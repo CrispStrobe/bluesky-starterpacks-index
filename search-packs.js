@@ -1,11 +1,19 @@
 #!/usr/bin/env node
-require('dotenv').config();
-const { MongoClient } = require('mongodb');
-const fs = require('fs');
-const yaml = require('js-yaml');
-const chalk = require('chalk');
-const yargs = require('yargs/yargs');
-const { hideBin } = require('yargs/helpers');
+// Add type: module to package.json or use .mjs extension
+import { MongoClient } from 'mongodb';
+import fs from 'fs';
+import yaml from 'js-yaml';
+import chalk from 'chalk';
+import yargs from 'yargs';
+import { hideBin } from 'yargs/helpers';
+import * as dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+dotenv.config();
 
 // CLI arguments setup
 const argv = yargs(hideBin(process.argv))
@@ -99,24 +107,40 @@ function searchJSON(filePath, searchTerm, isExact, isCaseSensitive) {
 }
 
 function searchYAML(filePath, searchTerm, isExact, isCaseSensitive) {
-    const data = yaml.load(fs.readFileSync(filePath, 'utf8'));
+    const fileContent = fs.readFileSync(filePath, 'utf8');
+    // Use loadAll instead of load to handle multiple documents
+    const documents = yaml.loadAll(fileContent);
+    // Combine all documents into a single array
+    const data = documents.flat();
     return searchInData(data, searchTerm, isExact, isCaseSensitive);
 }
 
 function searchInData(data, searchTerm, isExact, isCaseSensitive) {
-    const regex = isExact ? 
-        new RegExp(`^${searchTerm}$`, isCaseSensitive ? '' : 'i') : 
+    const regex = isExact ?
+        new RegExp(`^${searchTerm}$`, isCaseSensitive ? '' : 'i') :
         new RegExp(searchTerm, isCaseSensitive ? '' : 'i');
 
     return data.filter(pack => {
         // Search in pack name and description
         if (regex.test(pack.name) || (pack.description && regex.test(pack.description))) {
+            // If pack metadata matches, keep track of matching users
+            pack.matchingUsers = pack.users.filter(user =>
+                regex.test(user.handle) || (user.display_name && regex.test(user.display_name))
+            );
             return true;
         }
+
         // Search in users
-        return pack.users.some(user => 
+        const matchingUsers = pack.users.filter(user =>
             regex.test(user.handle) || (user.display_name && regex.test(user.display_name))
         );
+
+        if (matchingUsers.length > 0) {
+            pack.matchingUsers = matchingUsers;
+            return true;
+        }
+
+        return false;
     }).map(pack => ({
         _id: {
             pack_id: pack.rkey,
@@ -124,8 +148,9 @@ function searchInData(data, searchTerm, isExact, isCaseSensitive) {
             pack_creator: pack.creator,
             pack_description: pack.description
         },
-        matching_users: pack.users,
-        total_users: pack.users.length
+        matching_users: pack.matchingUsers || [], // Only include matching users
+        total_users: pack.users.length,
+        matching_users_count: (pack.matchingUsers || []).length
     }));
 }
 
@@ -136,7 +161,7 @@ function printResults(results) {
     }
 
     console.log(chalk.green(`\nFound ${results.length} matching starter pack(s):`));
-    
+
     results.forEach((pack, index) => {
         console.log(chalk.bold('\n' + '='.repeat(80)));
         console.log(chalk.blue(`${index + 1}. ${pack._id.pack_name}`));
@@ -144,13 +169,13 @@ function printResults(results) {
         if (pack._id.pack_description) {
             console.log(chalk.dim(`Description: ${pack._id.pack_description}`));
         }
-        
+
         // Create clickable URL
         const url = `https://bsky.app/profile/${pack._id.pack_creator}/lists/${pack._id.pack_id}`;
         console.log(chalk.cyan(`URL: ${url}`));
-        
+
         console.log(chalk.dim(`Total users in pack: ${pack.total_users}`));
-        
+
         if (pack.matching_users.length > 0) {
             console.log(chalk.yellow('\nMatching users:'));
             pack.matching_users.forEach(user => {
@@ -163,13 +188,13 @@ function printResults(results) {
 async function main() {
     const searchTerm = argv._[0];
     const source = argv.source;
-    
+
     console.log(chalk.blue(`Searching for: "${searchTerm}" in ${source}`));
     console.log(chalk.dim(`Mode: ${argv.exact ? 'Exact match' : 'Partial match'}, Case ${argv.caseSensitive ? 'sensitive' : 'insensitive'}`));
 
     try {
         let results;
-        
+
         switch (source) {
             case 'mongodb':
                 results = await searchMongoDB(searchTerm, argv.exact, argv.caseSensitive);

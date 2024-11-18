@@ -1,0 +1,26 @@
+# Environment variables
+.env
+
+# Logs
+*.log
+data_processor.log
+collector.log
+test_handle_resolution.log
+
+# Node modules
+node_modules/
+
+# Output files
+starter_packs.json
+starter_packs.yaml
+starter_packs.db
+checkpoints.json
+checkpoint.txt
+
+# Temporary files
+failed_pages.log
+starter_pack_urls.txt
+
+# Operating system files
+.DS_Store
+Thumbs.db

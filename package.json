@@ -1,0 +1,27 @@
+{
+  "name": "bsky-starterpack-index",
+  "version": "0.0.1",
+  "main": "index.js",
+  "scripts": {
+    "collect": "node url-collector-fast.js",
+    "process": "node data-processor.js",
+    "search": "node search-packs.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Tools for collecting and analyzing Bluesky starter packs",
+  "dependencies": {
+    "@atproto/api": "^0.13.16",
+    "axios": "^1.7.7",
+    "axios-cookiejar-support": "^5.0.3",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.4.5",
+    "js-yaml": "^4.1.0",
+    "mongodb": "^6.10.0",
+    "puppeteer": "^23.8.0",
+    "tough-cookie": "^5.0.0",
+    "winston": "^3.17.0",
+    "yargs": "^17.7.2"
+  }
+}

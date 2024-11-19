@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Add type: module to package.json or use .mjs extension
 import { MongoClient } from 'mongodb';
 import fs from 'fs';
 import yaml from 'js-yaml';
@@ -42,6 +41,16 @@ const argv = yargs(hideBin(process.argv))
         type: 'boolean',
         default: false
     })
+    .option('packs', {
+        describe: 'Show results organized by packs (default)',
+        type: 'boolean',
+        default: false
+    })
+    .option('users', {
+        describe: 'Show results organized by users',
+        type: 'boolean',
+        default: false
+    })
     .demandCommand(1, 'Please provide a search term')
     .help()
     .argv;
@@ -51,9 +60,7 @@ async function searchMongoDB(searchTerm, isExact, isCaseSensitive) {
     try {
         await client.connect();
         const db = client.db('starterpacks');
-        const collection = db.collection('users');
 
-        // Build search query
         let searchRegex;
         if (isExact) {
             searchRegex = `^${searchTerm}$`;
@@ -62,57 +69,213 @@ async function searchMongoDB(searchTerm, isExact, isCaseSensitive) {
         }
         const regexOptions = isCaseSensitive ? '' : 'i';
 
-        // Search in handle, display_name, and pack related fields
-        const query = {
+        // Find matching users
+        const userQuery = {
             $or: [
                 { handle: { $regex: searchRegex, $options: regexOptions } },
-                { display_name: { $regex: searchRegex, $options: regexOptions } },
-                { pack_name: { $regex: searchRegex, $options: regexOptions } },
-                { pack_description: { $regex: searchRegex, $options: regexOptions } }
+                { display_name: { $regex: searchRegex, $options: regexOptions } }
             ]
         };
 
-        // Group by pack to avoid duplicates
-        const results = await collection.aggregate([
-            { $match: query },
-            {
-                $group: {
-                    _id: {
-                        pack_id: "$pack_id",
-                        pack_name: "$pack_name",
-                        pack_creator: "$pack_creator",
-                        pack_description: "$pack_description"
-                    },
-                    matching_users: {
-                        $push: {
-                            handle: "$handle",
-                            display_name: "$display_name",
-                            did: "$did"
-                        }
-                    },
-                    total_users: { $sum: 1 }
-                }
-            }
-        ]).toArray();
+        const matchingUsers = await db.collection('users').find(userQuery).toArray();
+        console.log(`Found ${matchingUsers.length} matching users`);
 
-        return results;
+        // Get all unique pack IDs from matching users
+        const packIds = [...new Set(matchingUsers.flatMap(user => user.pack_ids || []))];
+        console.log(`Found ${packIds.length} unique pack IDs from users:`, packIds);
+
+        // Get all users from matching packs for accurate user counts
+        const allPackUsers = packIds.length > 0 ?
+            await db.collection('users').find({ pack_ids: { $in: packIds } }).toArray() : [];
+
+        // Group users by pack ID
+        const usersByPack = new Map();
+        allPackUsers.forEach(user => {
+            user.pack_ids.forEach(packId => {
+                if (!usersByPack.has(packId)) {
+                    usersByPack.set(packId, []);
+                }
+                usersByPack.get(packId).push(user);
+            });
+        });
+
+        // Create pack information with accurate user counts
+        const packs = await Promise.all(packIds.map(async packId => {
+            // Try to find pack in MongoDB first
+            const pack = await db.collection('starter_packs').findOne({ rkey: packId });
+
+            // Get all users for this pack
+            const packUsers = usersByPack.get(packId) || [];
+            const matchingPackUsers = matchingUsers.filter(u => u.pack_ids.includes(packId));
+
+            // If we found the pack in MongoDB, use that info
+            if (pack) {
+                return {
+                    rkey: packId,
+                    name: pack.name,
+                    creator: pack.creator,
+                    description: pack.description || '',
+                    users: packUsers.map(u => ({
+                        did: u.did,
+                        handle: u.handle,
+                        display_name: u.display_name,
+                        pack_ids: u.pack_ids
+                    }))
+                };
+            }
+
+            // If not found in MongoDB, construct from user data
+            // Try to find a matching user's document that might have pack metadata
+            const usersWithMetadata = await db.collection('users').find({
+                pack_ids: packId,
+                $or: [
+                    { 'pack_metadata.rkey': packId }
+                ]
+            }).toArray();
+
+            let packMetadata = usersWithMetadata.find(u => u.pack_metadata?.rkey === packId)?.pack_metadata;
+
+            return {
+                rkey: packId,
+                name: packMetadata?.name || `Pack ${packId}`,
+                creator: packMetadata?.creator || "Unknown",
+                description: packMetadata?.description || '',
+                users: packUsers.map(u => ({
+                    did: u.did,
+                    handle: u.handle,
+                    display_name: u.display_name,
+                    pack_ids: u.pack_ids
+                }))
+            };
+        }));
+
+        // Also search for packs directly by name/description
+        const directPackQuery = {
+            $or: [
+                { name: { $regex: searchRegex, $options: regexOptions } },
+                { description: { $regex: searchRegex, $options: regexOptions } }
+            ]
+        };
+
+        const directMatchingPacks = await db.collection('starter_packs')
+            .find(directPackQuery)
+            .toArray();
+
+        // Add any direct matching packs that weren't already included
+        const existingPackIds = new Set(packs.map(p => p.rkey));
+        for (const pack of directMatchingPacks) {
+            if (!existingPackIds.has(pack.rkey)) {
+                const packUsers = await db.collection('users')
+                    .find({ pack_ids: pack.rkey })
+                    .toArray();
+
+                packs.push({
+                    rkey: pack.rkey,
+                    name: pack.name,
+                    creator: pack.creator,
+                    description: pack.description || '',
+                    users: packUsers.map(u => ({
+                        did: u.did,
+                        handle: u.handle,
+                        display_name: u.display_name,
+                        pack_ids: u.pack_ids
+                    }))
+                });
+            }
+        }
+
+        return {
+            users: matchingUsers.map(user => ({
+                did: user.did,
+                handle: user.handle,
+                display_name: user.display_name,
+                pack_ids: user.pack_ids || []
+            })),
+            packs,
+            packIds: [...new Set([...packIds, ...directMatchingPacks.map(p => p.rkey)])]
+        };
+
     } finally {
         await client.close();
     }
 }
 
 function searchJSON(filePath, searchTerm, isExact, isCaseSensitive) {
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    return searchInData(data, searchTerm, isExact, isCaseSensitive);
+    try {
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        let jsonData;
+
+        try {
+            jsonData = JSON.parse(fileContent);
+        } catch (parseError) {
+            // Handle incomplete JSON file
+            const cleanContent = fileContent.trimEnd();
+            if (cleanContent.endsWith(',')) {
+                jsonData = JSON.parse(cleanContent.slice(0, -1) + ']');
+            } else if (!cleanContent.endsWith(']')) {
+                jsonData = JSON.parse(cleanContent + ']');
+            } else {
+                throw parseError;
+            }
+        }
+
+        return processFileSearchResults(jsonData, searchTerm, isExact, isCaseSensitive);
+    } catch (error) {
+        throw new Error(`Error reading JSON file (file may be incomplete due to ongoing processing): ${error.message}. Try using YAML source instead.`);
+    }
 }
 
 function searchYAML(filePath, searchTerm, isExact, isCaseSensitive) {
     const fileContent = fs.readFileSync(filePath, 'utf8');
-    // Use loadAll instead of load to handle multiple documents
     const documents = yaml.loadAll(fileContent);
-    // Combine all documents into a single array
     const data = documents.flat();
-    return searchInData(data, searchTerm, isExact, isCaseSensitive);
+    return processFileSearchResults(data, searchTerm, isExact, isCaseSensitive);
+}
+
+function processFileSearchResults(data, searchTerm, isExact, isCaseSensitive) {
+    const regex = isExact ?
+        new RegExp(`^${searchTerm}$`, isCaseSensitive ? '' : 'i') :
+        new RegExp(searchTerm, isCaseSensitive ? '' : 'i');
+
+    // First, collect all users from all packs
+    const allUsers = new Map();
+    const matchingUsers = new Set();
+    const matchingPacks = new Set();
+
+    data.forEach(pack => {
+        // Check if pack matches
+        if (regex.test(pack.name) || (pack.description && regex.test(pack.description))) {
+            matchingPacks.add(pack);
+        }
+
+        // Process all users
+        pack.users.forEach(user => {
+            if (!allUsers.has(user.did)) {
+                allUsers.set(user.did, {
+                    ...user,
+                    pack_ids: [pack.rkey]
+                });
+            } else {
+                // Add pack reference to existing user
+                const existingUser = allUsers.get(user.did);
+                if (!existingUser.pack_ids.includes(pack.rkey)) {
+                    existingUser.pack_ids.push(pack.rkey);
+                }
+            }
+
+            // Check if user matches search criteria
+            if (regex.test(user.handle) || (user.display_name && regex.test(user.display_name))) {
+                matchingUsers.add(user.did);
+                matchingPacks.add(pack);
+            }
+        });
+    });
+
+    return {
+        users: Array.from(matchingUsers).map(did => allUsers.get(did)),
+        packs: Array.from(matchingPacks),
+        packIds: [...new Set(Array.from(matchingPacks).map(pack => pack.rkey))]
+    };
 }
 
 function searchInData(data, searchTerm, isExact, isCaseSensitive) {
@@ -125,14 +288,16 @@ function searchInData(data, searchTerm, isExact, isCaseSensitive) {
         if (regex.test(pack.name) || (pack.description && regex.test(pack.description))) {
             // If pack metadata matches, keep track of matching users
             pack.matchingUsers = pack.users.filter(user =>
-                regex.test(user.handle) || (user.display_name && regex.test(user.display_name))
+                regex.test(user.handle) ||
+                (user.display_name && regex.test(user.display_name))
             );
             return true;
         }
 
         // Search in users
         const matchingUsers = pack.users.filter(user =>
-            regex.test(user.handle) || (user.display_name && regex.test(user.display_name))
+            regex.test(user.handle) ||
+            (user.display_name && regex.test(user.display_name))
         );
 
         if (matchingUsers.length > 0) {
@@ -148,37 +313,83 @@ function searchInData(data, searchTerm, isExact, isCaseSensitive) {
             pack_creator: pack.creator,
             pack_description: pack.description
         },
-        matching_users: pack.matchingUsers || [], // Only include matching users
-        total_users: pack.users.length,
-        matching_users_count: (pack.matchingUsers || []).length
+        matching_users: pack.matchingUsers || [],
+        total_users: pack.users.length
     }));
 }
 
-function printResults(results) {
-    if (results.length === 0) {
+function printUserResults(data) {
+    const { users, packs, packIds } = data;
+
+    if (!users || users.length === 0) {
+        console.log(chalk.yellow('\nNo matching users found.'));
+        return;
+    }
+
+    console.log(chalk.green(`\nFound ${users.length} matching user(s):`));
+
+    users.forEach((user, index) => {
+        console.log(chalk.bold('\n' + '='.repeat(80)));
+        console.log(chalk.blue(`${index + 1}. ${user.handle}`));
+        if (user.display_name) {
+            console.log(chalk.dim(`Display Name: ${user.display_name}`));
+        }
+        console.log(chalk.dim(`DID: ${user.did}`));
+
+        // Get packs this user belongs to
+        const userPacks = packs.filter(pack =>
+            user.pack_ids && user.pack_ids.includes(pack.rkey)
+        );
+
+        if (userPacks.length > 0) {
+            console.log(chalk.yellow('\nMember of the following packs:'));
+            userPacks.forEach(pack => {
+                console.log(chalk.dim(`- ${pack.name} (${pack.rkey})`));
+                if (pack.description) {
+                    console.log(chalk.dim(`  Description: ${pack.description}`));
+                }
+                console.log(chalk.dim(`  URL: https://bsky.app/profile/${pack.creator}/lists/${pack.rkey}`));
+            });
+        } else if (user.pack_ids && user.pack_ids.length > 0) {
+            console.log(chalk.yellow('\nMember of packs (IDs only):'));
+            user.pack_ids.forEach(packId => {
+                console.log(chalk.dim(`- ${packId}`));
+            });
+        }
+    });
+}
+
+function printPackResults(data) {
+    const { users, packs, packIds } = data;
+
+    if (!packs || (packs.length === 0 && (!packIds || packIds.length === 0))) {
         console.log(chalk.yellow('\nNo matches found.'));
         return;
     }
 
-    console.log(chalk.green(`\nFound ${results.length} matching starter pack(s):`));
+    console.log(chalk.green(`\nFound ${packs.length} matching starter pack(s):`));
 
-    results.forEach((pack, index) => {
+    packs.forEach((pack, index) => {
         console.log(chalk.bold('\n' + '='.repeat(80)));
-        console.log(chalk.blue(`${index + 1}. ${pack._id.pack_name}`));
-        console.log(chalk.dim(`Creator: ${pack._id.pack_creator}`));
-        if (pack._id.pack_description) {
-            console.log(chalk.dim(`Description: ${pack._id.pack_description}`));
+        console.log(chalk.blue(`${index + 1}. ${pack.name}`));
+        console.log(chalk.dim(`Creator: ${pack.creator}`));
+        if (pack.description) {
+            console.log(chalk.dim(`Description: ${pack.description}`));
         }
 
-        // Create clickable URL
-        const url = `https://bsky.app/profile/${pack._id.pack_creator}/lists/${pack._id.pack_id}`;
+        const url = `https://bsky.app/profile/${pack.creator}/lists/${pack.rkey}`;
         console.log(chalk.cyan(`URL: ${url}`));
 
-        console.log(chalk.dim(`Total users in pack: ${pack.total_users}`));
+        // Find matching users in this pack
+        const matchingUsers = users.filter(user =>
+            user.pack_ids && user.pack_ids.includes(pack.rkey)
+        );
 
-        if (pack.matching_users.length > 0) {
+        console.log(chalk.dim(`Total users in pack: ${pack.users.length}`));
+
+        if (matchingUsers && matchingUsers.length > 0) {
             console.log(chalk.yellow('\nMatching users:'));
-            pack.matching_users.forEach(user => {
+            matchingUsers.forEach(user => {
                 console.log(chalk.dim(`- ${user.handle}${user.display_name ? ` (${user.display_name})` : ''}`));
             });
         }
@@ -193,29 +404,38 @@ async function main() {
     console.log(chalk.dim(`Mode: ${argv.exact ? 'Exact match' : 'Partial match'}, Case ${argv.caseSensitive ? 'sensitive' : 'insensitive'}`));
 
     try {
-        let results;
+        let searchResults;
 
         switch (source) {
             case 'mongodb':
-                results = await searchMongoDB(searchTerm, argv.exact, argv.caseSensitive);
+                searchResults = await searchMongoDB(searchTerm, argv.exact, argv.caseSensitive);
                 break;
             case 'json':
                 const jsonPath = argv.file || 'starter_packs.json';
                 if (!fs.existsSync(jsonPath)) {
                     throw new Error(`JSON file not found: ${jsonPath}`);
                 }
-                results = searchJSON(jsonPath, searchTerm, argv.exact, argv.caseSensitive);
+                searchResults = searchJSON(jsonPath, searchTerm, argv.exact, argv.caseSensitive);
                 break;
             case 'yaml':
                 const yamlPath = argv.file || 'starter_packs.yaml';
                 if (!fs.existsSync(yamlPath)) {
                     throw new Error(`YAML file not found: ${yamlPath}`);
                 }
-                results = searchYAML(yamlPath, searchTerm, argv.exact, argv.caseSensitive);
+                searchResults = searchYAML(yamlPath, searchTerm, argv.exact, argv.caseSensitive);
                 break;
         }
 
-        printResults(results);
+        // If neither --packs nor --users is specified, default to --packs
+        if (!argv.users && !argv.packs) {
+            argv.packs = true;
+        }
+
+        if (argv.users) {
+            printUserResults(searchResults);
+        } else {
+            printPackResults(searchResults);
+        }
 
     } catch (error) {
         console.error(chalk.red(`Error: ${error.message}`));

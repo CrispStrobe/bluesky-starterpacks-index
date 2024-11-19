@@ -722,6 +722,8 @@ class StarterPackProcessor {
         }
     }
     
+    
+
     async checkMongoHealth() {
         if (this.noMongoDB) return true;
         try {
@@ -786,41 +788,162 @@ class StarterPackProcessor {
         }
     }
 
+
+    async writeToMongoDB(packData, userOperations) {
+        if (this.noMongoDB) return;
+    
+        const session = this.mongoClient.startSession();
+        try {
+            await session.withTransaction(async () => {
+                // Ensure the starter pack exists
+                await this.db.collection('starter_packs').updateOne(
+                    { rkey: packData.rkey },
+                    {
+                        $set: {
+                            rkey: packData.rkey,
+                            name: packData.name,
+                            creator: packData.creator,
+                            creator_did: packData.creator_did,
+                            description: packData.description || '',
+                            user_count: parseInt(packData.user_count), // Ensure integer
+                            created_at: new Date(packData.created_at),
+                            updated_at: new Date(packData.updated_at),
+                            users: packData.users
+                        }
+                    },
+                    { upsert: true, session }
+                );
+    
+                // Process user operations in batches
+                const BATCH_SIZE = 500;
+                for (let i = 0; i < userOperations.length; i += BATCH_SIZE) {
+                    const batch = userOperations.slice(i, i + BATCH_SIZE);
+                    
+                    const modifiedBatch = batch.map(op => ({
+                        updateOne: {
+                            filter: op.updateOne.filter,
+                            update: {
+                                $set: {
+                                    did: op.updateOne.update.$set.did,
+                                    handle: op.updateOne.update.$set.handle,
+                                    display_name: op.updateOne.update.$set.display_name,
+                                    last_updated: op.updateOne.update.$set.last_updated,
+                                    profile_check_needed: op.updateOne.update.$set.profile_check_needed
+                                    // Removed pack_ids from $set
+                                },
+                                $addToSet: { pack_ids: packData.rkey } // Only using $addToSet
+                            },
+                            upsert: true
+                        }
+                    }));
+    
+                    try {
+                        await this.db.collection('users').bulkWrite(modifiedBatch, {
+                            ordered: false,
+                            session
+                        });
+                    } catch (err) {
+                        if (err.code === 11000) {
+                            // Handle duplicate key errors individually
+                            for (const op of modifiedBatch) {
+                                try {
+                                    await this.db.collection('users').updateOne(
+                                        op.updateOne.filter,
+                                        op.updateOne.update,
+                                        { upsert: true, session }
+                                    );
+                                } catch (innerErr) {
+                                    if (innerErr.code !== 11000) {
+                                        throw innerErr;
+                                    }
+                                }
+                            }
+                        } else {
+                            throw err;
+                        }
+                    }
+                }
+            }, {
+                readPreference: 'primary',
+                readConcern: { level: 'majority' },
+                writeConcern: { w: 'majority' }
+            });
+        } finally {
+            await session.endSession();
+        }
+    }
+    
+
     async setupDatabase() {
         try {
-            await Promise.race([
-                this.mongoClient.connect(),
-                new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('MongoDB connection timeout')), 30000)
-                )
-            ]);
-            this.db = this.mongoClient.db('starterpacks');    
+            await this.mongoClient.connect();
+            this.db = this.mongoClient.db('starterpacks');
             
             // Drop existing collections if they exist
             await this.db.collection('users').drop().catch(() => {});
             await this.db.collection('starter_packs').drop().catch(() => {});
             
-            // Create collections with schemas
-            await this.db.createCollection('users');
-            await this.db.createCollection('starter_packs');
-            
-            // Create indexes in parallel
+            // Create collections with validation
+            await this.db.createCollection('starter_packs', {
+                validator: {
+                    $jsonSchema: {
+                        bsonType: 'object',
+                        required: ['rkey', 'name', 'creator', 'creator_did'],
+                        properties: {
+                            rkey: { bsonType: 'string' },
+                            name: { bsonType: 'string' },
+                            creator: { bsonType: 'string' },
+                            creator_did: { bsonType: 'string' },
+                            description: { bsonType: ['string', 'null'] },
+                            user_count: { bsonType: 'int' },
+                            created_at: { bsonType: 'date' },
+                            updated_at: { bsonType: 'date' },
+                            users: { 
+                                bsonType: 'array',
+                                items: { bsonType: 'string' }
+                            }
+                        }
+                    }
+                }
+            });
+    
+            await this.db.createCollection('users', {
+                validator: {
+                    $jsonSchema: {
+                        bsonType: 'object',
+                        required: ['did', 'handle'],
+                        properties: {
+                            did: { bsonType: 'string' },
+                            handle: { bsonType: 'string' },
+                            display_name: { bsonType: ['string', 'null'] },
+                            pack_ids: { 
+                                bsonType: 'array',
+                                items: { bsonType: 'string' }
+                            },
+                            last_updated: { bsonType: 'date' },
+                            profile_check_needed: { bsonType: 'bool' }
+                        }
+                    }
+                }
+            });
+    
+            // Create indexes
             await Promise.all([
                 this.db.collection('users').createIndex({ did: 1 }, { unique: true }),
                 this.db.collection('users').createIndex({ handle: 1 }),
+                this.db.collection('users').createIndex({ pack_ids: 1 }),
                 this.db.collection('users').createIndex({ last_updated: 1 }),
                 this.db.collection('users').createIndex({ profile_check_needed: 1 }),
                 this.db.collection('starter_packs').createIndex({ rkey: 1 }, { unique: true }),
-                this.db.collection('starter_packs').createIndex({ creator_did: 1 })
-            ]).catch(err => {
-                logger.error(`Error creating indexes: ${err.message}`);
-                throw err;
-            });
-            
-            logger.info('Connected to MongoDB and indexes created.');
+                this.db.collection('starter_packs').createIndex({ creator_did: 1 }),
+                this.db.collection('starter_packs').createIndex({ creator: 1 }),
+                this.db.collection('starter_packs').createIndex({ updated_at: 1 })
+            ]);
+    
+            logger.info('MongoDB setup completed successfully');
         } catch (err) {
-            logger.error(`Error setting up the database: ${err.stack || err.message}`);
-            process.exit(1);
+            logger.error(`Error setting up database: ${err.stack || err.message}`);
+            throw err;
         }
     }
 
@@ -1414,51 +1537,25 @@ class StarterPackProcessor {
     
             // Prepare pack data
             const packData = {
+                rkey: rkey,
                 name: value.name,
                 creator: creatorHandle,
-                rkey: rkey,
-                url: `https://bsky.app/profile/${creatorHandle}/lists/${rkey}`,
+                creator_did: creatorDID, 
+                description: value.description || '',
                 user_count: processedUsers.length,
-                total_attempted: listMembers.length,
-                failed_count: failedProfiles.length,
-                users: processedUsers,
-                updated_at: new Date().toISOString()
+                created_at: new Date(),
+                updated_at: new Date(),
+                users: processedUsers.map(u => u.did)
             };
     
             // MongoDB operations if enabled
             if (!this.noMongoDB && mongodbOperations.length > 0) {
-                const MONGODB_OPERATION_TIMEOUT = 30000;
-                const BATCH_SIZE = 1000;
-                
                 try {
-                    for (let i = 0; i < mongodbOperations.length; i += BATCH_SIZE) {
-                        const batch = mongodbOperations.slice(i, i + BATCH_SIZE);
-                        const result = await Promise.race([
-                            this.db.collection('users').bulkWrite(batch, { 
-                                ordered: false,
-                                w: 1,
-                                wtimeout: MONGODB_OPERATION_TIMEOUT 
-                            }),
-                            new Promise((_, reject) => 
-                                setTimeout(() => reject(new Error('MongoDB operation timeout')), MONGODB_OPERATION_TIMEOUT)
-                            )
-                        ]);
-
-                        // Validate result
-                        if (!result.ok) {
-                            throw new Error(`MongoDB write operation failed: ${result.writeErrors?.join(', ')}`);
-                        }
-
-                        logger.info(`Processed batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(mongodbOperations.length/BATCH_SIZE)}`);
-                    }
+                    await this.writeToMongoDB(packData, mongodbOperations);
+                    logger.info(`MongoDB update completed for pack ${rkey}`);
                 } catch (err) {
-                    if (err.message === 'MongoDB operation timeout') {
-                        logger.error('MongoDB batch operation timed out');
-                    } else if (err.code === 11000) {
-                        logger.warn('Duplicate key error occurred, continuing with next batch');
-                    } else {
-                        throw err;
-                    }
+                    logger.error(`MongoDB write failed for pack ${rkey}: ${err.stack || err.message}`);
+                    throw err;
                 }
             }
     

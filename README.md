@@ -1,11 +1,11 @@
 # Bluesky Starter Pack Tools
 
-A collection of tools for collecting, processing, and searching Bluesky starter packs.
+A collection of tools for collecting, processing, and searching Bluesky starter packs. These tools help you collect, process, and search through Bluesky's starter packs and their user data.
 
 ## Prerequisites
 
 - Node.js (v16 or higher): [Download Node.js](https://nodejs.org/)
-- MongoDB (optional, for database storage): [Download MongoDB](https://www.mongodb.com/try/download/community)
+- MongoDB (required for data storage): [Download MongoDB](https://www.mongodb.com/try/download/community)
 - Git (for cloning the repository)
 
 ## Installation
@@ -19,31 +19,13 @@ cd bsky-starter-pack-tools
 
 ### Step 2: Install Dependencies
 
-#### Windows (Command Prompt):
-```cmd
-npm install
-```
-
-#### macOS/Linux (Terminal):
 ```bash
 npm install
-```
-
-Note: If you encounter any permission issues on Linux/macOS, you might need to use:
-```bash
-sudo npm install
 ```
 
 ### Step 3: Configuration
 
-1. Create a `.env` file by copying the example:
-
-#### Windows:
-```cmd
-copy .env.example .env
-```
-
-#### macOS/Linux:
+1. Create a `.env` file:
 ```bash
 cp .env.example .env
 ```
@@ -52,116 +34,154 @@ cp .env.example .env
 ```env
 BSKY_USERNAME=your.username.bsky.social
 BSKY_PASSWORD=your_password
-MONGODB_URI=mongodb://username:password@host:port/database
+MONGODB_URI=mongodb://localhost:27017/starterpacks
 ```
 
 ## Usage
 
-The tools can be run using npm scripts or directly with node. Both methods work on all platforms.
+### Processing Starter Packs
 
-### Using npm scripts:
-
-#### 1. Collect starter pack URLs:
 ```bash
-npm run collect
+# Regular processing with MongoDB storage
+node data-processor.js
+
+# Process without MongoDB storage (file output only)
+node data-processor.js --nomongodb
+
+# Update MongoDB from existing files
+node data-processor.js --updatemongodb
+
+# Purge all data and start fresh
+node data-processor.js --purge
 ```
 
-#### 2. Process starter packs:
-```bash
-npm run process
-```
+### Searching Starter Packs
 
-#### 3. Search starter packs:
+The search tool supports both pack-centric and user-centric views, with various data sources:
+
 ```bash
-# Search in MongoDB
-npm run search -- --source mongodb "javascript"
+# Search in MongoDB (default)
+node search-packs.js "search term"
+
+# Show results organized by users
+node search-packs.js --users "search term"
+
+# Show results organized by packs (default)
+node search-packs.js --packs "search term"
 
 # Search in JSON file
-npm run search -- --source json --file starter_packs.json "javascript"
+node search-packs.js -s json "search term"
 
 # Search in YAML file
-npm run search -- --source yaml --file starter_packs.yaml "javascript"
+node search-packs.js -s yaml "search term"
 ```
 
-### Using node directly:
-
-#### Windows:
-```cmd
-node url-collector-fast.js
-node data-processor.js
-node search-packs.js --source mongodb "javascript"
-```
-
-#### macOS/Linux:
-```bash
-node url-collector-fast.js
-node data-processor.js
-node search-packs.js --source mongodb "javascript"
-```
-
-### Search Options
+#### Search Options
 
 - `--source` or `-s`: Specify data source (mongodb, json, yaml)
 - `--file` or `-f`: Input file path for JSON/YAML
 - `--exact` or `-e`: Perform exact match
 - `--case-sensitive` or `-c`: Make search case-sensitive
+- `--users`: Show results organized by users
+- `--packs`: Show results organized by packs (default)
 - `--help`: Show help message
 
 Examples:
 ```bash
 # Exact match search
-npm run search -- --source mongodb --exact "javascript"
+node search-packs.js --exact "javascript"
 
-# Case-sensitive search in JSON file
-npm run search -- --source json --file starter_packs.json --case-sensitive "JavaScript"
+# Case-sensitive search with user-centric view
+node search-packs.js --users --case-sensitive "JavaScript"
+
+# Search in JSON with pack-centric view
+node search-packs.js -s json --packs "javascript"
 ```
 
 ## Output Files
 
-The tools generate several files that are git-ignored by default:
+The tools generate several files:
 
 - `starter_packs.json`: JSON output of processed starter packs
 - `starter_packs.yaml`: YAML output of processed starter packs
 - `checkpoints.json`: Progress tracking and resumption data
 - `data_processor.log`: Processing logs
-- `failed_pages.log`: Failed URL collection attempts
 
-## Rate Limiting and Resumption
+## Features
 
+### Data Processing
+- Collects and processes Bluesky starter packs
+- Stores data in MongoDB and/or files (JSON/YAML)
+- Handles incremental updates
+- Tracks processing progress
+- Supports resume after interruption
+
+### Search Capabilities
+- Searches by handle, display name, pack name, or description
+- Supports exact and partial matching
+- Case-sensitive and case-insensitive options
+- Two view formats: pack-centric and user-centric
+- Multiple data source options (MongoDB/JSON/YAML)
+
+### Rate Limiting and Error Handling
 - Implements Bluesky's rate limit of 3000 requests per 5 minutes
-- Automatically saves progress in checkpoints.json
-- Resumes from last successful position if interrupted
 - Uses exponential backoff for rate limit handling
+- Automatically retries failed requests
+- Handles network errors gracefully
+
+## MongoDB Schema
+
+### Users Collection
+```javascript
+{
+  did: String,            // User's DID
+  handle: String,         // User's handle
+  display_name: String,   // User's display name
+  pack_ids: [String],     // Array of pack IDs user belongs to
+  last_updated: Date,     // Last profile update time
+  profile_check_needed: Boolean  // Profile update flag
+}
+```
+
+### Starter Packs Collection
+```javascript
+{
+  rkey: String,          // Pack's unique key
+  name: String,          // Pack name
+  creator: String,       // Pack creator's handle
+  description: String,   // Pack description
+  user_count: Number,    // Number of users in pack
+  created_at: Date,      // Creation timestamp
+  updated_at: Date       // Last update timestamp
+}
+```
 
 ## Troubleshooting
 
-### Windows-Specific Issues:
-- If you get EACCES errors, run Command Prompt as Administrator
-- For SSL/certificate errors, ensure your Node.js installation is up to date
-
-### Linux/macOS-Specific Issues:
-- Permission denied errors: Use `sudo` for npm install if needed
-- If MongoDB service doesn't start: `sudo systemctl start mongodb`
-
-### General Issues:
-- Rate limit errors: The script will automatically handle these
+### Common Issues
+- MongoDB connection errors: Verify MongoDB is running and connection string is correct
+- Rate limit errors: The script will automatically handle these with backoff
 - Network timeouts: Check your internet connection
-- MongoDB connection errors: Verify your connection string in .env
+- Interrupted processing: Will automatically resume from last checkpoint
+
+### Logs
+- Check `data_processor.log` for detailed processing information
+- Use `--nomongodb` flag to test file processing without database
+- MongoDB errors will be logged with full stack traces
 
 ## Development
 
-### File Structure:
+### File Structure
 ```
 bsky-starter-pack-tools/
-├── url-collector-fast.js   # Collects starter pack URLs
-├── data-processor.js       # Processes and stores starter packs
-├── search-packs.js         # Search interface
-├── .env                    # Configuration (not in git)
-├── .env.example           # Example configuration
-└── package.json           # Project dependencies
+├── data-processor.js    # Main processing script
+├── search-packs.js      # Search interface
+├── .env                 # Configuration (not in git)
+├── .env.example         # Example configuration
+└── package.json         # Project dependencies
 ```
 
-### Contributing:
+### Contributing
 1. Fork the repository
 2. Create your feature branch
 3. Commit your changes

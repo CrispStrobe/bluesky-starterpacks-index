@@ -12,6 +12,16 @@ import { promises as fsPromises } from 'fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+process.on('exit', () => {
+    try {
+        // Sync operations because we're exiting
+        fs.unlinkSync('checkpoints.json.temp');
+        fs.unlinkSync('checkpoints.json.lock');
+    } catch (err) {
+        // Ignore cleanup errors on exit
+    }
+});
+
 dotenv.config();
 
 const userSchema = {
@@ -198,60 +208,78 @@ class FileManager {
             if (!await this.validatePaths(['starter_packs.json', 'starter_packs.yaml'])) {
                 throw new Error('Required file paths are not accessible');
             }
-    
+                
+            // Check if directory exists and is writable
             const dir = './';
             try {
                 await fs.promises.access(dir, fs.constants.R_OK | fs.constants.W_OK);
             } catch (err) {
                 throw new Error(`Directory ${dir} is not accessible: ${err.message}`);
             }
-    
+                
+            // Try to load existing files
             const jsonExists = await fs.promises.access('starter_packs.json')
-                .then(() => true)
-                .catch(() => false);
-            const yamlExists = await fs.promises.access('starter_packs.yaml')
                 .then(() => true)
                 .catch(() => false);
     
             if (jsonExists) {
-                // Read and parse existing JSON
-                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
-                const trimmedContent = content.replace(/\]\s*$/, '');
-                const packs = JSON.parse(trimmedContent + ']');
-                
-                packs.forEach(pack => {
-                    this.existingPacks.set(pack.rkey, pack);
-                });
-                
-                logger.info(`Loaded ${this.existingPacks.size} existing packs`);
-                
-                // Create backup only on fresh start
-                if (this.existingPacks.size > 0) {
-                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                    await fs.promises.copyFile('starter_packs.json', `starter_packs.${timestamp}.backup.json`);
-                    if (yamlExists) {
-                        await fs.promises.copyFile('starter_packs.yaml', `starter_packs.${timestamp}.backup.yaml`);
+                try {
+                    // Read and parse existing JSON
+                    const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
+                    let packs;
+                    try {
+                        const trimmedContent = content.replace(/\]\s*$/, ''); // Remove trailing ]
+                        packs = JSON.parse(trimmedContent + ']');
+                    } catch (parseErr) {
+                        logger.warn(`JSON parse error, backing up corrupted file and starting fresh: ${parseErr.message}`);
+                        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                        await fs.promises.rename('starter_packs.json', `starter_packs.${timestamp}.corrupted.json`);
+                        if (await fs.promises.access('starter_packs.yaml').catch(() => false)) {
+                            await fs.promises.rename('starter_packs.yaml', `starter_packs.${timestamp}.corrupted.yaml`);
+                        }
+                        packs = [];
                     }
-                }
+                    
+                    if (Array.isArray(packs)) {
+                        packs.forEach(pack => {
+                            this.existingPacks.set(pack.rkey, pack);
+                        });
+                        
+                        logger.info(`Loaded ${this.existingPacks.size} existing packs`);
     
-                // Create append streams
-                this.jsonStream = fs.createWriteStream('starter_packs.json', { flags: 'a' });
-                this.yamlStream = fs.createWriteStream('starter_packs.yaml', { flags: yamlExists ? 'a' : 'w' });
-                
-                this.setupStreamErrorHandlers();
-    
-                // If the content doesn't end with a comma and we have existing packs, add one
-                const needsComma = !trimmedContent.trim().endsWith(',');
-                if (needsComma && this.existingPacks.size > 0) {
-                    await new Promise(resolve => this.jsonStream.write(',\n', resolve));
+                        // Backup old files
+                        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                        await fs.promises.rename('starter_packs.json', `starter_packs.${timestamp}.json`);
+                        await fs.promises.rename('starter_packs.yaml', `starter_packs.${timestamp}.yaml`).catch(() => {});
+                    }
+                } catch (err) {
+                    logger.warn(`Error reading existing files, starting fresh: ${err.message}`);
                 }
-            } else {
-                // Only create new files if they don't exist
-                this.jsonStream = fs.createWriteStream('starter_packs.json');
-                this.yamlStream = fs.createWriteStream('starter_packs.yaml');
+            }
+    
+            // Create new files
+            this.jsonStream = fs.createWriteStream('starter_packs.json');
+            this.yamlStream = fs.createWriteStream('starter_packs.yaml');
                 
-                this.setupStreamErrorHandlers();
-                await new Promise(resolve => this.jsonStream.write('[', resolve));
+            this.jsonStream.on('error', (err) => {
+                logger.error(`JSON Stream Error: ${err.stack || err.message}`);
+            });
+                    
+            this.yamlStream.on('error', (err) => {
+                logger.error(`YAML Stream Error: ${err.stack || err.message}`);
+            });
+    
+            // Write initial content including existing packs
+            const initialJson = '[' + Array.from(this.existingPacks.values())
+                .map(pack => JSON.stringify(pack, null, 2))
+                .join(',\n');
+            await new Promise(resolve => this.jsonStream.write(initialJson, resolve));
+                
+            // Write existing packs to YAML
+            for (const pack of this.existingPacks.values()) {
+                await new Promise(resolve => 
+                    this.yamlStream.write('---\n' + yaml.dump(pack), resolve)
+                );
             }
     
             this.isFirstEntry = this.existingPacks.size === 0;
@@ -560,115 +588,64 @@ async function updateMongoDBFromFiles() {
 class CheckpointManager {
     constructor(filename = 'checkpoints.json') {
         this.filename = filename;
-        this.checkpoints = null; // Will be initialized in init()
-    }
-
-    async init() {
-        this.checkpoints = await this.loadCheckpoints();
-    }
-    
-    async validateCheckpoints() {
-        try {
-            const data = await fs.promises.readFile(this.filename, 'utf-8');
-            JSON.parse(data); // Validate JSON structure
-            return true;
-        } catch (err) {
-            logger.error(`Invalid checkpoints file: ${err.message}`);
-            return false;
-        }
-    }
-
-    async loadCheckpoints() {
-        try {
-            await fs.promises.access(this.filename);
-            const data = JSON.parse(await fs.promises.readFile(this.filename, 'utf-8'));
-            if (data.completedPacks) {
-                data.completedPacks = new Set(data.completedPacks);
-            }
-            logger.info(`Loaded checkpoints: ${JSON.stringify({...data, completedPacks: Array.from(data.completedPacks)}, null, 2)}`);
-            return data;
-        } catch (err) {
-            if (err.code === 'ENOENT') {
-                logger.info('No checkpoint file found, starting fresh');
-            } else {
-                logger.error(`Error loading checkpoints: ${err.stack || err.message}`);
-            }
-            return this.getInitialCheckpoints();
-        }
-    }
-
-    getInitialCheckpoints() {
-        return {
-            lastProcessedIndex: -1,
-            lastProcessedDate: null,
-            dailyStats: {},
-            errors: [],
-            completedPacks: new Set(),
-            rateLimitHits: [],
-        };
+        this.lockFile = `${filename}.lock`;
+        this.tempFile = `${filename}.temp`;
+        this.checkpoints = null;
+        this.lockTimeout = 30000; // 30 seconds timeout for locks
     }
 
     async acquireLock() {
-        const lockFile = `${this.filename}.lock`;
         try {
-            await fsPromises.writeFile(lockFile, String(process.pid), { flag: 'wx' });
+            // Check if lock exists and is stale
+            try {
+                const lockStat = await fs.promises.stat(this.lockFile);
+                const lockAge = Date.now() - lockStat.mtimeMs;
+                if (lockAge > this.lockTimeout) {
+                    // Lock is stale, remove it
+                    await fs.promises.unlink(this.lockFile).catch(() => {});
+                }
+            } catch (err) {
+                // Lock doesn't exist, which is fine
+            }
+
+            // Try to create lock file
+            await fs.promises.writeFile(this.lockFile, String(process.pid), { flag: 'wx' });
             return true;
         } catch (err) {
             if (err.code === 'EEXIST') {
-                const pid = await fsPromises.readFile(lockFile, 'utf8');
-                logger.warn(`Lock file exists with PID ${pid}`);
-            } else {
-                // Log unexpected errors
-                logger.error(`Unexpected error acquiring lock: ${err.stack || err.message}`);
+                logger.warn('Lock file exists, another process may be writing');
+                return false;
             }
+            logger.error(`Error acquiring lock: ${err.message}`);
             return false;
         }
     }
 
     async releaseLock() {
-        const lockFile = `${this.filename}.lock`;
         try {
-            await fsPromises.unlink(lockFile);
+            await fs.promises.unlink(this.lockFile).catch(() => {});
         } catch (err) {
-            logger.warn(`Error releasing lock: ${err.stack || err.message}`);
+            logger.warn(`Error releasing lock: ${err.message}`);
         }
     }
 
-    async saveCheckpoints() {
-        const lockFile = `${this.filename}.lock`;
-        const tempFile = `${this.filename}.temp`;
-        
-        try {
-            // Try to acquire lock
-            await fsPromises.writeFile(lockFile, String(process.pid), { flag: 'wx' });
-            
-            // Prepare checkpoint data
-            const checkpointsToSave = {
-                ...this.checkpoints,
-                completedPacks: Array.from(this.checkpoints.completedPacks)
-            };
-            
-            // Write to temp file
-            await fs.promises.writeFile(tempFile, JSON.stringify(checkpointsToSave, null, 2));
-            
-            // Atomic rename
-            await fs.promises.rename(tempFile, this.filename);
-            
-        } catch (err) {
-            if (err.code === 'EEXIST') {
-                logger.warn('Checkpoint save skipped - another process holds the lock');
-                return;
-            }
-            logger.error(`Error saving checkpoints: ${err.stack || err.message}`);
-            throw err;
-        } finally {
-            try {
-                await fs.promises.unlink(lockFile).catch(() => {});
-                await fs.promises.unlink(tempFile).catch(() => {});
-            } catch (_) {}
+    shouldProcessPack(rkey, isNewOrUpdate = false) {
+        // Always process new packs or those marked for update
+        if (isNewOrUpdate) {
+            return true;
         }
+        // For existing packs, check completion status
+        return !this.checkpoints.completedPacks.has(rkey);
     }
-
+    
+    getLastProcessedIndex() {
+        return this.checkpoints?.lastProcessedIndex || -1;
+    }
+    
+    getDailyStats(date = new Date().toISOString().split('T')[0]) {
+        return this.checkpoints?.dailyStats[date] || null;
+    }
+    
     updateProgress(index, rkey, status = 'success', error = null) {
         const today = new Date().toISOString().split('T')[0];
         
@@ -681,7 +658,7 @@ class CheckpointManager {
                 rateLimitHits: 0
             };
         }
-
+    
         // Update stats
         this.checkpoints.dailyStats[today].processed++;
         if (status === 'success') {
@@ -703,33 +680,126 @@ class CheckpointManager {
                 rkey
             });
         }
-
+    
         this.checkpoints.lastProcessedIndex = index;
         this.checkpoints.lastProcessedDate = new Date().toISOString();
         
         // Save after each update
-        this.saveCheckpoints();
+        this.saveCheckpoints().catch(err => {
+            logger.error(`Failed to save checkpoint: ${err.message}`);
+        });
     }
+
+    async loadCheckpoints() {
+        try {
+            // Try to load existing checkpoints
+            await fs.promises.access(this.filename);
+            const data = await fs.promises.readFile(this.filename, 'utf-8');
+            const loadedCheckpoints = JSON.parse(data);
+            
+            // Convert completedPacks array back to Set
+            if (loadedCheckpoints.completedPacks) {
+                loadedCheckpoints.completedPacks = new Set(loadedCheckpoints.completedPacks);
+            }
     
-    shouldProcessPack(rkey, isNewOrUpdate = false) {
-        // Always process new packs or those marked for update
-        if (isNewOrUpdate) {
-            return true;
+            logger.info(`Loaded checkpoints: ${JSON.stringify({
+                ...loadedCheckpoints,
+                completedPacks: Array.from(loadedCheckpoints.completedPacks)
+            }, null, 2)}`);
+            
+            return loadedCheckpoints;
+        } catch (err) {
+            if (err.code === 'ENOENT') {
+                logger.info('No checkpoint file found, starting fresh');
+            } else {
+                logger.error(`Error loading checkpoints: ${err.stack || err.message}`);
+            }
+            
+            // Return initial checkpoint state
+            return {
+                version: "1.0",
+                lastProcessedIndex: -1,
+                lastProcessedDate: null,
+                dailyStats: {},
+                errors: [],
+                completedPacks: new Set(),
+                rateLimitHits: [],
+            };
         }
-        // For existing packs, check completion status
-        return !this.checkpoints.completedPacks.has(rkey);
     }
 
-    getLastProcessedIndex() {
-        return this.checkpoints.lastProcessedIndex;
+    async saveCheckpoints() {
+        let lockAcquired = false;
+        try {
+            // Try to acquire lock with retries
+            for (let i = 0; i < 3; i++) {
+                lockAcquired = await this.acquireLock();
+                if (lockAcquired) break;
+                await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+            }
+
+            if (!lockAcquired) {
+                logger.warn('Could not acquire lock after retries, skipping checkpoint save');
+                return;
+            }
+
+            // Prepare checkpoint data
+            const checkpointsToSave = {
+                ...this.checkpoints,
+                completedPacks: Array.from(this.checkpoints.completedPacks)
+            };
+
+            // Write to temp file
+            await fs.promises.writeFile(this.tempFile, JSON.stringify(checkpointsToSave, null, 2));
+
+            // Try to ensure the destination file is writable
+            try {
+                await fs.promises.access(this.filename, fs.constants.W_OK);
+            } catch (err) {
+                if (err.code === 'ENOENT') {
+                    // File doesn't exist, which is fine
+                } else {
+                    // Try to make the file writable
+                    await fs.promises.chmod(this.filename, 0o666).catch(() => {});
+                }
+            }
+
+            // Atomic rename with retries
+            for (let i = 0; i < 3; i++) {
+                try {
+                    await fs.promises.rename(this.tempFile, this.filename);
+                    break;
+                } catch (err) {
+                    if (i === 2) throw err; // Last attempt failed
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+
+        } catch (err) {
+            logger.error(`Error saving checkpoints: ${err.stack || err.message}`);
+            // Don't throw here, just log the error
+        } finally {
+            if (lockAcquired) {
+                await this.releaseLock();
+            }
+            // Always try to clean up temp file
+            await fs.promises.unlink(this.tempFile).catch(() => {});
+        }
     }
 
-    getDailyStats(date = new Date().toISOString().split('T')[0]) {
-        return this.checkpoints.dailyStats[date] || null;
+    async init() {
+        // Clean up any stale lock files on startup
+        try {
+            await fs.promises.unlink(this.lockFile).catch(() => {});
+            await fs.promises.unlink(this.tempFile).catch(() => {});
+        } catch (err) {
+            // Ignore errors during cleanup
+        }
+
+        this.checkpoints = await this.loadCheckpoints();
     }
 }
 
-// First, define the base BlueSkyRateLimiter class
 class BlueSkyRateLimiter {
     constructor() {
         // Overall rate limit: 3000 requests per 5 minutes
@@ -971,167 +1041,211 @@ class StarterPackProcessor {
 
     async writeToMongoDB(packData, userOperations) {
         if (this.noMongoDB) return;
-    
+      
         const session = this.mongoClient.startSession();
         try {
-            await session.withTransaction(async () => {
-                // Ensure the starter pack exists
-                await this.db.collection('starter_packs').updateOne(
-                    { rkey: packData.rkey },
-                    {
-                        $set: {
-                            rkey: packData.rkey,
-                            name: packData.name,
-                            creator: packData.creator,
-                            creator_did: packData.creator_did,
-                            description: packData.description || '',
-                            user_count: parseInt(packData.user_count), // Ensure integer
-                            created_at: new Date(packData.created_at),
-                            updated_at: new Date(packData.updated_at),
-                            users: packData.users
-                        }
-                    },
-                    { upsert: true, session }
-                );
-    
-                // Process user operations in batches
-                const BATCH_SIZE = 500;
-                for (let i = 0; i < userOperations.length; i += BATCH_SIZE) {
-                    const batch = userOperations.slice(i, i + BATCH_SIZE);
-                    
-                    const modifiedBatch = batch.map(op => ({
-                        updateOne: {
-                            filter: op.updateOne.filter,
-                            update: {
-                                $set: {
-                                    did: op.updateOne.update.$set.did,
-                                    handle: op.updateOne.update.$set.handle,
-                                    display_name: op.updateOne.update.$set.display_name,
-                                    last_updated: op.updateOne.update.$set.last_updated,
-                                    profile_check_needed: op.updateOne.update.$set.profile_check_needed
-                                    // Removed pack_ids from $set
-                                },
-                                $addToSet: { pack_ids: packData.rkey } // Only using $addToSet
-                            },
-                            upsert: true
-                        }
-                    }));
-    
-                    try {
-                        await this.db.collection('users').bulkWrite(modifiedBatch, {
-                            ordered: false,
-                            session
-                        });
-                    } catch (err) {
-                        if (err.code === 11000) {
-                            // Handle duplicate key errors individually
-                            for (const op of modifiedBatch) {
-                                try {
-                                    await this.db.collection('users').updateOne(
-                                        op.updateOne.filter,
-                                        op.updateOne.update,
-                                        { upsert: true, session }
-                                    );
-                                } catch (innerErr) {
-                                    if (innerErr.code !== 11000) {
-                                        throw innerErr;
-                                    }
-                                }
-                            }
-                        } else {
-                            throw err;
-                        }
-                    }
+          await session.withTransaction(async () => {
+            // Ensure the starter pack exists
+            await this.db.collection('starter_packs').updateOne(
+              { rkey: packData.rkey },
+              {
+                $set: {
+                  rkey: packData.rkey,
+                  name: packData.name,
+                  creator: packData.creator,
+                  creator_did: packData.creator_did,
+                  description: packData.description || '',
+                  user_count: parseInt(packData.user_count), // Ensure integer
+                  created_at: new Date(packData.created_at),
+                  updated_at: new Date(packData.updated_at),
+                  users: packData.users
                 }
-            }, {
-                readPreference: 'primary',
-                readConcern: { level: 'majority' },
-                writeConcern: { w: 'majority' }
-            });
+              },
+              { upsert: true, session }
+            );
+      
+            // Process user operations in batches
+            const BATCH_SIZE = 500;
+            for (let i = 0; i < userOperations.length; i += BATCH_SIZE) {
+              const batch = userOperations.slice(i, i + BATCH_SIZE);
+      
+              // Include all necessary fields in $set
+              const modifiedBatch = batch.map(op => ({
+                updateOne: {
+                  filter: op.updateOne.filter,
+                  update: {
+                    $set: {
+                      did: op.updateOne.update.$set.did,
+                      handle: op.updateOne.update.$set.handle,
+                      display_name: op.updateOne.update.$set.display_name,
+                      followers_count: op.updateOne.update.$set.followers_count,
+                      follows_count: op.updateOne.update.$set.follows_count,
+                      last_updated: op.updateOne.update.$set.last_updated,
+                      profile_check_needed: op.updateOne.update.$set.profile_check_needed
+                    },
+                    $addToSet: { pack_ids: packData.rkey }
+                  },
+                  upsert: true
+                }
+              }));
+      
+              // Execute the batch operation
+              try {
+                await this.db.collection('users').bulkWrite(modifiedBatch, {
+                  ordered: false,
+                  session
+                });
+              } catch (err) {
+                // Handle errors as before
+                if (err.code === 11000) {
+                  // Handle duplicate key errors individually
+                  for (const op of modifiedBatch) {
+                    try {
+                      await this.db.collection('users').updateOne(
+                        op.updateOne.filter,
+                        op.updateOne.update,
+                        { upsert: true, session }
+                      );
+                    } catch (innerErr) {
+                      if (innerErr.code !== 11000) {
+                        throw innerErr;
+                      }
+                    }
+                  }
+                } else {
+                  throw err;
+                }
+              }
+            }
+          }, {
+            readPreference: 'primary',
+            readConcern: { level: 'majority' },
+            writeConcern: { w: 'majority' }
+          });
         } finally {
-            await session.endSession();
+          await session.endSession();
         }
-    }
+      }
     
 
     async setupDatabase() {
         try {
-            await this.mongoClient.connect();
-            this.db = this.mongoClient.db('starterpacks');
-    
-            // Only ensure collections exist, don't drop
-            await this.db.createCollection('starter_packs', {
-                validator: {
-                    $jsonSchema: {
-                        bsonType: 'object',
-                        required: ['rkey', 'name', 'creator', 'creator_did'],
-                        properties: {
-                            rkey: { bsonType: 'string' },
-                            name: { bsonType: 'string' },
-                            creator: { bsonType: 'string' },
-                            creator_did: { bsonType: 'string' },
-                            description: { bsonType: ['string', 'null'] },
-                            user_count: { bsonType: 'int' },
-                            created_at: { bsonType: 'date' },
-                            updated_at: { bsonType: 'date' },
-                            users: { 
-                                bsonType: 'array',
-                                items: { bsonType: 'string' }
-                            }
-                        }
-                    }
-                }
-            }).catch(err => {
-                // Ignore error if collection already exists
-                if (err.code !== 48) { // 48 is "collection already exists"
-                    throw err;
-                }
+          await this.mongoClient.connect();
+          this.db = this.mongoClient.db('starterpacks');
+      
+          // Ensure 'starter_packs' collection exists
+          await this.db.createCollection('starter_packs', {
+            validator: {
+              $jsonSchema: {
+                bsonType: 'object',
+                required: ['rkey', 'name', 'creator', 'creator_did'],
+                properties: {
+                  rkey: { bsonType: 'string' },
+                  name: { bsonType: 'string' },
+                  creator: { bsonType: 'string' },
+                  creator_did: { bsonType: 'string' },
+                  description: { bsonType: ['string', 'null'] },
+                  user_count: { bsonType: 'int' },
+                  created_at: { bsonType: 'date' },
+                  updated_at: { bsonType: 'date' },
+                  users: {
+                    bsonType: 'array',
+                    items: { bsonType: 'string' },
+                  },
+                },
+                additionalProperties: true, // Allow additional fields if needed
+              },
+            },
+          }).catch((err) => {
+            // Ignore error if collection already exists
+            if (err.code !== 48) {
+              // 48 is "collection already exists"
+              throw err;
+            }
+          });
+      
+          // Ensure 'users' collection exists
+          await this.db.createCollection('users', {
+            validator: {
+              $jsonSchema: {
+                bsonType: 'object',
+                required: ['did', 'handle'],
+                properties: {
+                  did: { bsonType: 'string' },
+                  handle: { bsonType: 'string' },
+                  display_name: { bsonType: ['string', 'null'] },
+                  pack_ids: {
+                    bsonType: 'array',
+                    items: { bsonType: 'string' },
+                  },
+                  last_updated: { bsonType: 'date' },
+                  profile_check_needed: { bsonType: 'bool' },
+                },
+                additionalProperties: true, // Allow additional fields if needed
+              },
+            },
+          }).catch((err) => {
+            // Ignore error if collection already exists
+            if (err.code !== 48) {
+              throw err;
+            }
+          });
+      
+          // **Update the schema validator for the 'users' collection**
+          try {
+            const newUserSchema = {
+                bsonType: 'object',
+                required: ['did', 'handle'],
+                properties: {
+                did: { bsonType: 'string' },
+                handle: { bsonType: 'string' },
+                display_name: { bsonType: ['string', 'null'] },
+                followers_count: { bsonType: 'int' }, // New field
+                follows_count: { bsonType: 'int' },   // New field
+                pack_ids: {
+                    bsonType: 'array',
+                    items: { bsonType: 'string' },
+                },
+                last_updated: { bsonType: 'date' },
+                profile_check_needed: { bsonType: 'bool' },
+                },
+                additionalProperties: true, // Adjust as needed
+            };
+        
+            await this.db.command({
+                collMod: 'users',
+                validator: { $jsonSchema: newUserSchema },
+                validationLevel: 'moderate', // Using 'moderate' to avoid affecting existing documents
             });
-    
-            await this.db.createCollection('users', {
-                validator: {
-                    $jsonSchema: {
-                        bsonType: 'object',
-                        required: ['did', 'handle'],
-                        properties: {
-                            did: { bsonType: 'string' },
-                            handle: { bsonType: 'string' },
-                            display_name: { bsonType: ['string', 'null'] },
-                            pack_ids: { 
-                                bsonType: 'array',
-                                items: { bsonType: 'string' }
-                            },
-                            last_updated: { bsonType: 'date' },
-                            profile_check_needed: { bsonType: 'bool' }
-                        }
-                    }
-                }
-            }).catch(err => {
-                // Ignore error if collection already exists
-                if (err.code !== 48) {
-                    throw err;
-                }
-            });
-    
-            // Ensure indexes exist - MongoDB will only create if they don't exist
-            await Promise.all([
-                this.db.collection('users').createIndex({ did: 1 }, { unique: true }),
-                this.db.collection('users').createIndex({ handle: 1 }),
-                this.db.collection('users').createIndex({ pack_ids: 1 }),
-                this.db.collection('users').createIndex({ last_updated: 1 }),
-                this.db.collection('users').createIndex({ profile_check_needed: 1 }),
-                this.db.collection('starter_packs').createIndex({ rkey: 1 }, { unique: true }),
-                this.db.collection('starter_packs').createIndex({ creator_did: 1 }),
-                this.db.collection('starter_packs').createIndex({ creator: 1 }),
-                this.db.collection('starter_packs').createIndex({ updated_at: 1 })
-            ]);
-    
-            logger.info('MongoDB setup completed successfully');
+
+            logger.info('Schema validator for users collection updated successfully');
+          } catch (err) {
+            if (err.codeName === 'Unauthorized' || err.code === 13) {
+                logger.warn('Insufficient privileges to modify collection validator. Proceeding without updating schema.');
+            } else {
+                throw err; // Rethrow if it's a different error
+            }
+          }
+                
+          // Ensure indexes exist - MongoDB will only create if they don't exist
+          await Promise.all([
+            this.db.collection('users').createIndex({ did: 1 }, { unique: true }),
+            this.db.collection('users').createIndex({ handle: 1 }),
+            this.db.collection('users').createIndex({ pack_ids: 1 }),
+            this.db.collection('users').createIndex({ last_updated: 1 }),
+            this.db.collection('users').createIndex({ profile_check_needed: 1 }),
+            this.db.collection('starter_packs').createIndex({ rkey: 1 }, { unique: true }),
+            this.db.collection('starter_packs').createIndex({ creator_did: 1 }),
+            this.db.collection('starter_packs').createIndex({ creator: 1 }),
+            this.db.collection('starter_packs').createIndex({ updated_at: 1 }),
+          ]);
+      
+          logger.info('MongoDB setup completed successfully');
         } catch (err) {
-            logger.error(`Error setting up database: ${err.stack || err.message}`);
-            throw err;
+          logger.error(`Error setting up database: ${err.stack || err.message}`);
+          throw err;
         }
-    }
+      }
 
     async setupAgent() {
         try {
@@ -1280,84 +1394,96 @@ class StarterPackProcessor {
 
     async getProfile(did, forceUpdate = false) {
         const TEN_DAYS = 10 * 24 * 60 * 60 * 1000;
-        
+      
         // Check memory cache first
         const cached = this.profileCache.get(did);
         if (!forceUpdate && cached && Date.now() - cached.timestamp < this.profileCacheExpiry) {
-            return cached.profile;
+          return cached.profile;
         }
-    
+      
         // Check MongoDB if enabled
         if (!this.noMongoDB) {
-            try {
-                const userDoc = await this.db.collection('users').findOne({ did });
-                if (userDoc) {
-                    const needsUpdate = Date.now() - userDoc.last_updated.getTime() > TEN_DAYS;
-                    
-                    if (!needsUpdate && !forceUpdate) {
-                        // Map MongoDB fields to API response fields
-                        const profile = {
-                            did: userDoc.did,
-                            handle: userDoc.handle,
-                            displayName: userDoc.display_name, // Map display_name to displayName
-                            // Add other necessary mappings if required
-                        };
-                        this.profileCache.set(did, {
-                            profile: profile,
-                            timestamp: Date.now()
-                        });
-                        return profile;
-                    }
-                    
-                    // Mark for update if older than 10 days
-                    if (needsUpdate) {
-                        await this.db.collection('users').updateOne(
-                            { did },
-                            { $set: { profile_check_needed: true } }
-                        );
-                    }
-                }
-            } catch (err) {
-                logger.error(`MongoDB profile check error for ${did}: ${err.stack || err.message}`);
-            }
-        }
-    
-        // Fetch from API if needed
-        const profile = await this.fetchProfileFromAPI(did);
-        if (profile) {
-            // Create user data with proper display name handling
-            const userData = {
-                did: did,  // Use the original DID, not profile.did
-                handle: profile.handle,
-                displayName: profile.displayName,  // Ensure consistency
-                last_updated: new Date(),
-                profile_check_needed: false
-            };
-    
-            // Update MongoDB
-            if (!this.noMongoDB) {
+          try {
+            const userDoc = await this.db.collection('users').findOne({ did });
+            if (userDoc) {
+              const needsUpdate = Date.now() - userDoc.last_updated.getTime() > TEN_DAYS;
+      
+              if (!needsUpdate && !forceUpdate) {
+                // Map MongoDB fields to profile object
+                const profile = {
+                  did: userDoc.did,
+                  handle: userDoc.handle,
+                  displayName: userDoc.display_name,
+                  followersCount: userDoc.followers_count,
+                  followsCount: userDoc.follows_count,
+                };
+                this.profileCache.set(did, {
+                  profile: profile,
+                  timestamp: Date.now(),
+                });
+                return profile;
+              }
+      
+              // Mark for update if older than 10 days
+              if (needsUpdate) {
                 await this.db.collection('users').updateOne(
-                    { did },
-                    { $set: userData },
-                    { upsert: true }
+                  { did },
+                  { $set: { profile_check_needed: true } }
                 );
-                
-                await this.db.collection('starter_packs').updateMany(
-                    { users: did },
-                    { $set: { updated_at: new Date() } }
-                );
+              }
             }
-    
-            this.profileCache.set(did, {
-                profile: userData,
-                timestamp: Date.now()
-            });
-    
-            return userData;
+          } catch (err) {
+            logger.error(`MongoDB profile check error for ${did}: ${err.stack || err.message}`);
+          }
         }
-        
+      
+        // Fetch from API if needed
+        const apiProfile = await this.fetchProfileFromAPI(did);
+        if (apiProfile) {
+          // Create user data with proper display name handling
+          const userData = {
+            did: did,
+            handle: apiProfile.handle,
+            display_name: apiProfile.displayName,
+            followers_count: parseInt(apiProfile.followersCount) || 0,
+            follows_count: parseInt(apiProfile.followsCount) || 0,
+            last_updated: new Date(),
+            profile_check_needed: false,
+          };
+      
+          // Update MongoDB
+          if (!this.noMongoDB) {
+            await this.db.collection('users').updateOne(
+              { did },
+              { $set: userData },
+              { upsert: true }
+            );
+      
+            await this.db.collection('starter_packs').updateMany(
+              { users: did },
+              { $set: { updated_at: new Date() } }
+            );
+          }
+      
+          // Map userData to profile object
+          const profile = {
+            did: userData.did,
+            handle: userData.handle,
+            displayName: userData.display_name,
+            followersCount: userData.followers_count,
+            followsCount: userData.follows_count,
+          };
+      
+          this.profileCache.set(did, {
+            profile: profile,
+            timestamp: Date.now(),
+          });
+      
+          return profile;
+        }
+      
         return null;
-    }
+      }
 
     async getProcessingStatus() {
         try {
@@ -1394,7 +1520,7 @@ class StarterPackProcessor {
                 );
                 
                 // debug logging
-                //logger.info(`Profile response for ${did}: ${JSON.stringify(response?.data, null, 2)}`);
+                logger.info(`Profile response for ${did}: ${JSON.stringify(response?.data, null, 2)}`);
                 
                 const shouldRetry = await this.rateLimiter.handleResponse(response);
                 if (shouldRetry && attempt < maxRetries - 1) {
@@ -1411,7 +1537,9 @@ class StarterPackProcessor {
                     return {
                         did: profile.did,
                         handle: profile.handle,
-                        displayName: displayName
+                        displayName: profile.displayName?.trim() || profile.handle,
+                        followersCount: profile.followersCount || 0,
+                        followsCount: profile.followsCount || 0
                     };
                 }
                 return null;
@@ -1600,7 +1728,7 @@ class StarterPackProcessor {
         const startTime = Date.now();
         
         try {
-            // Initialize MongoDB connection if needed
+            // Initialize MongoDB if needed
             if (!this.noMongoDB) {
                 await this.ensureDbConnection();
                 mongoConnection = true;
@@ -1620,7 +1748,7 @@ class StarterPackProcessor {
     
             logger.info(`\n=== Starting to process pack by ${creatorHandle}: ${rkey} ===`);
     
-            // Track all changes
+            // Track all types of changes
             const changes = {
                 renamed: [], // Users who changed handles
                 updated: [], // Users with updated profiles
@@ -1629,14 +1757,14 @@ class StarterPackProcessor {
                 failed: []   // Failed profile fetches
             };
     
-            // First check if we already have this pack
+            // Skip if already processed and not needing update
             const existingPack = this.fileManager.getExistingPack(rkey);
             if (existingPack && !this.checkpointManager.shouldProcessPack(rkey)) {
                 logger.info(`Pack ${rkey} already processed, skipping...`);
                 return true;
             }
     
-            // Resolve creator's DID with retries
+            // Resolve creator's handle to DID
             let creatorDID = await this.resolveHandleWithRetry(creatorHandle);
             if (!creatorDID) {
                 logger.error(`Failed to resolve creator DID for ${creatorHandle}, skipping pack ${rkey}`);
@@ -1656,7 +1784,7 @@ class StarterPackProcessor {
             logger.info(`Description: ${value.description || 'No description'}`);
             logger.info(`List URI: ${value.list}`);
     
-            // Fetch all list members
+            // Fetch list members
             const listMembers = await this.getAllListMembers(value.list);
             if (!listMembers || listMembers.length === 0) {
                 logger.error(`No members found in the list for pack ${rkey}`);
@@ -1665,7 +1793,7 @@ class StarterPackProcessor {
     
             logger.info(`Processing ${listMembers.length} members...`);
     
-            // Get existing users if updating
+            // Load existing users for comparison
             let existingUsers = new Map();
             if (existingPack) {
                 const existingUserDids = new Set(existingPack.users);
@@ -1692,20 +1820,17 @@ class StarterPackProcessor {
                     // First profile fetch attempt
                     let profile = await this.getProfile(memberDid);
                     
-                    // Handle empty display names
+                    // Handle empty display names with retry
                     if (profile && (!profile.displayName || profile.displayName.trim() === '')) {
                         logger.warn(`WARNING: Empty display name for DID ${memberDid} (handle: ${profile.handle})`);
-                        await this.delay(2000); // Wait before retry
-                        
-                        // Second attempt with force update
+                        await this.delay(2000);
                         profile = await this.getProfile(memberDid, true);
                     }
     
                     if (profile) {
-                        // Track changes if this is an existing user
+                        // Track changes for existing users
                         const existingUser = existingUsers.get(memberDid);
                         if (existingUser) {
-                            // Check for handle changes
                             if (existingUser.handle !== profile.handle) {
                                 changes.renamed.push({
                                     did: memberDid,
@@ -1714,7 +1839,6 @@ class StarterPackProcessor {
                                 });
                             }
     
-                            // Check for profile updates
                             if (existingUser.display_name !== profile.displayName) {
                                 changes.updated.push({
                                     did: memberDid,
@@ -1724,7 +1848,6 @@ class StarterPackProcessor {
                                 });
                             }
                         } else {
-                            // This is a new user
                             changes.added.push({
                                 did: memberDid,
                                 handle: profile.handle
@@ -1734,24 +1857,22 @@ class StarterPackProcessor {
                         const userData = {
                             did: memberDid,
                             handle: profile.handle,
-                            display_name: profile.displayName || ''
+                            display_name: profile.displayName || '',
+                            followers_count: parseInt(profile.followersCount) || 0,
+                            follows_count: parseInt(profile.followsCount) || 0,
+                            last_updated: new Date(),
+                            profile_check_needed: false
                         };
     
                         processedUsers.push(userData);
     
-                        // Prepare MongoDB operations if enabled
+                        // Prepare MongoDB operations
                         if (!this.noMongoDB) {
                             mongodbOperations.push({
                                 updateOne: {
                                     filter: { did: memberDid },
                                     update: {
-                                        $set: {
-                                            did: memberDid,
-                                            handle: profile.handle,
-                                            display_name: profile.displayName || '',
-                                            last_updated: new Date(),
-                                            profile_check_needed: false
-                                        },
+                                        $set: userData,
                                         $addToSet: { pack_ids: rkey }
                                     },
                                     upsert: true
@@ -1786,14 +1907,14 @@ class StarterPackProcessor {
                         handle: existingUsers.get(did)?.handle || 'unknown'
                     }));
     
-                    // Update MongoDB to remove pack_id from removed users
+                    // Update MongoDB for removed users
                     if (!this.noMongoDB) {
                         await this.db.collection('users').updateMany(
                             { did: { $in: removedDids } },
                             { $pull: { pack_ids: rkey } }
                         );
     
-                        // Clean up users who are no longer in any packs
+                        // Clean up users no longer in any packs
                         const cleanupResults = await this.db.collection('users').deleteMany({
                             did: { $in: removedDids },
                             pack_ids: { $size: 0 }
@@ -1819,7 +1940,7 @@ class StarterPackProcessor {
                 users: processedUsers.map(u => u.did)
             };
     
-            // MongoDB operations if enabled
+            // Update MongoDB if enabled
             if (!this.noMongoDB && mongodbOperations.length > 0) {
                 try {
                     await this.writeToMongoDB(packData, mongodbOperations);
@@ -1830,7 +1951,7 @@ class StarterPackProcessor {
                 }
             }
     
-            // Always write to files
+            // Write to files
             try {
                 await this.fileManager.writePack(packData);
                 logger.info(`File update completed for pack ${rkey}`);
@@ -1839,7 +1960,7 @@ class StarterPackProcessor {
                 return false;
             }
     
-            // Log all changes
+            // Log changes
             const changeReport = [];
             if (changes.added.length > 0) changeReport.push(`Added: ${changes.added.length}`);
             if (changes.removed.length > 0) changeReport.push(`Removed: ${changes.removed.length}`);
@@ -1893,8 +2014,8 @@ class StarterPackProcessor {
             throw err;
     
         } finally {
-            // Log memory usage for long-running operations
-            if (Date.now() - startTime > 30000) { // If operation took more than 30s
+            // Log memory usage for long operations
+            if (Date.now() - startTime > 30000) {
                 const used = process.memoryUsage();
                 logger.info(`Memory usage after long operation:\n` +
                     `HeapUsed: ${Math.round(used.heapUsed / 1024 / 1024)}MB\n` +

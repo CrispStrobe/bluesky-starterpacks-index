@@ -2,6 +2,9 @@
 
 A collection of tools for collecting, processing, and searching Bluesky starter packs. These tools help you collect, process, and search through Bluesky's starter packs and their user data.
 
+They also build a MongoDB index that can easily be searched. For a prototype of an index frontend of BlueSky Starterpacks see the demo currently running [on vercel](https://starter-pack-explorer-o13o.vercel.app/), [github repo](https://github.com/CrispStrobe/starter-pack-explorer/).
+
+
 ## Prerequisites
 
 - Node.js (v16 or higher): [Download Node.js](https://nodejs.org/)

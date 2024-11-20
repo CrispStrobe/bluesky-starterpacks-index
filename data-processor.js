@@ -47,6 +47,63 @@ const logger = winston.createLogger({
     ],
 });
 
+class LRUCache {
+    constructor(maxSize = 1000) {
+        this.cache = new Map();
+        this.maxSize = maxSize;
+    }
+
+    set(key, value) {
+        if (this.cache.size >= this.maxSize) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+        }
+        this.cache.set(key, value);
+    }
+
+    get(key) {
+        const value = this.cache.get(key);
+        if (value) {
+            // Refresh item's position
+            this.cache.delete(key);
+            this.cache.set(key, value);
+        }
+        return value;
+    }
+
+    clear() {
+        this.cache.clear();
+    }
+}
+
+class ResourceManager {
+    constructor() {
+        this.resources = new Set();
+    }
+    
+    register(resource) {
+        this.resources.add(resource);
+    }
+    
+    async cleanup() {
+        const errors = [];
+        for (const resource of this.resources) {
+            try {
+                if (typeof resource.cleanup === 'function') {
+                    await resource.cleanup();
+                } else if (typeof resource.close === 'function') {
+                    await resource.close();
+                }
+            } catch (err) {
+                errors.push(err);
+            }
+        }
+        if (errors.length > 0) {
+            throw new AggregateError(errors, 'Multiple cleanup errors occurred');
+        }
+    }
+}
+
 class FileManager {
     constructor() {
         this.existingPacks = new Map();
@@ -101,14 +158,24 @@ class FileManager {
 
     async atomicWrite(path, content) {
         const tempPath = `${path}.tmp`;
+        const lockPath = `${path}.lock`;
+        
         try {
+            // Try to create lock file
+            await fs.promises.writeFile(lockPath, process.pid.toString(), { flag: 'wx' });
+            
             await fs.promises.writeFile(tempPath, content);
             await fs.promises.rename(tempPath, path);
         } catch (err) {
+            if (err.code === 'EEXIST') {
+                throw new Error('File is locked by another process');
+            }
+            throw err;
+        } finally {
             try {
+                await fs.promises.unlink(lockPath).catch(() => {});
                 await fs.promises.unlink(tempPath).catch(() => {});
             } catch (_) {}
-            throw err;
         }
     }
 
@@ -131,24 +198,25 @@ class FileManager {
             if (!await this.validatePaths(['starter_packs.json', 'starter_packs.yaml'])) {
                 throw new Error('Required file paths are not accessible');
             }
-            
-            // Check if directory exists and is writable
+    
             const dir = './';
             try {
                 await fs.promises.access(dir, fs.constants.R_OK | fs.constants.W_OK);
             } catch (err) {
                 throw new Error(`Directory ${dir} is not accessible: ${err.message}`);
             }
-            
-            // Try to load existing files
+    
             const jsonExists = await fs.promises.access('starter_packs.json')
                 .then(() => true)
                 .catch(() => false);
-
+            const yamlExists = await fs.promises.access('starter_packs.yaml')
+                .then(() => true)
+                .catch(() => false);
+    
             if (jsonExists) {
                 // Read and parse existing JSON
                 const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
-                const trimmedContent = content.replace(/\]\s*$/, ''); // Remove trailing ]
+                const trimmedContent = content.replace(/\]\s*$/, '');
                 const packs = JSON.parse(trimmedContent + ']');
                 
                 packs.forEach(pack => {
@@ -156,44 +224,51 @@ class FileManager {
                 });
                 
                 logger.info(`Loaded ${this.existingPacks.size} existing packs`);
-
-                // Backup old files
-                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                await fs.promises.rename('starter_packs.json', `starter_packs.${timestamp}.json`);
-                await fs.promises.rename('starter_packs.yaml', `starter_packs.${timestamp}.yaml`);
-            }
-
-            // Create new files
-            this.jsonStream = fs.createWriteStream('starter_packs.json');
-            this.yamlStream = fs.createWriteStream('starter_packs.yaml');
-            
-
-            this.jsonStream.on('error', (err) => {
-                logger.error(`JSON Stream Error: ${err.stack || err.message}`);
-            });
                 
-            this.yamlStream.on('error', (err) => {
-                logger.error(`YAML Stream Error: ${err.stack || err.message}`);
-            });
-
-            // Write initial content including existing packs
-            const initialJson = '[' + Array.from(this.existingPacks.values())
-                .map(pack => JSON.stringify(pack, null, 2))
-                .join(',\n');
-            await new Promise(resolve => this.jsonStream.write(initialJson, resolve));
-            
-            // Write existing packs to YAML
-            for (const pack of this.existingPacks.values()) {
-                await new Promise(resolve => 
-                    this.yamlStream.write('---\n' + yaml.dump(pack), resolve)
-                );
+                // Create backup only on fresh start
+                if (this.existingPacks.size > 0) {
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    await fs.promises.copyFile('starter_packs.json', `starter_packs.${timestamp}.backup.json`);
+                    if (yamlExists) {
+                        await fs.promises.copyFile('starter_packs.yaml', `starter_packs.${timestamp}.backup.yaml`);
+                    }
+                }
+    
+                // Create append streams
+                this.jsonStream = fs.createWriteStream('starter_packs.json', { flags: 'a' });
+                this.yamlStream = fs.createWriteStream('starter_packs.yaml', { flags: yamlExists ? 'a' : 'w' });
+                
+                this.setupStreamErrorHandlers();
+    
+                // If the content doesn't end with a comma and we have existing packs, add one
+                const needsComma = !trimmedContent.trim().endsWith(',');
+                if (needsComma && this.existingPacks.size > 0) {
+                    await new Promise(resolve => this.jsonStream.write(',\n', resolve));
+                }
+            } else {
+                // Only create new files if they don't exist
+                this.jsonStream = fs.createWriteStream('starter_packs.json');
+                this.yamlStream = fs.createWriteStream('starter_packs.yaml');
+                
+                this.setupStreamErrorHandlers();
+                await new Promise(resolve => this.jsonStream.write('[', resolve));
             }
-
+    
             this.isFirstEntry = this.existingPacks.size === 0;
         } catch (err) {
             logger.error(`Error initializing file manager: ${err.stack || err.message}`);
             throw err;
         }
+    }
+    
+    async setupStreamErrorHandlers() {
+        this.jsonStream.on('error', (err) => {
+            logger.error(`JSON Stream Error: ${err.stack || err.message}`);
+        });
+            
+        this.yamlStream.on('error', (err) => {
+            logger.error(`YAML Stream Error: ${err.stack || err.message}`);
+        });
     }
 
     async getExistingProfile(did) {
@@ -234,24 +309,57 @@ class FileManager {
         const removedDids = [...existingDids].filter(did => !currentDids.has(did));
         if (removedDids.length > 0) {
             logger.info(`${removedDids.length} profiles were removed from pack ${pack.rkey}`);
+            
+            // Update MongoDB to remove pack_id from removed users
+            if (!this.noMongoDB) {
+                try {
+                    await this.db.collection('users').updateMany(
+                        { did: { $in: removedDids } },
+                        { $pull: { pack_ids: pack.rkey } }
+                    );
+                    
+                    // Optional: Clean up users who are no longer in any packs
+                    const cleanupResults = await this.db.collection('users').deleteMany({
+                        did: { $in: removedDids },
+                        pack_ids: { $size: 0 }
+                    });
+                    
+                    if (cleanupResults.deletedCount > 0) {
+                        logger.info(`Removed ${cleanupResults.deletedCount} users who are no longer in any packs`);
+                    }
+                } catch (err) {
+                    logger.error(`Error updating removed users in MongoDB: ${err.stack || err.message}`);
+                    // Don't throw - we want to continue processing even if this fails
+                }
+            }
         }
+        
+        // Also track newly added users
+        const addedDids = [...currentDids].filter(did => !existingDids.has(did));
+        if (addedDids.length > 0) {
+            logger.info(`${addedDids.length} new profiles were added to pack ${pack.rkey}`);
+        }
+        
+        return {
+            removed: removedDids,
+            added: addedDids
+        };
     }
 
     async writePack(pack) {
         try {
             await this.handleRemovedProfiles(pack);
             this.existingPacks.set(pack.rkey, pack);
-            await this.safeWrite(
-                this.jsonStream,
-                (this.isFirstEntry ? '' : ',\n') + JSON.stringify(pack, null, 2)
-            );
-            await this.safeWrite(
-                this.yamlStream,
-                '---\n' + yaml.dump(pack)
-            );
+            
+            const content = (this.isFirstEntry ? '' : ',\n') + JSON.stringify(pack, null, 2);
+            await this.safeWrite(this.jsonStream, content);
+            await this.safeWrite(this.yamlStream, '---\n' + yaml.dump(pack));
+            
             this.isFirstEntry = false;
         } catch (err) {
             logger.error(`Error writing pack ${pack.rkey}: ${err.stack || err.message}`);
+            // Make sure we properly close streams on error
+            await this.cleanup();
             throw err;
         }
     }
@@ -527,23 +635,37 @@ class CheckpointManager {
     }
 
     async saveCheckpoints() {
-        if (await this.acquireLock()) {
-            const tempFile = `${this.filename}.temp`;
-            try {
-                const checkpointsToSave = {
-                    ...this.checkpoints,
-                    completedPacks: Array.from(this.checkpoints.completedPacks)
-                };
-                await fs.promises.writeFile(tempFile, JSON.stringify(checkpointsToSave, null, 2));
-                await fs.promises.rename(tempFile, this.filename);
-            } catch (err) {
-                logger.error(`Error saving checkpoints: ${err.stack || err.message}`);
-                try {
-                    await fs.promises.unlink(tempFile).catch(() => {});
-                } catch (_) {}
-            } finally {
-                await this.releaseLock();
+        const lockFile = `${this.filename}.lock`;
+        const tempFile = `${this.filename}.temp`;
+        
+        try {
+            // Try to acquire lock
+            await fsPromises.writeFile(lockFile, String(process.pid), { flag: 'wx' });
+            
+            // Prepare checkpoint data
+            const checkpointsToSave = {
+                ...this.checkpoints,
+                completedPacks: Array.from(this.checkpoints.completedPacks)
+            };
+            
+            // Write to temp file
+            await fs.promises.writeFile(tempFile, JSON.stringify(checkpointsToSave, null, 2));
+            
+            // Atomic rename
+            await fs.promises.rename(tempFile, this.filename);
+            
+        } catch (err) {
+            if (err.code === 'EEXIST') {
+                logger.warn('Checkpoint save skipped - another process holds the lock');
+                return;
             }
+            logger.error(`Error saving checkpoints: ${err.stack || err.message}`);
+            throw err;
+        } finally {
+            try {
+                await fs.promises.unlink(lockFile).catch(() => {});
+                await fs.promises.unlink(tempFile).catch(() => {});
+            } catch (_) {}
         }
     }
 
@@ -589,7 +711,12 @@ class CheckpointManager {
         this.saveCheckpoints();
     }
     
-    shouldProcessPack(rkey) {
+    shouldProcessPack(rkey, isNewOrUpdate = false) {
+        // Always process new packs or those marked for update
+        if (isNewOrUpdate) {
+            return true;
+        }
+        // For existing packs, check completion status
         return !this.checkpoints.completedPacks.has(rkey);
     }
 
@@ -602,6 +729,7 @@ class CheckpointManager {
     }
 }
 
+// First, define the base BlueSkyRateLimiter class
 class BlueSkyRateLimiter {
     constructor() {
         // Overall rate limit: 3000 requests per 5 minutes
@@ -697,32 +825,61 @@ class BlueSkyRateLimiter {
     }
 }
 
+// Then define the AdaptiveRateLimiter that extends it
+class AdaptiveRateLimiter extends BlueSkyRateLimiter {
+    constructor() {
+        super();
+        this.dynamicDelay = 1000; // Start with 1 second
+        this.lastResponseTime = Date.now();
+    }
+
+    async handleResponse(response) {
+        const remaining = response?.headers?.['x-ratelimit-remaining'];
+        const resetTime = response?.headers?.['x-ratelimit-reset'];
+        
+        if (remaining !== undefined) {
+            // Adjust delay based on remaining quota
+            const remainingPercent = remaining / this.maxRequests;
+            if (remainingPercent < 0.2) {
+                this.dynamicDelay = Math.min(this.dynamicDelay * 1.5, 5000);
+            } else if (remainingPercent > 0.5) {
+                this.dynamicDelay = Math.max(this.dynamicDelay * 0.8, 1000);
+            }
+        }
+        
+        return super.handleResponse(response);
+    }
+}
+
 class StarterPackProcessor {
     constructor() {
-        // Get command line arguments
         const args = process.argv.slice(2);
         this.noMongoDB = args.includes('--nomongodb');
         this.updateMongoDB = args.includes('--updatemongodb');
     
         if (!this.updateMongoDB) {
-            // Normal mode or --nomongodb mode
             this.agent = new BskyAgent({ service: 'https://bsky.social' });
             if (!this.noMongoDB) {
-                this.mongoClient = new MongoClient(process.env.MONGODB_URI);
+                this.mongoClient = new MongoClient(process.env.MONGODB_URI, {
+                    maxPoolSize: 10,
+                    minPoolSize: 1,
+                    maxIdleTimeMS: 30000,
+                    connectTimeoutMS: 5000,
+                    serverSelectionTimeoutMS: 5000,
+                });
             }
             this.db = null;
-            this.rateLimiter = new BlueSkyRateLimiter();
+            this.rateLimiter = new AdaptiveRateLimiter(); // Use the adaptive rate limiter
             this.lastTokenRefresh = Date.now();
             this.tokenRefreshInterval = 45 * 60 * 1000;
             this.checkpointManager = new CheckpointManager();
-            this.fileManager = new FileManager(); // New addition
+            this.fileManager = new FileManager();
             this.isInitialized = false;
-            this.profileCache = new Map();
+            this.profileCache = new LRUCache(1000); // Use LRU cache with 1000 item limit
             this.profileCacheExpiry = 24 * 60 * 60 * 1000;
+            this.resourceManager = new ResourceManager(); // Add resource manager
         }
     }
-    
-    
 
     async checkMongoHealth() {
         if (this.noMongoDB) return true;
@@ -735,25 +892,48 @@ class StarterPackProcessor {
         }
     }
 
-    async withTransaction(operations) {
-        const TRANSACTION_TIMEOUT = 30000;
-        const session = this.mongoClient.startSession();
-        try {
-            await Promise.race([
-                session.withTransaction(async () => {
+    async recover() {
+        const backupFiles = await fs.promises.readdir('.')
+            .then(files => files.filter(f => f.includes('.backup.')))
+            .catch(() => []);
+            
+        if (backupFiles.length > 0) {
+            const latest = backupFiles
+                .sort((a, b) => b.localeCompare(a))
+                .shift();
+                
+            await fs.promises.copyFile(latest, 'starter_packs.json');
+            logger.info(`Recovered from backup: ${latest}`);
+        }
+    }
+
+    async withTransaction(operations, maxRetries = 3) {
+        let attempt = 0;
+        while (attempt < maxRetries) {
+            const session = this.mongoClient.startSession();
+            try {
+                await session.withTransaction(async () => {
                     await operations(session);
                 }, {
                     readPreference: 'primary',
                     readConcern: { level: 'majority' },
                     writeConcern: { w: 'majority' },
-                    maxCommitTimeMS: TRANSACTION_TIMEOUT
-                }),
-                new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Transaction timeout')), TRANSACTION_TIMEOUT)
-                )
-            ]);
-        } finally {
-            await session.endSession();
+                    maxCommitTimeMS: 60000
+                });
+                return;
+            } catch (err) {
+                if (err.errorLabels?.includes('TransientTransactionError') && 
+                    attempt < maxRetries - 1) {
+                    attempt++;
+                    await new Promise(resolve => 
+                        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+                    );
+                    continue;
+                }
+                throw err;
+            } finally {
+                await session.endSession();
+            }
         }
     }
 
@@ -878,12 +1058,8 @@ class StarterPackProcessor {
         try {
             await this.mongoClient.connect();
             this.db = this.mongoClient.db('starterpacks');
-            
-            // Drop existing collections if they exist
-            await this.db.collection('users').drop().catch(() => {});
-            await this.db.collection('starter_packs').drop().catch(() => {});
-            
-            // Create collections with validation
+    
+            // Only ensure collections exist, don't drop
             await this.db.createCollection('starter_packs', {
                 validator: {
                     $jsonSchema: {
@@ -905,6 +1081,11 @@ class StarterPackProcessor {
                         }
                     }
                 }
+            }).catch(err => {
+                // Ignore error if collection already exists
+                if (err.code !== 48) { // 48 is "collection already exists"
+                    throw err;
+                }
             });
     
             await this.db.createCollection('users', {
@@ -925,9 +1106,14 @@ class StarterPackProcessor {
                         }
                     }
                 }
+            }).catch(err => {
+                // Ignore error if collection already exists
+                if (err.code !== 48) {
+                    throw err;
+                }
             });
     
-            // Create indexes
+            // Ensure indexes exist - MongoDB will only create if they don't exist
             await Promise.all([
                 this.db.collection('users').createIndex({ did: 1 }, { unique: true }),
                 this.db.collection('users').createIndex({ handle: 1 }),
@@ -1388,16 +1574,20 @@ class StarterPackProcessor {
     }
 
     async apiCallWithTimeout(promise, timeout = 30000) {
+        let timeoutId;
+        
         const timeoutPromise = new Promise((_, reject) => {
-            const timeoutId = setTimeout(() => {
-                clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => {
                 reject(new Error('API call timed out'));
             }, timeout);
         });
     
         try {
-            return await Promise.race([promise, timeoutPromise]);
+            const result = await Promise.race([promise, timeoutPromise]);
+            clearTimeout(timeoutId);
+            return result;
         } catch (err) {
+            clearTimeout(timeoutId);
             if (err.message.includes('timeout')) {
                 logger.warn('API call timed out, will retry');
             }
@@ -1407,11 +1597,15 @@ class StarterPackProcessor {
     
     async processStarterPack(urlLine) {
         let mongoConnection = false;
+        const startTime = Date.now();
+        
         try {
+            // Initialize MongoDB connection if needed
             if (!this.noMongoDB) {
                 await this.ensureDbConnection();
                 mongoConnection = true;
             }
+    
             // Input validation
             if (!urlLine || !urlLine.includes('|')) {
                 logger.error(`Invalid URL line format: ${urlLine}`);
@@ -1426,7 +1620,16 @@ class StarterPackProcessor {
     
             logger.info(`\n=== Starting to process pack by ${creatorHandle}: ${rkey} ===`);
     
-            // First check if we already have this pack and it's already processed
+            // Track all changes
+            const changes = {
+                renamed: [], // Users who changed handles
+                updated: [], // Users with updated profiles
+                removed: [], // Users removed from pack
+                added: [],   // Users added to pack
+                failed: []   // Failed profile fetches
+            };
+    
+            // First check if we already have this pack
             const existingPack = this.fileManager.getExistingPack(rkey);
             if (existingPack && !this.checkpointManager.shouldProcessPack(rkey)) {
                 logger.info(`Pack ${rkey} already processed, skipping...`);
@@ -1462,10 +1665,21 @@ class StarterPackProcessor {
     
             logger.info(`Processing ${listMembers.length} members...`);
     
+            // Get existing users if updating
+            let existingUsers = new Map();
+            if (existingPack) {
+                const existingUserDids = new Set(existingPack.users);
+                if (!this.noMongoDB) {
+                    const users = await this.db.collection('users')
+                        .find({ did: { $in: Array.from(existingUserDids) } })
+                        .toArray();
+                    users.forEach(user => existingUsers.set(user.did, user));
+                }
+            }
+    
             // Process user profiles
             const processedUsers = [];
             const mongodbOperations = [];
-            const failedProfiles = [];
     
             for (const member of listMembers) {
                 const memberDid = member.did || (member.subject ? member.subject.did : null);
@@ -1485,17 +1699,42 @@ class StarterPackProcessor {
                         
                         // Second attempt with force update
                         profile = await this.getProfile(memberDid, true);
-                        
-                        if (!profile.displayName || profile.displayName.trim() === '') {
-                            logger.warn(`Display name still empty after retry for ${memberDid}`);
-                        }
                     }
     
                     if (profile) {
+                        // Track changes if this is an existing user
+                        const existingUser = existingUsers.get(memberDid);
+                        if (existingUser) {
+                            // Check for handle changes
+                            if (existingUser.handle !== profile.handle) {
+                                changes.renamed.push({
+                                    did: memberDid,
+                                    oldHandle: existingUser.handle,
+                                    newHandle: profile.handle
+                                });
+                            }
+    
+                            // Check for profile updates
+                            if (existingUser.display_name !== profile.displayName) {
+                                changes.updated.push({
+                                    did: memberDid,
+                                    fields: ['display_name'],
+                                    old: { display_name: existingUser.display_name },
+                                    new: { display_name: profile.displayName }
+                                });
+                            }
+                        } else {
+                            // This is a new user
+                            changes.added.push({
+                                did: memberDid,
+                                handle: profile.handle
+                            });
+                        }
+    
                         const userData = {
                             did: memberDid,
                             handle: profile.handle,
-                            display_name: profile.displayName || '', // Keep empty if truly empty
+                            display_name: profile.displayName || ''
                         };
     
                         processedUsers.push(userData);
@@ -1520,19 +1759,51 @@ class StarterPackProcessor {
                             });
                         }
                     } else {
-                        failedProfiles.push({ did: memberDid, reason: 'Profile fetch failed' });
+                        changes.failed.push({
+                            did: memberDid,
+                            reason: 'Profile fetch failed'
+                        });
                     }
                 } catch (err) {
                     logger.error(`Error processing profile ${memberDid}: ${err.stack || err.message}`);
-                    failedProfiles.push({ did: memberDid, reason: err.message });
-                    continue; // Continue with next user even if one fails
+                    changes.failed.push({
+                        did: memberDid,
+                        reason: err.message
+                    });
+                    continue;
                 }
             }
     
-            // Log failed profiles summary if any
-            if (failedProfiles.length > 0) {
-                logger.warn(`Failed to process ${failedProfiles.length} profiles in pack ${rkey}:`);
-                failedProfiles.forEach(f => logger.warn(`- ${f.did}: ${f.reason}`));
+            // Handle removed users
+            if (existingPack) {
+                const currentDids = new Set(processedUsers.map(u => u.did));
+                const existingDids = new Set(existingPack.users);
+                
+                const removedDids = [...existingDids].filter(did => !currentDids.has(did));
+                if (removedDids.length > 0) {
+                    changes.removed = removedDids.map(did => ({
+                        did,
+                        handle: existingUsers.get(did)?.handle || 'unknown'
+                    }));
+    
+                    // Update MongoDB to remove pack_id from removed users
+                    if (!this.noMongoDB) {
+                        await this.db.collection('users').updateMany(
+                            { did: { $in: removedDids } },
+                            { $pull: { pack_ids: rkey } }
+                        );
+    
+                        // Clean up users who are no longer in any packs
+                        const cleanupResults = await this.db.collection('users').deleteMany({
+                            did: { $in: removedDids },
+                            pack_ids: { $size: 0 }
+                        });
+    
+                        if (cleanupResults.deletedCount > 0) {
+                            logger.info(`Removed ${cleanupResults.deletedCount} users who are no longer in any packs`);
+                        }
+                    }
+                }
             }
     
             // Prepare pack data
@@ -1540,10 +1811,10 @@ class StarterPackProcessor {
                 rkey: rkey,
                 name: value.name,
                 creator: creatorHandle,
-                creator_did: creatorDID, 
+                creator_did: creatorDID,
                 description: value.description || '',
                 user_count: processedUsers.length,
-                created_at: new Date(),
+                created_at: existingPack ? existingPack.created_at : new Date(),
                 updated_at: new Date(),
                 users: processedUsers.map(u => u.did)
             };
@@ -1568,148 +1839,213 @@ class StarterPackProcessor {
                 return false;
             }
     
+            // Log all changes
+            const changeReport = [];
+            if (changes.added.length > 0) changeReport.push(`Added: ${changes.added.length}`);
+            if (changes.removed.length > 0) changeReport.push(`Removed: ${changes.removed.length}`);
+            if (changes.renamed.length > 0) changeReport.push(`Renamed: ${changes.renamed.length}`);
+            if (changes.updated.length > 0) changeReport.push(`Updated: ${changes.updated.length}`);
+            if (changes.failed.length > 0) changeReport.push(`Failed: ${changes.failed.length}`);
+    
             logger.info(`=== Successfully processed pack ${rkey} ===`);
-            logger.info(`Processed ${processedUsers.length}/${listMembers.length} users (${failedProfiles.length} failed)`);
-            
-            return true; // Indicate successful processing
+            logger.info(`Changes: ${changeReport.join(', ')}`);
+    
+            // Detailed change logging
+            if (changes.renamed.length > 0) {
+                logger.info('Handle changes:', changes.renamed
+                    .map(u => `${u.oldHandle} -> ${u.newHandle}`)
+                    .join(', '));
+            }
+            if (changes.removed.length > 0) {
+                logger.info('Removed users:', changes.removed
+                    .map(u => u.handle)
+                    .join(', '));
+            }
+            if (changes.added.length > 0) {
+                logger.info('New users:', changes.added
+                    .map(u => u.handle)
+                    .join(', '));
+            }
+            if (changes.failed.length > 0) {
+                logger.warn('Failed profiles:', changes.failed
+                    .map(f => `${f.did}: ${f.reason}`)
+                    .join(', '));
+            }
+    
+            return true;
     
         } catch (err) {
-            logger.error(`Error processing pack: ${err.stack || err.message}`);
+            const errorDuration = Date.now() - startTime;
+            logger.error(`Error processing pack (duration: ${errorDuration}ms): ${err.stack || err.message}`);
             
             if (err.code === 'ECONNRESET' || err.message.includes('socket hang up')) {
                 logger.info('Network error detected, waiting before retry...');
                 await this.delay(5000);
-                return false; // Signal retry needed
+                return false;
             }
             
-            // connection recovery attempt
-            if (mongoConnection && err.name === 'MongoNetworkError') {
-                logger.warn('MongoDB connection lost, will attempt reconnection');
-                this.mongoClient = new MongoClient(process.env.MONGODB_URI);
+            if (mongoConnection && (err.name === 'MongoNetworkError' || err.name === 'MongoServerError')) {
+                logger.warn('MongoDB error detected, attempting reconnection...');
+                await this.ensureDbConnection();
+                return false;
             }
-
-            throw err; // Rethrow other errors for handling by caller
+    
+            throw err;
+    
+        } finally {
+            // Log memory usage for long-running operations
+            if (Date.now() - startTime > 30000) { // If operation took more than 30s
+                const used = process.memoryUsage();
+                logger.info(`Memory usage after long operation:\n` +
+                    `HeapUsed: ${Math.round(used.heapUsed / 1024 / 1024)}MB\n` +
+                    `HeapTotal: ${Math.round(used.heapTotal / 1024 / 1024)}MB`);
+            }
         }
     }
 
     async processUrls(filename) {
         try {
-            await fs.promises.access(filename);  
-
             const content = await fs.promises.readFile(filename, 'utf-8');
             const urls = content
                 .split('\n')
                 .map(line => line.trim())
                 .filter(line => line && line.includes('|'));
-    
-            logger.info(`Processing ${urls.length} starter packs...`);
-    
-            let startIndex = Math.max(0, this.checkpointManager.getLastProcessedIndex() + 1);
-            logger.info(`Resuming from index ${startIndex}`);
-    
-            const todayStats = this.checkpointManager.getDailyStats();
-            if (todayStats) {
-                logger.info(`Today's progress: ${JSON.stringify(todayStats, null, 2)}`);
+        
+            // Split packs into new and existing
+            const newPacks = [];
+            const oldPacks = [];
+            const DAYS_THRESHOLD = 14; // Change from 10 to 14 days
+        
+            for (const url of urls) {
+                const [_, rkey] = url.split('|').map(s => s.trim());
+                const existingPack = this.fileManager.getExistingPack(rkey);
+                
+                if (!existingPack) {
+                    newPacks.push(url);
+                } else {
+                    const lastUpdated = new Date(existingPack.updated_at);
+                    const daysSinceUpdate = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
+                    
+                    if (daysSinceUpdate > DAYS_THRESHOLD) {
+                        oldPacks.push(url);
+                    }
+                }
             }
+        
+            logger.info(`Found ${newPacks.length} new packs and ${oldPacks.length} packs needing update`);
+        
+            // Process new packs first, then old ones
+            const processingOrder = [...newPacks, ...oldPacks];
             
-            const startTime = Date.now();
-            let lastStatusReport = startTime;
-    
-            for (const [index, urlLine] of urls.entries()) {
-                
-                if (index % 50 === 0 && !this.noMongoDB) {
-                    const isHealthy = await this.checkMongoHealth();
-                    if (!isHealthy) {
-                        logger.warn('MongoDB health check failed, attempting reconnection...');
-                        await this.ensureDbConnection();
-                    }
-                }  
-                
-                if (index < startIndex) continue;
-    
-                const [creatorHandle, rkey] = urlLine.trim().split('|').map(s => s.trim());
-                
-                if (!this.checkpointManager.shouldProcessPack(rkey)) {
-                    logger.info(`Skipping already processed pack: ${rkey}`);
-                    continue;
+            let startIndex = Math.max(0, this.checkpointManager.getLastProcessedIndex() + 1);
+                logger.info(`Resuming from index ${startIndex}`);
+        
+                const todayStats = this.checkpointManager.getDailyStats();
+                if (todayStats) {
+                    logger.info(`Today's progress: ${JSON.stringify(todayStats, null, 2)}`);
                 }
-    
-                let retries = 0;
-                const MAX_RETRIES = 3;
-                let success = false;
-    
-                while (!success && retries < MAX_RETRIES) {
-                    try {
-                        const result = await this.processStarterPack(urlLine.trim());
-                        if (result !== false) {  // false indicates retry needed
-                            success = true;
-                            this.checkpointManager.updateProgress(index, rkey, 'success');
-                        } else {
-                            retries++;
-                            if (retries < MAX_RETRIES) {
-                                logger.info(`Retrying pack ${rkey} (${retries}/${MAX_RETRIES})...`);
-                                await this.delay(Math.pow(2, retries) * 1000);
+                
+                const startTime = Date.now();
+                let lastStatusReport = startTime;
+        
+                for (const [index, urlLine] of processingOrder.entries()) {
+                    
+                    if (index % 50 === 0 && !this.noMongoDB) {
+                        const isHealthy = await this.checkMongoHealth();
+                        if (!isHealthy) {
+                            logger.warn('MongoDB health check failed, attempting reconnection...');
+                            await this.ensureDbConnection();
+                        }
+                    }  
+                    
+                    if (index < startIndex) continue;
+        
+                    const [creatorHandle, rkey] = urlLine.trim().split('|').map(s => s.trim());
+                    
+                    if (!this.checkpointManager.shouldProcessPack(rkey, newPacks.includes(urlLine) || oldPacks.includes(urlLine))) {
+                        logger.info(`Skipping already processed pack: ${rkey}`);
+                        continue;
+                    }
+        
+                    let retries = 0;
+                    const MAX_RETRIES = 3;
+                    let success = false;
+        
+                    while (!success && retries < MAX_RETRIES) {
+                        try {
+                            const result = await this.processStarterPack(urlLine.trim());
+                            if (result !== false) {  // false indicates retry needed
+                                success = true;
+                                this.checkpointManager.updateProgress(index, rkey, 'success');
+                            } else {
+                                retries++;
+                                if (retries < MAX_RETRIES) {
+                                    logger.info(`Retrying pack ${rkey} (${retries}/${MAX_RETRIES})...`);
+                                    await this.delay(Math.pow(2, retries) * 1000);
+                                }
+                            }
+                        } catch (err) {
+                            if (err.status === 429) {
+                                logger.warn(`Rate limit reached at index ${index}. Saving progress and exiting...`);
+                                this.checkpointManager.updateProgress(index, rkey, 'rateLimit', err);
+                                await this.cleanup();
+                                process.exit(0);
+                            } else if (err.code === 'ECONNRESET' || err.message.includes('socket hang up')) {
+                                logger.warn(`Network error at index ${index}, retrying...`);
+                                retries++;
+                                if (retries < MAX_RETRIES) {
+                                    await this.delay(Math.pow(2, retries) * 1000);
+                                    continue;
+                                }
+                            } else {
+                                logger.error(`Error processing pack ${rkey}: ${err.stack || err.message}`);
+                                this.checkpointManager.updateProgress(index, rkey, 'error', err);
+                                retries++;
+                                if (retries < MAX_RETRIES) {
+                                    logger.info(`Retrying after error (${retries}/${MAX_RETRIES})...`);
+                                    await this.delay(Math.pow(2, retries) * 1000);
+                                }
                             }
                         }
-                    } catch (err) {
-                        if (err.status === 429) {
-                            logger.warn(`Rate limit reached at index ${index}. Saving progress and exiting...`);
-                            this.checkpointManager.updateProgress(index, rkey, 'rateLimit', err);
-                            await this.cleanup();
-                            process.exit(0);
-                        } else if (err.code === 'ECONNRESET' || err.message.includes('socket hang up')) {
-                            logger.warn(`Network error at index ${index}, retrying...`);
-                            retries++;
-                            if (retries < MAX_RETRIES) {
-                                await this.delay(Math.pow(2, retries) * 1000);
-                                continue;
-                            }
-                        } else {
-                            logger.error(`Error processing pack ${rkey}: ${err.stack || err.message}`);
-                            this.checkpointManager.updateProgress(index, rkey, 'error', err);
-                            retries++;
-                            if (retries < MAX_RETRIES) {
-                                logger.info(`Retrying after error (${retries}/${MAX_RETRIES})...`);
-                                await this.delay(Math.pow(2, retries) * 1000);
-                            }
-                        }
                     }
-                }
-    
-                // Add delays for rate limiting
-                if (index % 10 === 0 && index !== 0) {
-                    logger.info('Adding small delay to prevent rate limiting...');
-                    await this.delay(1000);
-                }
-                if (index % 100 === 0 && index !== 0) {
-                    logger.info('Adding longer delay to prevent rate limiting...');
-                    await this.delay(5000);
-                }
+        
+                    // Add delays for rate limiting
+                    if (index % 10 === 0 && index !== 0) {
+                        logger.info('Adding small delay to prevent rate limiting...');
+                        await this.delay(1000);
+                    }
+                    if (index % 100 === 0 && index !== 0) {
+                        logger.info('Adding longer delay to prevent rate limiting...');
+                        await this.delay(5000);
+                    }
 
-                
-                // Status report at the end of the loop
-                const now = Date.now();
-                if (now - lastStatusReport > 5 * 60 * 1000) {
-                    const elapsed = (now - startTime) / 1000;
-                    const processed = index - startIndex;
-                    const rate = processed / (elapsed / 60);
-                    const remaining = urls.length - index;
-                    const estimatedTimeLeft = remaining / rate;
                     
-                    const stats = this.checkpointManager.getDailyStats();
-                    logger.info(`
-    Status Report:
-    Processed: ${processed}/${urls.length} (${(processed/urls.length*100).toFixed(2)}%)
-    Rate: ${rate.toFixed(2)} packs/minute
-    Est. time remaining: ${(estimatedTimeLeft/60).toFixed(2)} hours
-    Success rate: ${stats ? (stats.successful/stats.processed*100).toFixed(2) : 0}%
-    Rate limits hit: ${stats?.rateLimitHits || 0}
-    Errors: ${stats?.errors || 0}
-                    `);
-                    
-                    lastStatusReport = now;
+                    // Status report at the end of the loop
+                    const now = Date.now();
+                    if (now - lastStatusReport > 5 * 60 * 1000) {
+                        const elapsed = (now - startTime) / 1000;
+                        const processed = index - startIndex;
+                        const rate = processed / (elapsed / 60);
+                        const remaining = processingOrder.length - index;
+                        const estimatedTimeLeft = remaining / rate;
+                        const statusReport = `
+Status Report:
+New packs: ${newPacks.length}
+Updates needed: ${oldPacks.length}
+Total to process: ${processingOrder.length}
+Processed: ${processed}/${processingOrder.length} (${(processed/processingOrder.length*100).toFixed(2)}%)
+Rate: ${rate.toFixed(2)} packs/minute
+Est. time remaining: ${(estimatedTimeLeft/60).toFixed(2)} hours
+Success rate: ${todayStats ? (todayStats.successful/todayStats.processed*100).toFixed(2) : 0}%
+Rate limits hit: ${todayStats?.rateLimitHits || 0}
+Errors: ${todayStats?.errors || 0}
+`;
+
+                        logger.info(statusReport);
+                        
+                        lastStatusReport = now;
+                    }
                 }
-            }
 
             await this.cleanup();
         } catch (err) {
@@ -1789,7 +2125,15 @@ class StarterPackProcessor {
     }
 
     async delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                clearTimeout(timeout);
+                resolve();
+            }, ms);
+            
+            // Handle potential errors
+            timeout.unref(); // Don't keep process alive just for this timeout
+        });
     }
 }
 
@@ -1817,6 +2161,7 @@ let globalProcessor = null;
 async function main() {
     globalProcessor = new StarterPackProcessor();
     
+    // Handle purge before any initialization
     if (process.argv.includes('--purge')) {
         await globalProcessor.init();  // Initialize before purge
         await purgeData();

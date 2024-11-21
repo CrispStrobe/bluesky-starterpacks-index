@@ -16,7 +16,7 @@ They also build a MongoDB index that can easily be searched. For a prototype of 
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/CrispStrobe/bsky-starter-pack-index.git
+git clone https://github.com/CrispStrobe/bluesky-starter-pack-index.git
 cd bsky-starter-pack-tools
 ```
 

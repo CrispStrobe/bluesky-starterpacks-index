@@ -9,6 +9,8 @@ import { dirname } from 'path';
 import path from 'path'; 
 import { promises as fsPromises } from 'fs';
 import fetch from 'node-fetch';
+import readline from 'readline';
+import fsExtra from 'fs-extra';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -141,6 +143,211 @@ class LRUCache {
     clear() {
         this.cache.clear();
         this.keys = [];
+    }
+}
+
+
+class UserManager {
+    constructor(processor) {
+        this.processor = processor;
+        this.userCache = new Map();       // Cache to store user data
+        this.updateBuffer = new Map();    // Buffer to store pending updates
+        this.batchSize = 10;              // Flush after n users
+        this.flushInterval = 5000;        // Flush every 5 seconds
+        this.isFlushing = false;          // Flag to prevent concurrent flushes
+
+        // Bind methods to preserve 'this' context
+        this.writeUser = this.writeUser.bind(this);
+        this.flushUpdates = this.flushUpdates.bind(this);
+
+        // Start the periodic flush timer
+        this.startFlushTimer();
+    }
+
+    startFlushTimer() {
+        this.flushTimer = setInterval(() => {
+            if (this.updateBuffer.size > 0) {
+                this.flushUpdates().catch(err => {
+                    if (this.processor?.debug) {
+                        this.processor.debugLog('Error flushing user data', {
+                            error: err.message,
+                            stack: err.stack
+                        });
+                    }
+                });
+            }
+        }, this.flushInterval);
+    }
+
+    stopFlushTimer() {
+        clearInterval(this.flushTimer);
+    }
+
+    async writeUser(user, isUpdate = false) {
+        // Debugging logs
+        if (this.processor?.debug) {
+            this.processor.debugLog('UserManager.writeUser called', { user, isUpdate });
+        }
+
+        // Update cache
+        this.userCache.set(user.did, user);
+
+        // Add or update the user in the buffer
+        this.updateBuffer.set(user.did, {
+            ...user,
+            last_updated: new Date()
+        });
+
+        // If buffer size reaches batchSize, flush
+        if (this.updateBuffer.size >= this.batchSize) {
+            await this.flushUpdates();
+        }
+
+        if (this.processor?.debug) {
+            this.processor.debugLog('User data buffered successfully', {
+                did: user.did,
+                handle: user.handle,
+                isUpdate
+            });
+        }
+    }
+
+    async flushUpdates() {
+        if (this.isFlushing) return; // Prevent concurrent flushes
+        this.isFlushing = true;
+
+        const uniqueId = Date.now() + '-' + Math.random().toString(36).substring(2);
+        const tempJsonPath = `users.json.${uniqueId}.tmp`;
+        const tempYamlPath = `users.yaml.${uniqueId}.tmp`;
+        const backupJsonPath = `users.json.${uniqueId}.bak`;
+        const backupYamlPath = `users.yaml.${uniqueId}.bak`;
+
+        try {
+            if (this.processor?.debug) {
+                this.processor.debugLog('Flushing user data. Loading existing content first...')
+            }
+            // Read existing content
+            let existingJson = [];
+            let existingYaml = '';
+
+            try {
+                const jsonContent = await fs.promises.readFile('users.json', 'utf-8')
+                    .catch(err => err.code === 'ENOENT' ? '[]' : Promise.reject(err));
+
+                try {
+                    existingJson = JSON.parse(jsonContent);
+                    if (!Array.isArray(existingJson)) {
+                        existingJson = [];
+                    }
+                } catch (parseErr) {
+                    logger.warn(`Error parsing users.json: ${parseErr.message}`);
+                    existingJson = [];
+                }
+
+                existingYaml = await fs.promises.readFile('users.yaml', 'utf-8')
+                    .catch(() => '');
+            } catch (err) {
+                logger.error(`Error reading user files: ${err.message}`);
+                existingJson = [];
+                existingYaml = '';
+            }
+
+            // Apply buffered updates
+            if (this.processor?.debug) {
+                this.processor.debugLog('Applying updates..')
+            }
+            
+            for (const [did, userData] of this.updateBuffer.entries()) {
+                const userIndex = existingJson.findIndex(u => u.did === did);
+                if (userIndex >= 0) {
+                    existingJson[userIndex] = userData;
+                } else {
+                    existingJson.push(userData);
+                }
+
+                // Update YAML content
+                existingYaml = existingYaml +
+                    (existingYaml && !existingYaml.endsWith('\n') ? '\n' : '') +
+                    '---\n' +
+                    yaml.dump(userData);
+            }
+
+            // Write to temp files
+            if (this.processor?.debug) {
+                this.processor.debugLog('Writing to temp files..')
+            }
+            await fs.promises.writeFile(tempJsonPath, JSON.stringify(existingJson, null, 2));
+            await fs.promises.writeFile(tempYamlPath, existingYaml);
+
+            // Windows-specific safe file replacement
+            if (process.platform === 'win32') {
+                // Create backups
+                await fs.promises.copyFile('users.json', backupJsonPath).catch(() => {});
+                await fs.promises.copyFile('users.yaml', backupYamlPath).catch(() => {});
+
+                // Add delay after backup
+                await new Promise(resolve => setTimeout(resolve, 100));
+
+                try {
+                    // Replace original files with temp files
+                    await fs.promises.copyFile(tempJsonPath, 'users.json');
+                    await fs.promises.copyFile(tempYamlPath, 'users.yaml');
+
+                    // Add delay after copy
+                    await new Promise(resolve => setTimeout(resolve, 100));
+
+                    // Clean up temp and backup files
+                    await fs.promises.unlink(tempJsonPath).catch(() => {});
+                    await fs.promises.unlink(tempYamlPath).catch(() => {});
+                    await fs.promises.unlink(backupJsonPath).catch(() => {});
+                    await fs.promises.unlink(backupYamlPath).catch(() => {});
+                } catch (copyErr) {
+                    // Restore from backup if copy fails
+                    await fs.promises.copyFile(backupJsonPath, 'users.json').catch(() => {});
+                    await fs.promises.copyFile(backupYamlPath, 'users.yaml').catch(() => {});
+                    throw copyErr;
+                }
+            } else {
+                // Non-Windows platforms can use rename
+                await fs.promises.rename(tempJsonPath, 'users.json');
+                await fs.promises.rename(tempYamlPath, 'users.yaml');
+            }
+
+            // Clear the buffer after successful flush
+            this.updateBuffer.clear();
+
+            if (this.processor?.debug) {
+                this.processor.debugLog('Batch user data written successfully', {
+                    flushedUsers: this.batchSize
+                });
+            }
+        } catch (err) {
+            // Handle errors and ensure the buffer remains intact for retry
+            if (this.processor?.debug) {
+                this.processor.debugLog('Error flushing user data', {
+                    error: err.message,
+                    stack: err.stack
+                });
+            }
+            logger.error(`Failed to flush updates: ${err.message}`);
+            throw err;
+        } finally {
+            this.isFlushing = false;
+        }
+    }
+
+    async shutdown() {
+        // Stop the flush timer
+        this.stopFlushTimer();
+
+        // Flush any remaining updates
+        if (this.updateBuffer.size > 0) {
+            await this.flushUpdates();
+        }
+
+        if (this.processor?.debug) {
+            this.processor.debugLog('UserManager shutdown complete');
+        }
     }
 }
 
@@ -355,23 +562,318 @@ class FileManager {
         this.existingPacks = new Map();
         this.userCache = new Map();
         this.isFirstEntry = true;
+        this.userManager = new UserManager(processor);
+    }
+
+    async verifyFiles() {
+        const files = ['users.json', 'users.yaml', 'starter_packs.json', 'starter_packs.yaml', 'starter_pack_urls.txt'];
+        for (const file of files) {
+            try {
+                await fs.promises.access(file, fs.constants.F_OK);
+                const stats = await fs.promises.stat(file);
+                this.debugLog(`File verification`, {
+                    file,
+                    exists: true,
+                    size: stats.size,
+                    lastModified: stats.mtime
+                });
+            } catch (err) {
+                this.debugLog(`File missing`, {
+                    file,
+                    error: err.message
+                });
+            }
+        }
+    }
+
+    /**
+    * Attempts to move a file with retries on failure.
+    * @param {string} oldPath - The current file path.
+    * @param {string} newPath - The target file path.
+    * @param {number} retries - Number of retry attempts.
+    * @param {number} delay - Delay between retries in milliseconds.
+    */
+    async renameWithRetries(oldPath, newPath, retries = 5, delay = 1000) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                await fsExtra.move(oldPath, newPath, { overwrite: true });
+                return;
+            } catch (err) {
+                if (attempt === retries) {
+                    throw err;
+                }
+                logger.warn(`Move attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
+                await new Promise(res => setTimeout(res, delay));
+            }
+        }
+    }
+
+    /**
+     * Converts starter_packs.json to NDJSON format if it's not already.
+     */
+    async convertToNDJSONIfNeeded() {
+        const filePath = 'starter_packs.json';
+        const backupPath = `starter_packs.json.backup.${Date.now()}`;
+        const tempNDJSONPath = `starter_packs.ndjson.tmp`;
+        const uniqueId = Date.now() + '-' + Math.random().toString(36).substring(2);
+        const backupTempNDJSONPath = `starter_packs.ndjson.backup.${uniqueId}.bak`;
+
+        // Check if starter_packs.json exists
+        const fileExists = await fs.promises.access(filePath, fs.constants.F_OK)
+            .then(() => true)
+            .catch(() => false);
+
+        if (!fileExists) {
+            logger.info(`${filePath} does not exist. No conversion needed.`);
+            return;
+        }
+
+        // Create a backup before any modifications
+        try {
+            await fs.promises.copyFile(filePath, backupPath);
+            logger.info(`Backup created at ${backupPath}`);
+        } catch (err) {
+            logger.error(`Failed to create backup for ${filePath}: ${err.message}`);
+            throw err;
+        }
+
+        // Determine if the file is already in NDJSON format
+        const isNDJSON = await this.checkIfNDJSON(filePath);
+        if (isNDJSON) {
+            logger.info(`${filePath} is already in NDJSON format.`);
+            return;
+        }
+
+        logger.info(`Converting ${filePath} to NDJSON format.`);
+
+        // Initialize read and write streams
+        const readStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+        const writeStream = fs.createWriteStream(tempNDJSONPath, { encoding: 'utf-8' });
+
+        const rl = readline.createInterface({
+            input: readStream,
+            crlfDelay: Infinity
+        });
+
+        let buffer = '';
+        let packsArray = [];
+        let parsedObjects = 0;
+        let skippedObjects = 0;
+
+        // Read the entire file into a buffer
+        for await (const line of rl) {
+            buffer += line + '\n';
+        }
+        logger.info(`Finished reading the original file into buffer.`);
+
+        // Close read streams
+        readStream.close();
+        rl.close();
+        logger.info(`Closed read streams.`);
+
+        // Attempt to parse as JSON array
+        try {
+            packsArray = JSON.parse(buffer);
+            if (!Array.isArray(packsArray)) {
+                throw new Error('JSON is not an array.');
+            }
+            logger.info(`Parsed ${packsArray.length} JSON objects from the array.`);
+        } catch (err) {
+            logger.warn(`Failed to parse ${filePath} as JSON array: ${err.message}`);
+            // Attempt to extract individual JSON objects from the buffer
+            packsArray = this.extractJSONObjects(buffer);
+            if (packsArray.length === 0) {
+                logger.error(`No valid JSON objects found in ${filePath}.`);
+                throw err;
+            }
+            logger.info(`Extracted ${packsArray.length} JSON objects from the buffer.`);
+        }
+
+        // Write each pack as a separate NDJSON line
+        for (const pack of packsArray) {
+            if (typeof pack === 'object' && pack !== null) {
+                try {
+                    const jsonLine = JSON.stringify(pack);
+                    writeStream.write(jsonLine + '\n');
+                    parsedObjects += 1;
+                } catch (err) {
+                    logger.warn(`Failed to stringify a pack: ${err.message}`);
+                    skippedObjects += 1;
+                }
+            } else {
+                skippedObjects += 1;
+            }
+        }
+
+        logger.info(`Finished writing to temporary NDJSON file.`);
+
+        // Close the write stream and wait for it to finish
+        await new Promise((resolve, reject) => {
+            writeStream.end();
+            writeStream.on('finish', resolve);
+            writeStream.on('error', reject);
+        });
+
+        logger.info(`Write stream to temporary NDJSON file closed.`);
+
+        // Windows-specific safe file replacement
+        if (process.platform === 'win32') {
+            try {
+                // Create backups of existing files
+                await fs.promises.copyFile(filePath, backupPath).catch(() => {});
+                await fs.promises.copyFile(tempNDJSONPath, backupTempNDJSONPath).catch(() => {});
+
+                // Add delay after backup
+                await new Promise(resolve => setTimeout(resolve, 100));
+
+                // Copy temp NDJSON to original JSON path
+                await fs.promises.copyFile(tempNDJSONPath, filePath);
+
+                // Add delay after copy
+                await new Promise(resolve => setTimeout(resolve, 100));
+
+                // Clean up temporary and backup files
+                await fs.promises.unlink(tempNDJSONPath).catch(() => {});
+                await fs.promises.unlink(backupTempNDJSONPath).catch(() => {});
+                await fs.promises.unlink(backupPath).catch(() => {});
+
+                logger.info(`Successfully converted ${filePath} to NDJSON format. Parsed objects: ${parsedObjects}, Skipped objects: ${skippedObjects}`);
+            } catch (err) {
+                logger.error(`Failed to replace original file with NDJSON: ${err.message}`);
+                // Attempt to restore from backup
+                try {
+                    await fs.promises.copyFile(backupPath, filePath);
+                    logger.info(`Restored original file from backup.`);
+                } catch (restoreErr) {
+                    logger.error(`Failed to restore original file from backup: ${restoreErr.message}`);
+                }
+                throw err;
+            }
+        } else {
+            // Non-Windows platforms can use fs-extra's move with overwrite
+            try {
+                await fsExtra.move(tempNDJSONPath, filePath, { overwrite: true });
+                logger.info(`Successfully converted ${filePath} to NDJSON format. Parsed objects: ${parsedObjects}, Skipped objects: ${skippedObjects}`);
+            } catch (err) {
+                logger.error(`Failed to replace original file with NDJSON: ${err.message}`);
+                // Attempt to restore from backup
+                try {
+                    await fsExtra.move(backupPath, filePath, { overwrite: true });
+                    logger.info(`Restored original file from backup.`);
+                } catch (restoreErr) {
+                    logger.error(`Failed to restore original file from backup: ${restoreErr.message}`);
+                }
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * Checks if a file is in NDJSON format by attempting to parse each line as JSON.
+     * @param {string} filePath 
+     * @returns {Promise<boolean>}
+     */
+    async checkIfNDJSON(filePath) {
+        return new Promise((resolve) => {
+            const readStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+            const rl = readline.createInterface({
+                input: readStream,
+                crlfDelay: Infinity
+            });
+
+            let isNDJSON = true;
+
+            rl.on('line', (line) => {
+                if (line.trim() === '') return; // Skip empty lines
+                try {
+                    JSON.parse(line);
+                } catch (err) {
+                    isNDJSON = false;
+                    rl.close();
+                }
+            });
+
+            rl.on('close', () => {
+                resolve(isNDJSON);
+            });
+
+            rl.on('error', () => {
+                resolve(false);
+            });
+        });
+    }
+
+    /**
+     * Extracts JSON objects from a string buffer.
+     * This is a simplistic implementation and may need enhancements for complex JSON.
+     * @param {string} buffer 
+     * @returns {Array<Object>}
+     */
+    extractJSONObjects(buffer) {
+        const objects = [];
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        let currentObject = '';
+
+        for (let i = 0; i < buffer.length; i++) {
+            const char = buffer[i];
+
+            if (escape) {
+                currentObject += char;
+                escape = false;
+                continue;
+            }
+
+            if (char === '\\') {
+                currentObject += char;
+                escape = true;
+                continue;
+            }
+
+            if (char === '"' && !escape) {
+                inString = !inString;
+                currentObject += char;
+                continue;
+            }
+
+            if (!inString) {
+                if (char === '{') {
+                    depth += 1;
+                } else if (char === '}') {
+                    depth -= 1;
+                }
+            }
+
+            currentObject += char;
+
+            if (depth === 0 && currentObject.trim()) {
+                try {
+                    const obj = JSON.parse(currentObject);
+                    objects.push(obj);
+                } catch (err) {
+                    logger.warn(`Failed to parse extracted JSON object: ${err.message}`);
+                }
+                currentObject = '';
+            }
+        }
+
+        return objects;
     }
 
     async writePack(pack) {
         try {
             await this.handleRemovedProfiles(pack);
             this.existingPacks.set(pack.rkey, pack);
-            
+
             // Create backup before writing
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
             await this.createBackup('starter_packs.json', timestamp);
             await this.createBackup('starter_packs.yaml', timestamp);
 
-            const jsonContent = (this.isFirstEntry ? '' : ',\n') + JSON.stringify(pack, null, 2);
+            const jsonContent = JSON.stringify(pack, null, 2) + '\n';
             await this.writeToStream('json', jsonContent);
             await this.writeToStream('yaml', '---\n' + yaml.dump(pack));
-            
-            this.isFirstEntry = false;
 
             if (this.processor?.debug) {
                 this.processor.debugLog('Pack written successfully', { rkey: pack.rkey });
@@ -382,29 +884,29 @@ class FileManager {
             throw err;
         }
     }
-    
+
     async safeWrite(stream, content) {
         if (!stream || stream.destroyed) {
             throw new Error('Stream is not available');
         }
-    
+
         return new Promise((resolve, reject) => {
             const writeResult = stream.write(content, err => {
                 if (err) reject(err);
                 else resolve();
             });
-    
+
             // Handle backpressure
             if (!writeResult) {
                 stream.once('drain', resolve);
             }
         });
     }
-    
+
     async handleRemovedProfiles(pack) {
         const existingPack = this.existingPacks.get(pack.rkey);
         if (!existingPack) return;
-    
+
         const currentDids = new Set(pack.users.map(u => u.did));
         const existingDids = new Set(existingPack.users.map(u => u.did));
         
@@ -438,7 +940,7 @@ class FileManager {
             added: [...currentDids].filter(did => !existingDids.has(did))
         };
     }
-    
+
     // Validate file paths
     async validatePaths(paths) {
         try {
@@ -458,7 +960,7 @@ class FileManager {
         if (this.processor?.debug) {
             this.processor.debugLog(`Initializing stream: ${name}`, { path, options });
         }
-    
+
         const stream = fs.createWriteStream(path, options);
         
         stream.on('error', (err) => {
@@ -470,12 +972,12 @@ class FileManager {
                 });
             }
         });
-    
+
         await new Promise((resolve, reject) => {
-            stream.once('open', resolve); // more reliable for detecting when a stream is ready for writing
+            stream.once('open', resolve);
             stream.once('error', reject);
         });
-    
+
         this.streams.set(name, stream);
         return stream;
     }
@@ -486,68 +988,72 @@ class FileManager {
             if (!await this.validatePaths(['starter_packs.json', 'starter_packs.yaml', 'users.json', 'users.yaml'])) {
                 throw new Error('Required file paths are not accessible');
             }
-    
+            
+            // Convert to NDJSON if needed
+            await this.convertToNDJSONIfNeeded();
+
+            if (this.processor?.debug) {
+                this.processor.debugLog('Loading existing starterpacks');
+            }
             await this.loadExistingPacks();
-    
-            // Initialize streams with append mode instead of write mode
+
+            // Initialize streams with append mode
             await this.initStream('json', 'starter_packs.json', { flags: 'a' });
             await this.initStream('yaml', 'starter_packs.yaml', { flags: 'a' });
             await this.initStream('users-json', 'users.json', { flags: 'a' });
             await this.initStream('users-yaml', 'users.yaml', { flags: 'a' });
-    
-            // Only write initial content if files are empty
-            const stats = await fs.promises.stat('starter_packs.json').catch(() => ({ size: 0 }));
-            if (stats.size === 0) {
-                await this.writeToStream('json', '[');
-                this.isFirstEntry = true;
-            } else {
-                // Check if the last character is ']' to determine if the array is closed
-                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
-                const trimmedContent = content.trim();
-                if (trimmedContent.endsWith(']')) {
-                    // Remove the closing ']' to append new entries
-                    await fs.promises.truncate('starter_packs.json', content.lastIndexOf(']'));
-                    this.isFirstEntry = false;
-                } else {
-                    this.isFirstEntry = false;
-                }
-            }
-    
+
             if (this.processor?.debug) {
                 this.processor.debugLog('File manager initialized', {
                     existingPacks: this.existingPacks.size,
                     streams: Array.from(this.streams.keys())
                 });
             }
-    
+
         } catch (err) {
             logger.error(`Error initializing file manager: ${err.stack || err.message}`);
             throw err;
         }
     }
 
-    // Load existing packs from files
+    // Load existing packs from NDJSON file
     async loadExistingPacks() {
+        const filePath = 'starter_packs.json';
         try {
-            const jsonExists = await fs.promises.access('starter_packs.json')
+            const exists = await fs.promises.access(filePath)
                 .then(() => true)
                 .catch(() => false);
     
-            if (jsonExists) {
-                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
-                let packs = [];
-                try {
-                    packs = JSON.parse(content);
-                    if (Array.isArray(packs)) {
-                        packs.forEach(pack => {
-                            this.existingPacks.set(pack.rkey, pack);
-                        });
-                    }
-                } catch (parseErr) {
-                    logger.warn(`JSON parse error: ${parseErr.message}`);
-                    // Handle corrupted JSON if necessary
-                    // For now, we'll ignore and start fresh
+            if (exists) {
+                if (this.processor?.debug) {
+                    this.processor.debugLog(`Opening existing ${filePath}`);
                 }
+
+                const readStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+                const rl = readline.createInterface({
+                    input: readStream,
+                    crlfDelay: Infinity
+                });
+
+                for await (const line of rl) {
+                    const trimmedLine = line.trim();
+                    if (trimmedLine === '') continue; // Skip empty lines
+                    try {
+                        const pack = JSON.parse(trimmedLine);
+                        this.existingPacks.set(pack.rkey, pack);
+                    } catch (err) {
+                        logger.warn(`Failed to parse a line in ${filePath}: ${err.message}`);
+                        // Continue parsing the next lines
+                    }
+                }
+
+                readStream.close();
+                rl.close();
+            } else {
+                if (this.processor?.debug) {
+                    this.processor.debugLog(`${filePath} does not exist. Starting with empty packs.`);
+                }
+                this.existingPacks = new Map();
             }
         } catch (err) {
             logger.error(`Error loading existing packs: ${err.stack || err.message}`);
@@ -579,47 +1085,18 @@ class FileManager {
     }
 
     // Write user data
-    async writeUser(user, isUpdate = false) {
-        const tempJsonPath = 'users.json.tmp';
-        const tempYamlPath = 'users.yaml.tmp';
-        
+    async writeUser(user, isUpdate = false) { 
         try {
-            // Update cache
-            this.userCache.set(user.did, user);
-    
-            // Read existing content if any
-            let existingJson = '[]';
-            let existingYaml = '';
-            
-            try {
-                existingJson = await fs.promises.readFile('users.json', 'utf-8');
-                existingYaml = await fs.promises.readFile('users.yaml', 'utf-8');
-            } catch (err) {
-                if (err.code !== 'ENOENT') throw err;
-            }
-
-            // Prepare new content
-            const userData = {...user, last_updated: new Date() };
-            const jsonArray = existingJson === '[]' ? [] : JSON.parse(existingJson);
-            const userIndex = jsonArray.findIndex(u => u.did === user.did);
-
-            if (userIndex >= 0) {
-                jsonArray[userIndex] = userData;
-            } else {
-                jsonArray.push(userData);
-            }
-
-            // Write atomically
-            await this.writer.writeAtomic(tempJsonPath, JSON.stringify(jsonArray, null, 2));
-            await this.writer.writeAtomic(tempYamlPath, 
-                existingYaml + (existingYaml ? '\n' : '') + '---\n' + yaml.dump(userData));
-
-            await fs.promises.rename(tempJsonPath, 'users.json');
-            await fs.promises.rename(tempYamlPath, 'users.yaml');
-
+            await this.userManager.writeUser(user, isUpdate);
         } catch (err) {
-            await fs.promises.unlink(tempJsonPath).catch(() => {});
-            await fs.promises.unlink(tempYamlPath).catch(() => {});
+            logger.error(`Failed to write user ${user.did}: ${err.message}`);
+            if (this.processor?.debug) {
+                this.processor.debugLog('Error writing user', {
+                    did: user.did,
+                    error: err.message,
+                    stack: err.stack
+                });
+            }
             throw err;
         }
     }
@@ -687,13 +1164,14 @@ class FileManager {
         }
     
         await this.cleanupTempFiles();
+        await this.userManager.shutdown();
     
         const closePromises = Array.from(this.streams.entries()).map(
             async ([name, stream]) => {
                 try {
                     if (name === 'json') {
-                        // Close the JSON array properly
-                        await this.writeToStream('json', '\n]\n');
+                        // For NDJSON, no need to close array brackets
+                        // If you switch back to JSON array, handle accordingly
                     }
                     await new Promise((resolve, reject) => {
                         stream.end(err => {
@@ -1598,6 +2076,181 @@ class StarterPackProcessor {
         }
     }
 
+    async findExistingUser(did) {
+        // Already handled by getProfile's cache check
+        return await this.getProfile(did, false);
+    }
+
+    // Enhanced pack tracking
+    async trackNewStarterPack(uri, creator) {
+        const rkey = this.extractRkeyFromURI(uri);
+        
+        if (this.debug) {
+            this.debugLog('Checking potential new pack', {
+                uri,
+                rkey,
+                creator: creator.handle,
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        // Check existing pack in memory first
+        const existingPack = this.fileManager.getExistingPack(rkey);
+        if (existingPack) {
+            if (this.debug) {
+                this.debugLog('Pack already known in memory', { 
+                    uri, 
+                    rkey,
+                    lastUpdated: existingPack.updated_at
+                });
+            }
+            return false;
+        }
+    
+        // Check URLs file
+        try {
+            const urlsContent = await fs.promises.readFile('starter_pack_urls.txt', 'utf-8');
+            if (urlsContent.includes(rkey)) {
+                if (this.debug) {
+                    this.debugLog('Pack already in URL list', { uri, rkey });
+                }
+                return false;
+            }
+    
+            // Add to URLs file using atomic write
+            const line = `${creator.handle}|${rkey}\n`;
+            await this.fileManager.atomicWrite(
+                'starter_pack_urls.txt',
+                line,
+                { flag: 'a' }
+            );
+    
+            if (this.debug) {
+                this.debugLog('Added new pack to discovery list', {
+                    uri,
+                    rkey,
+                    creator: creator.handle,
+                    timestamp: new Date().toISOString()
+                });
+            }
+    
+            // Create minimal pack entry
+            const minimalPack = {
+                rkey,
+                name: creator.name || 'Unknown',
+                creator: creator.handle,
+                creator_did: creator.did,
+                description: creator.description || '',
+                user_count: 0,
+                created_at: new Date(),
+                updated_at: new Date(),
+                users: [],
+                weekly_joins: 0,
+                total_joins: 0
+            };
+    
+            // Write to pack files
+            try {
+                await this.fileManager.writePack(minimalPack);
+                
+                if (this.debug) {
+                    this.debugLog('Successfully wrote new pack data', {
+                        rkey,
+                        creator: creator.handle,
+                        files: ['starter_packs.json', 'starter_packs.yaml']
+                    });
+                }
+            } catch (writeErr) {
+                this.debugLog('Failed to write pack data', {
+                    rkey,
+                    error: writeErr.message,
+                    stack: writeErr.stack
+                });
+                
+                // Try to remove from URLs file if pack write failed
+                try {
+                    const currentContent = await fs.promises.readFile('starter_pack_urls.txt', 'utf-8');
+                    const newContent = currentContent.replace(line, '');
+                    await this.fileManager.atomicWrite('starter_pack_urls.txt', newContent);
+                } catch (cleanupErr) {
+                    this.debugLog('Failed to cleanup URLs file after pack write failure', {
+                        rkey,
+                        error: cleanupErr.message
+                    });
+                }
+                
+                throw writeErr; // Propagate the original error
+            }
+    
+            // Track discovery statistics
+            this.stats = this.stats || {};
+            this.stats.discoveredPacks = (this.stats.discoveredPacks || 0) + 1;
+    
+            // Add to current processing batch if appropriate
+            if (this.fileManager.existingPacks) {
+                this.fileManager.existingPacks.set(rkey, minimalPack);
+            }
+    
+            return true;
+    
+        } catch (err) {
+            if (err.code === 'ENOENT') {
+                // First time discovering any packs, create the file
+                try {
+                    await this.fileManager.atomicWrite(
+                        'starter_pack_urls.txt',
+                        `${creator.handle}|${rkey}\n`
+                    );
+                    if (this.debug) {
+                        this.debugLog('Created initial URLs file', {
+                            rkey,
+                            creator: creator.handle
+                        });
+                    }
+                    return await this.trackNewStarterPack(uri, creator); // Retry the whole operation
+                } catch (createErr) {
+                    this.debugLog('Failed to create URLs file', {
+                        error: createErr.message,
+                        stack: createErr.stack
+                    });
+                    return false;
+                }
+            }
+    
+            this.debugLog('Error tracking new pack', {
+                uri,
+                error: err.message,
+                stack: err.stack
+            });
+            return false;
+        }
+    }
+
+    // Enhanced stat tracking
+    async updateDiscoveryStats(profile, newPacks) {
+        if (!this.stats) {
+            this.stats = {
+                discoveredUsers: 0,
+                discoveredPacks: 0,
+                processedProfiles: 0,
+                updatedProfiles: 0
+            };
+        }
+
+        this.stats.processedProfiles++;
+        if (newPacks > 0) {
+            this.stats.discoveredPacks += newPacks;
+        }
+
+        if (this.debug) {
+            this.debugLog('Updated discovery stats', {
+                profile: profile.handle,
+                newPacks,
+                stats: this.stats
+            });
+        }
+    }
+    
     async checkMemoryUsage() {
         const used = process.memoryUsage();
         const heapUsage = used.heapUsed / used.heapTotal;
@@ -2264,7 +2917,7 @@ class StarterPackProcessor {
         return response?.data?.items || [];
     }
     
-    async trackNewStarterPack(uri, creator) {
+    async trackNewStarterPack_old(uri, creator) {
         if (!uri || !creator) return;
     
         try {
@@ -2549,6 +3202,27 @@ class StarterPackProcessor {
                 }
             };
     
+            try {
+                const needsWrite = forceUpdate || !await this.findExistingUser(did);
+                if (needsWrite) {
+                    await this.fileManager.writeUser(userData);
+                    if (this.debug) {
+                        this.debugLog('Buffered write of new user data to files', {
+                            did,
+                            handle: userData.handle,
+                            reason: forceUpdate ? 'forced_update' : 'new_user'
+                        });
+                    }
+                }
+            } catch (writeErr) {
+                this.debugLog('Failed to buffer write of user data to files', {
+                    did,
+                    error: writeErr.message,
+                    stack: writeErr.stack
+                });
+                // Continue processing despite write failure
+            }
+
             let starterPacks = [];
     
             // 7. Process Starter Packs if Present
@@ -2557,45 +3231,46 @@ class StarterPackProcessor {
                 try {
                     const packs = await this.getActorStarterPacks(did);
                     starterPacks = packs.map(pack => pack.uri);
-    
+            
+                    // Enhanced discovery logging
+                    let newPacksFound = 0;
+            
                     // Handle new packs discovery
                     for (const pack of packs) {
                         const rkey = this.extractRkeyFromURI(pack.uri);
                         
-                        if (!this.fileManager.getExistingPack(rkey)) {
-                            logger.info(`Discovered new starter pack: ${pack.uri}`);
-                            try {
-                                const line = `${apiProfile.handle}|${rkey}\n`;
-                                await this.fileManager.atomicWrite(
-                                    'starter_pack_urls.txt',
-                                    line,
-                                    { flag: 'a' }
-                                );
-    
-                                const minimalPack = {
-                                    rkey,
-                                    name: pack.name || 'Unknown',
-                                    creator: apiProfile.handle,
-                                    creator_did: did,
-                                    description: pack.description || '',
-                                    user_count: 0,
-                                    created_at: new Date(),
-                                    updated_at: new Date(),
-                                    users: [],
-                                    weekly_joins: 0,
-                                    total_joins: 0
-                                };
-    
-                                await this.fileManager.writePack(minimalPack);
-                            } catch (err) {
-                                logger.error(`Error adding new starter pack ${rkey}: ${err.stack || err.message}`);
+                        const isNewPack = await this.trackNewStarterPack(pack.uri, {
+                            did,
+                            handle: apiProfile.handle,
+                            name: pack.name,
+                            description: pack.description
+                        });
+            
+                        if (isNewPack) {
+                            newPacksFound++;
+                            if (this.debug) {
+                                this.debugLog('Discovered new pack during profile fetch', {
+                                    profileDid: did,
+                                    packUri: pack.uri,
+                                    packName: pack.name
+                                });
                             }
                         }
                     }
-    
+            
+                    // Update discovery stats
+                    await this.updateDiscoveryStats(apiProfile, newPacksFound);
+            
                     userData.associated.starterPacks = starterPacks;
                 } catch (err) {
                     logger.error(`Error fetching starter packs for ${did}: ${err.stack || err.message}`);
+                    if (this.debug) {
+                        this.debugLog('Starter pack fetch error', {
+                            did,
+                            error: err.message,
+                            stack: err.stack
+                        });
+                    }
                 }
             }
     
@@ -2646,8 +3321,9 @@ class StarterPackProcessor {
     
             // 10. Update Memory Cache
             this.profileCache.set(did, {
-                profile: profile,
+                profile,
                 timestamp: Date.now(),
+                discoveryChecked: true  // Flag to indicate we've checked for associated packs
             });
     
             if (this.debug) {
@@ -2710,14 +3386,16 @@ class StarterPackProcessor {
         const {
             maxRetries = 3,
             shouldFallback = false,
-            fallbackFn = null
+            fallbackFn = null,
+            baseUrl = null
         } = options;
     
         if (this.debug) {
             this.debugLog(`API call starting: ${name}`, {
                 timestamp: new Date().toISOString(),
                 options,
-                memory: process.memoryUsage()
+                memory: process.memoryUsage(),
+                baseUrl: baseUrl || 'default'
             });
         }
     
@@ -2730,14 +3408,23 @@ class StarterPackProcessor {
                 const response = await this.apiCallWithTimeout(apiCall);
                 const shouldRetry = await this.rateLimiter.handleResponse(response);
     
+                // Enhanced response logging
                 if (this.debug) {
                     this.debugLog(`API call response: ${name}`, {
                         attempt: attempt + 1,
                         status: response?.status,
-                        rateLimit: {
-                            remaining: response?.headers?.['x-ratelimit-remaining'],
-                            reset: response?.headers?.['x-ratelimit-reset']
+                        headers: {
+                            rateLimit: {
+                                remaining: response?.headers?.['x-ratelimit-remaining'],
+                                reset: response?.headers?.['x-ratelimit-reset'],
+                                limit: response?.headers?.['x-ratelimit-limit']
+                            }
                         },
+                        data: response?.data ? {
+                            type: typeof response.data,
+                            keys: Object.keys(response.data),
+                            preview: JSON.stringify(response.data).slice(0, 200) + '...'
+                        } : null,
                         shouldRetry
                     });
                 }
@@ -2745,7 +3432,11 @@ class StarterPackProcessor {
                 if (shouldRetry && attempt < maxRetries - 1) {
                     const delay = Math.pow(2, attempt) * 1000;
                     if (this.debug) {
-                        this.debugLog(`Rate limit retry: ${name}`, { delay });
+                        this.debugLog(`Rate limit retry: ${name}`, { 
+                            delay,
+                            attempt,
+                            nextAttempt: attempt + 1
+                        });
                     }
                     await this.delay(delay);
                     continue;
@@ -2754,6 +3445,7 @@ class StarterPackProcessor {
                 return response;
     
             } catch (err) {
+                // Handle "not found" cases
                 const isNotFound = err.status === 404 || 
                                  err.message?.includes('not found') ||
                                  err.message?.includes('Could not locate');
@@ -2762,54 +3454,97 @@ class StarterPackProcessor {
                     if (this.debug) {
                         this.debugLog(`Resource not found: ${name}`, {
                             error: err.message,
-                            attempt: attempt + 1
+                            attempt: attempt + 1,
+                            context: {
+                                status: err.status,
+                                message: err.message
+                            }
                         });
                     }
                     return null;
                 }
     
+                // Handle rate limiting
                 if (err.status === 429) {
                     const shouldRetry = await this.rateLimiter.handleResponse(err);
                     if (shouldRetry && attempt < maxRetries - 1) {
+                        if (this.debug) {
+                            this.debugLog(`Rate limit hit: ${name}`, {
+                                attempt,
+                                headers: err.headers,
+                                willRetry: true
+                            });
+                        }
                         continue;
                     }
                     break;
                 }
     
+                // Handle authentication issues
                 if (err.message?.includes('Token has expired') || 
                     err.message?.includes('Authentication Required')) {
+                    if (this.debug) {
+                        this.debugLog(`Auth refresh needed: ${name}`, {
+                            attempt,
+                            error: err.message
+                        });
+                    }
                     await this.refreshTokenIfNeeded(true);
                     if (attempt < maxRetries - 1) continue;
                 }
     
+                // Enhanced error logging
                 if (this.debug) {
                     this.debugLog(`API call error: ${name}`, {
                         error: err.message,
                         status: err.status,
                         attempt: attempt + 1,
-                        stack: err.stack
+                        stack: err.stack,
+                        headers: err.headers,
+                        context: {
+                            isNetworkError: this.isNetworkError(err),
+                            willRetry: attempt < maxRetries - 1,
+                            remainingAttempts: maxRetries - attempt - 1
+                        }
                     });
                 }
     
-                // For network errors, try fallback if available
+                // Handle fallback for network errors
                 if (shouldFallback && fallbackFn && this.isNetworkError(err)) {
                     if (this.debug) {
-                        this.debugLog(`Attempting fallback: ${name}`);
+                        this.debugLog(`Attempting fallback: ${name}`, {
+                            error: err.message,
+                            attempt
+                        });
                     }
                     try {
-                        return await fallbackFn();
+                        const fallbackResult = await fallbackFn();
+                        if (this.debug) {
+                            this.debugLog(`Fallback successful: ${name}`, {
+                                hasData: !!fallbackResult
+                            });
+                        }
+                        return fallbackResult;
                     } catch (fallbackErr) {
                         if (this.debug) {
                             this.debugLog(`Fallback failed: ${name}`, {
-                                error: fallbackErr.message
+                                error: fallbackErr.message,
+                                stack: fallbackErr.stack
                             });
                         }
                     }
                 }
     
-                // Only retry on network errors
+                // Handle retryable network errors
                 if (this.isNetworkError(err) && attempt < maxRetries - 1) {
                     const delay = Math.pow(2, attempt) * 1000;
+                    if (this.debug) {
+                        this.debugLog(`Network error retry: ${name}`, {
+                            delay,
+                            attempt,
+                            error: err.message
+                        });
+                    }
                     await this.delay(delay);
                     continue;
                 }
@@ -2817,7 +3552,16 @@ class StarterPackProcessor {
                 // Log final failure
                 if (attempt === maxRetries - 1) {
                     logger.error(`Failed API call ${name} after ${maxRetries} attempts: ${err.message}`);
+                    if (this.debug) {
+                        this.debugLog(`Final failure: ${name}`, {
+                            attempts: maxRetries,
+                            error: err.message,
+                            stack: err.stack
+                        });
+                    }
                 }
+    
+                throw err; // Propagate the error if we've exhausted all retries
             }
         }
     
@@ -3262,14 +4006,19 @@ class StarterPackProcessor {
      * @returns {Map} Map of user DIDs to user data
      */
     async loadExistingUsers(existingPack) {
+        if (this.processor?.debug) {
+            this.processor.debugLog('Loading existing useres');
+        }
+        
         const existingUsers = new Map();
         
         if (!existingPack) {
             return existingUsers;
         }
-
+    
         try {
             const existingUserDids = new Set(existingPack.users);
+            let remainingDids = [];  // Moved outside conditional block
             
             // Try cache first
             for (const did of existingUserDids) {
@@ -3278,38 +4027,37 @@ class StarterPackProcessor {
                     existingUsers.set(did, cached.profile);
                 }
             }
-
+    
+            // Calculate remaining DIDs regardless of MongoDB status
+            remainingDids = Array.from(existingUserDids)
+                .filter(did => !existingUsers.has(did));
+    
             // Get remaining from MongoDB
-            if (!this.noMongoDB) {
-                const remainingDids = Array.from(existingUserDids)
-                    .filter(did => !existingUsers.has(did));
-
-                if (remainingDids.length > 0) {
-                    const users = await this.db.collection('users')
-                        .find({ did: { $in: remainingDids } })
-                        .toArray();
-                        
-                    users.forEach(user => {
-                        existingUsers.set(user.did, user);
-                        // Update cache
-                        this.profileCache.set(user.did, {
-                            profile: user,
-                            timestamp: Date.now()
-                        });
+            if (!this.noMongoDB && remainingDids.length > 0) {
+                const users = await this.db.collection('users')
+                    .find({ did: { $in: remainingDids } })
+                    .toArray();
+                    
+                users.forEach(user => {
+                    existingUsers.set(user.did, user);
+                    // Update cache
+                    this.profileCache.set(user.did, {
+                        profile: user,
+                        timestamp: Date.now()
                     });
-                }
+                });
             }
-
+    
             if (this.debug) {
                 this.debugLog('Loaded existing users', {
                     packUsers: existingUserDids.size,
                     loadedUsers: existingUsers.size,
-                    fromCache: existingUsers.size - (remainingDids?.length || 0)
+                    fromCache: existingUsers.size - remainingDids.length
                 });
             }
-
+    
             return existingUsers;
-
+    
         } catch (err) {
             logger.error(`Error loading existing users: ${err.stack || err.message}`);
             throw err;
@@ -3365,54 +4113,59 @@ class StarterPackProcessor {
         try {
             const currentDids = new Set(processedUsers.map(u => u.did));
             const existingDids = new Set(existingPack.users);
-
+    
             // Find removed DIDs
             const removedDids = [...existingDids].filter(did => !currentDids.has(did));
             
             if (removedDids.length === 0) {
                 return; // Nothing to do
             }
-
+    
             // Track changes
             changes.removed = removedDids.map(did => ({
                 did,
                 handle: existingUsers.get(did)?.handle || 'unknown',
                 removed_at: new Date().toISOString()
             }));
-
+    
             logger.info(`${removedDids.length} profiles were removed from pack ${rkey}`);
-
+    
             // Update MongoDB if enabled
             if (!this.noMongoDB) {
                 try {
-                    // Remove pack from users' pack_ids
-                    await this.db.collection('users').updateMany(
-                        { did: { $in: removedDids } },
-                        { $pull: { pack_ids: rkey } }
-                    );
-
-                    // Clean up users no longer in any packs
-                    const cleanupResults = await this.db.collection('users').deleteMany({
-                        did: { $in: removedDids },
-                        pack_ids: { $size: 0 }
-                    });
-
-                    if (cleanupResults.deletedCount > 0) {
-                        logger.info(`Removed ${cleanupResults.deletedCount} users no longer in any packs`);
+                    const batchSize = 20; // Adjust as necessary
+                    for (let i = 0; i < removedDids.length; i += batchSize) {
+                        const batchDids = removedDids.slice(i, i + batchSize);
+    
+                        // Remove pack from users' pack_ids and update last_updated
+                        await retryOnRateLimit(async () => {
+                            await this.db.collection('users').updateMany(
+                                { did: { $in: batchDids } },
+                                {
+                                    $pull: { pack_ids: rkey },
+                                    $set: { last_updated: new Date() }
+                                }
+                            );
+                        });
+    
+                        // Clean up users no longer in any packs
+                        await retryOnRateLimit(async () => {
+                            const cleanupResults = await this.db.collection('users').deleteMany({
+                                did: { $in: batchDids },
+                                pack_ids: { $size: 0 }
+                            });
+                            if (cleanupResults.deletedCount > 0) {
+                                logger.info(`Removed ${cleanupResults.deletedCount} users no longer in any packs`);
+                            }
+                        });
                     }
-
-                    // Update last_updated for affected users
-                    await this.db.collection('users').updateMany(
-                        { did: { $in: removedDids } },
-                        { $set: { last_updated: new Date() } }
-                    );
-
+    
                 } catch (err) {
                     logger.error(`Error updating removed users in MongoDB: ${err.stack || err.message}`);
                     // Continue processing - MongoDB updates are not critical
                 }
             }
-
+    
             if (this.debug) {
                 this.debugLog('Removed users processed', {
                     packRkey: rkey,
@@ -3420,12 +4173,13 @@ class StarterPackProcessor {
                     timestamp: new Date().toISOString()
                 });
             }
-
+    
         } catch (err) {
             logger.error(`Error handling removed users: ${err.stack || err.message}`);
             throw err; // This is a critical operation, should fail if it errors
         }
     }
+    
 
     /**
      * Logs changes made during pack processing
@@ -3654,12 +4408,36 @@ class StarterPackProcessor {
                 failed: [],    // Failed profile fetches
                 discovered: [] // New starter packs found
             };
+
+            if (!this.stats) {
+                this.stats = {
+                    discoveredUsers: 0,
+                    discoveredPacks: 0,
+                    processedProfiles: 0,
+                    updatedProfiles: 0,
+                    fileOperations: {
+                        success: 0,
+                        failed: 0
+                    }
+                };
+            }
+        
+            if (this.debug) {
+                this.debugLog('Current stats before processing', {
+                    stats: this.stats,
+                    memory: process.memoryUsage(),
+                    timestamp: new Date().toISOString()
+                });
+            }
     
             // Check existing state
             const existingPack = this.fileManager.getExistingPack(rkey);
             if (existingPack && !this.checkpointManager.shouldProcessPack(rkey)) {
                 if (this.debug) {
-                    this.debugLog('Pack already processed', { rkey });
+                    this.debugLog('Pack already processed', { 
+                        rkey,
+                        lastProcessed: existingPack.updated_at
+                    });
                 }
                 return true;
             }
@@ -3690,7 +4468,8 @@ class StarterPackProcessor {
                 this.debugLog('Pack details', { 
                     name: record.name,
                     creator: creatorHandle,
-                    record: record 
+                    record: record,
+                    uri: packUri
                 });
             }
     
@@ -3705,6 +4484,13 @@ class StarterPackProcessor {
                 }
                 await this.checkpointManager.addMissingPack(rkey, 'empty_list');
                 return false;
+            }
+    
+            if (this.debug) {
+                this.debugLog('Retrieved list members', {
+                    count: listMembers.length,
+                    listUri: record.list
+                });
             }
     
             // Load existing user data for comparison
@@ -3741,41 +4527,95 @@ class StarterPackProcessor {
                     // Check if profile has associated starter packs
                     if (profile.associated?.starterPacks > 0) {
                         try {
-                            const userPacks = await this.agent.app.bsky.graph.getActorStarterPacks({ 
-                                actor: memberDid 
-                            });
+                            const userPacks = await this.makeApiCall('getActorStarterPacks',
+                                this.agent.app.bsky.graph.getActorStarterPacks({ 
+                                    actor: memberDid 
+                                })
+                            );
+                            
+                            if (this.debug) {
+                                this.debugLog('Retrieved associated packs', {
+                                    did: memberDid,
+                                    handle: profile.handle,
+                                    packCount: userPacks?.data?.starterPacks?.length || 0
+                                });
+                            }
                             
                             if (userPacks?.data?.starterPacks) {
+                                let newPacksFound = 0;
                                 for (const newPack of userPacks.data.starterPacks) {
-                                    // Track new packs we find
-                                    await this.trackNewStarterPack(newPack.uri, {
-                                        did: memberDid,
-                                        handle: profile.handle
-                                    });
-                                    changes.discovered.push({
-                                        uri: newPack.uri,
-                                        creator: profile.handle
-                                    });
+                                    try {
+                                        const isNewPack = await this.trackNewStarterPack(newPack.uri, {
+                                            did: memberDid,
+                                            handle: profile.handle,
+                                            name: newPack.name || 'Unknown',
+                                            description: newPack.description
+                                        });
+                                        
+                                        if (isNewPack) {
+                                            newPacksFound++;
+                                            changes.discovered.push({
+                                                uri: newPack.uri,
+                                                creator: profile.handle,
+                                                name: newPack.name,
+                                                timestamp: new Date().toISOString()
+                                            });
+                
+                                            if (this.debug) {
+                                                this.debugLog('New pack discovered and tracked', {
+                                                    packUri: newPack.uri,
+                                                    creator: profile.handle,
+                                                    fromUser: memberDid,
+                                                    filesUpdated: true
+                                                });
+                                            }
+                                        }
+                                    } catch (packWriteErr) {
+                                        this.debugLog('Failed to write new pack', {
+                                            uri: newPack.uri,
+                                            error: packWriteErr.message,
+                                            stack: packWriteErr.stack
+                                        });
+                                        changes.failed.push({
+                                            type: 'pack_write',
+                                            uri: newPack.uri,
+                                            error: packWriteErr.message,
+                                            timestamp: new Date().toISOString()
+                                        });
+                                    }
+                                }
+                                
+                                if (newPacksFound > 0) {
+                                    await this.updateDiscoveryStats(profile, newPacksFound);
+                                    if (this.debug) {
+                                        this.debugLog('Pack discovery batch complete', {
+                                            profileDid: memberDid,
+                                            newPacks: newPacksFound,
+                                            totalAssociated: userPacks.data.starterPacks.length,
+                                            stats: this.stats
+                                        });
+                                    }
                                 }
                             }
                         } catch (packErr) {
-                            if (this.debug) {
-                                this.debugLog('Failed to fetch user packs', {
-                                    did: memberDid,
-                                    error: packErr.message
-                                });
-                            }
+                            this.debugLog('Failed to fetch user packs', {
+                                did: memberDid,
+                                error: packErr.message,
+                                stack: packErr.stack,
+                                impact: 'pack_discovery_incomplete'
+                            });
                         }
                     }
     
                     // Track changes
-                    const existingUser = existingUsers.get(memberDid);
+                    const existingUser = await this.findExistingUser(memberDid);
                     if (existingUser) {
                         if (existingUser.handle !== profile.handle) {
                             changes.renamed.push({
                                 did: memberDid,
                                 oldHandle: existingUser.handle,
-                                newHandle: profile.handle
+                                newHandle: profile.handle,
+                                timestamp: new Date().toISOString()
                             });
                         }
                         if (existingUser.display_name !== profile.displayName) {
@@ -3783,14 +4623,17 @@ class StarterPackProcessor {
                                 did: memberDid,
                                 fields: ['display_name'],
                                 old: { display_name: existingUser.display_name },
-                                new: { display_name: profile.displayName }
+                                new: { display_name: profile.displayName },
+                                timestamp: new Date().toISOString()
                             });
                         }
                     } else {
                         changes.added.push({
                             did: memberDid,
-                            handle: profile.handle
+                            handle: profile.handle,
+                            timestamp: new Date().toISOString()
                         });
+                        this.stats.discoveredUsers++;
                     }
     
                     const userData = {
@@ -3803,6 +4646,37 @@ class StarterPackProcessor {
                         profile_check_needed: false
                     };
     
+                    if (!existingUser || existingUser.handle !== profile.handle || 
+                        existingUser.display_name !== profile.displayName) {
+                        try {
+                            await this.fileManager.writeUser(userData);
+                            if (this.debug) {
+                                this.debugLog('Buffered user data to write to files', {
+                                    did: memberDid,
+                                    handle: profile.handle,
+                                    isNew: !existingUser,
+                                    changes: existingUser ? 
+                                        changes.renamed.concat(changes.updated)
+                                            .filter(c => c.did === memberDid) : 
+                                        ['new_user']
+                                });
+                            }
+                        } catch (writeErr) {
+                            this.debugLog('Failed to buffer user data to write to files', {
+                                did: memberDid,
+                                error: writeErr.message,
+                                stack: writeErr.stack
+                            });
+                            changes.failed.push({
+                                type: 'user_write',
+                                did: memberDid,
+                                handle: profile.handle,
+                                error: writeErr.message,
+                                timestamp: new Date().toISOString()
+                            });
+                        }
+                    }
+
                     processedUsers.push(userData);
     
                     // Prepare MongoDB operations
@@ -3821,6 +4695,23 @@ class StarterPackProcessor {
     
                 } catch (err) {
                     await this.handleFailedProfile(memberDid, err.message, changes);
+                }
+    
+                // Memory check and cleanup during processing
+                if (processedUsers.length % 100 === 0) {
+                    const currentHeapUsage = process.memoryUsage().heapUsed / process.memoryUsage().heapTotal;
+                    if (currentHeapUsage > 0.85) {
+                        if (this.debug) {
+                            this.debugLog('Performing mid-processing memory cleanup', {
+                                heapUsage: `${(currentHeapUsage * 100).toFixed(1)}%`,
+                                processedCount: processedUsers.length
+                            });
+                        }
+                        if (global.gc) {
+                            global.gc();
+                            await this.delay(100);
+                        }
+                    }
                 }
             }
     
@@ -3857,7 +4748,17 @@ class StarterPackProcessor {
                     if (this.debug) {
                         this.debugLog('MongoDB update complete', {
                             rkey,
-                            operations: mongodbOperations.length
+                            operations: mongodbOperations.length,
+                            packSize: processedUsers.length,
+                            stats: {
+                                newUsers: changes.added.length,
+                                updatedUsers: changes.updated.length + changes.renamed.length,
+                                discoveredPacks: changes.discovered.length
+                            },
+                            timing: {
+                                duration: Date.now() - startTime,
+                                timestamp: new Date().toISOString()
+                            }
                         });
                     }
                 } catch (err) {
@@ -3869,7 +4770,7 @@ class StarterPackProcessor {
             await this.fileManager.writePack(packData);
     
             // Log all changes
-            this.logChanges(changes, rkey);
+            await this.logChanges(changes, rkey);
     
             // Print memory usage in debug mode
             if (this.debug) {
@@ -3895,7 +4796,24 @@ class StarterPackProcessor {
                     }
                 });
             }
-    
+            
+            if (this.debug) {
+                this.debugLog('Discovery statistics', {
+                    rkey,
+                    stats: this.stats,
+                    changes: {
+                        discoveredUsers: changes.added.length,
+                        discoveredPacks: changes.discovered.length,
+                        updatedUsers: changes.updated.length + changes.renamed.length
+                    },
+                    totals: {
+                        processedUsers: processedUsers.length,
+                        existingUsers: existingUsers.size,
+                        mongoOperations: mongodbOperations.length
+                    }
+                });
+            }
+
             return true;
     
         } catch (err) {
@@ -3956,6 +4874,15 @@ class StarterPackProcessor {
     
     // Helper for processing individual user profiles
     async processUserProfile(profile, did, existingUsers, changes, processedUsers, mongodbOperations, rkey) {
+        if (this.debug) {
+            this.debugLog('Processing user profile', {
+                did,
+                handle: profile.handle,
+                isExisting: existingUsers.has(did)
+            });
+        }
+    
+        // Check against existing users
         const existingUser = existingUsers.get(did);
         
         if (existingUser) {
@@ -3963,21 +4890,49 @@ class StarterPackProcessor {
                 changes.renamed.push({
                     did,
                     oldHandle: existingUser.handle,
-                    newHandle: profile.handle
+                    newHandle: profile.handle,
+                    timestamp: new Date().toISOString()
                 });
+                if (this.debug) {
+                    this.debugLog('User handle changed', {
+                        did,
+                        oldHandle: existingUser.handle,
+                        newHandle: profile.handle
+                    });
+                }
             }
             if (existingUser.display_name !== profile.displayName) {
                 changes.updated.push({
                     did,
                     fields: ['display_name'],
                     old: { display_name: existingUser.display_name },
-                    new: { display_name: profile.displayName }
+                    new: { display_name: profile.displayName },
+                    timestamp: new Date().toISOString()
                 });
+                if (this.debug) {
+                    this.debugLog('User display name updated', {
+                        did,
+                        handle: profile.handle,
+                        oldName: existingUser.display_name,
+                        newName: profile.displayName
+                    });
+                }
             }
         } else {
-            changes.added.push({ did, handle: profile.handle });
+            changes.added.push({ 
+                did, 
+                handle: profile.handle,
+                timestamp: new Date().toISOString()
+            });
+            if (this.debug) {
+                this.debugLog('New user discovered', {
+                    did,
+                    handle: profile.handle
+                });
+            }
         }
     
+        // Prepare user data
         const userData = {
             did,
             handle: profile.handle,
@@ -3988,8 +4943,10 @@ class StarterPackProcessor {
             profile_check_needed: false
         };
     
+        // Add to processed users list
         processedUsers.push(userData);
     
+        // Prepare MongoDB operation if enabled
         if (!this.noMongoDB) {
             mongodbOperations.push({
                 updateOne: {
@@ -4002,7 +4959,47 @@ class StarterPackProcessor {
                 }
             });
         }
-    }   
+    
+        // Write to local files
+        try {
+            await this.fileManager.writeUser(userData);
+            if (this.debug) {
+                this.debugLog('Wrote user data to files', {
+                    did,
+                    handle: profile.handle,
+                    files: ['users.json', 'users.yaml']
+                });
+            }
+        } catch (err) {
+            this.debugLog('Failed to write user data to files', {
+                did,
+                handle: profile.handle,
+                error: err.message,
+                stack: err.stack
+            });
+            // Don't throw - we can continue even if file write fails
+            // But do log it as a change
+            changes.failed.push({
+                type: 'file_write',
+                did,
+                handle: profile.handle,
+                error: err.message,
+                timestamp: new Date().toISOString()
+            });
+        }
+    
+        // Update discovery stats if this is a new user
+        if (!existingUser) {
+            this.stats = this.stats || {
+                discoveredUsers: 0,
+                processedProfiles: 0
+            };
+            this.stats.discoveredUsers++;
+            this.stats.processedProfiles++;
+        }
+    
+        return userData;
+    }
 
     // check if we already have processed this profile
     async isProfileProcessed(did, packId) {
@@ -5039,6 +6036,7 @@ async function main() {
         } else {
             await globalProcessor.collect();
         }
+        
     } catch (err) {
         logger.error('Fatal error:', err);
         await globalProcessor.cleanup();

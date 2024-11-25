@@ -104,23 +104,26 @@ const logger = winston.createLogger({
 });
 
 class LRUCache {
-    constructor(maxSize = 1000) {
+    constructor(maxSize = 500) {
         this.cache = new Map();
         this.maxSize = maxSize;
         this.keys = [];
     }
 
     set(key, value) {
-        if (this.cache.has(key)) {
-            // Remove key from current position
-            this.keys = this.keys.filter(k => k !== key);
-        } else if (this.cache.size >= this.maxSize) {
-            // Remove least recently used
-            const lru = this.keys.shift();
-            this.cache.delete(lru);
+        if (this.cache.size >= this.maxSize * 0.9) { // Clear at 90% capacity
+            // Remove oldest 20% of entries
+            const removeCount = Math.floor(this.maxSize * 0.2);
+            for (let i = 0; i < removeCount; i++) {
+                const oldestKey = this.keys.shift();
+                if (oldestKey) this.cache.delete(oldestKey);
+            }
         }
         
-        // Add to cache and key tracking
+        if (this.cache.has(key)) {
+            this.keys = this.keys.filter(k => k !== key);
+        }
+        
         this.cache.set(key, value);
         this.keys.push(key);
     }
@@ -163,7 +166,7 @@ class AtomicFileWriter {
             }
         }
     }
-
+    
     async writeAtomic(filepath, content, options = {}) {
         const {
             mode = 'w',
@@ -348,183 +351,56 @@ class FileManager {
     constructor(processor = null) {
         this.processor = processor;
         this.writer = new AtomicFileWriter(processor);
-        this.streams = new Map();
+        this.streams = new Map();  // Important for stream management
         this.existingPacks = new Map();
-        this.userCache = new Map(); // Added user cache
+        this.userCache = new Map();
         this.isFirstEntry = true;
     }
 
-    // Validate file paths
-    async validatePaths(paths) {
+    async writePack(pack) {
         try {
-            for (const path of paths) {
-                const dir = dirname(path);
-                await fs.promises.access(dir, fs.constants.R_OK | fs.constants.W_OK);
-            }
-            return true;
-        } catch (err) {
-            logger.error(`Path validation failed: ${err.stack || err.message}`);
-            return false;
-        }
-    }
+            await this.handleRemovedProfiles(pack);
+            this.existingPacks.set(pack.rkey, pack);
+            
+            // Create backup before writing
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            await this.createBackup('starter_packs.json', timestamp);
+            await this.createBackup('starter_packs.yaml', timestamp);
 
-    // Initialize streams with proper error handling
-    async initStream(name, path, options = {}) {
-        if (this.processor?.debug) {
-            this.processor.debugLog(`Initializing stream: ${name}`, { path });
-        }
-
-        const stream = fs.createWriteStream(path, options);
-        
-        stream.on('error', (err) => {
-            logger.error(`Stream error for ${name}: ${err.message}`);
-            if (this.processor?.debug) {
-                this.processor.debugLog(`Stream error: ${name}`, {
-                    error: err.message,
-                    stack: err.stack
-                });
-            }
-        });
-
-        await new Promise((resolve, reject) => {
-            stream.once('ready', resolve);
-            stream.once('error', reject);
-        });
-
-        this.streams.set(name, stream);
-        return stream;
-    }
-
-    // Initialize the file manager
-    async init() {
-        try {
-            // Validate paths
-            if (!await this.validatePaths(['starter_packs.json', 'starter_packs.yaml', 'users.json', 'users.yaml'])) {
-                throw new Error('Required file paths are not accessible');
-            }
-
-            // Load existing packs
-            await this.loadExistingPacks();
-
-            // Initialize streams
-            await this.initStream('json', 'starter_packs.json');
-            await this.initStream('yaml', 'starter_packs.yaml');
-            await this.initStream('users-json', 'users.json');
-            await this.initStream('users-yaml', 'users.yaml');
-
-            // Write initial content
-            if (this.existingPacks.size > 0) {
-                const initialJson = '[' + Array.from(this.existingPacks.values())
-                    .map(pack => JSON.stringify(pack, null, 2))
-                    .join(',\n');
-                await this.writeToStream('json', initialJson);
-
-                for (const pack of this.existingPacks.values()) {
-                    await this.writeToStream('yaml', '---\n' + yaml.dump(pack));
-                }
-            } else {
-                await this.writeToStream('json', '[');
-            }
-
-            // Initialize user streams
-            await this.writeToStream('users-json', '[');
+            const jsonContent = (this.isFirstEntry ? '' : ',\n') + JSON.stringify(pack, null, 2);
+            await this.writeToStream('json', jsonContent);
+            await this.writeToStream('yaml', '---\n' + yaml.dump(pack));
+            
+            this.isFirstEntry = false;
 
             if (this.processor?.debug) {
-                this.processor.debugLog('File manager initialized', {
-                    existingPacks: this.existingPacks.size,
-                    streams: Array.from(this.streams.keys())
-                });
+                this.processor.debugLog('Pack written successfully', { rkey: pack.rkey });
             }
-
         } catch (err) {
-            logger.error(`Error initializing file manager: ${err.stack || err.message}`);
+            logger.error(`Error writing pack ${pack.rkey}: ${err.stack || err.message}`);
+            await this.cleanup();
             throw err;
         }
     }
-
-    // Load existing packs from files
-    async loadExistingPacks() {
-        try {
-            const jsonExists = await fs.promises.access('starter_packs.json')
-                .then(() => true)
-                .catch(() => false);
-
-            if (jsonExists) {
-                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
-                let packs;
-                try {
-                    const trimmedContent = content.replace(/\]\s*$/, '');
-                    packs = JSON.parse(trimmedContent + ']');
-
-                    if (Array.isArray(packs)) {
-                        packs.forEach(pack => {
-                            this.existingPacks.set(pack.rkey, pack);
-                        });
-                        
-                        // Backup old files
-                        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                        await fs.promises.rename('starter_packs.json', `starter_packs.${timestamp}.json`);
-                        await fs.promises.rename('starter_packs.yaml', `starter_packs.${timestamp}.yaml`)
-                            .catch(() => {});
-                    }
-                } catch (parseErr) {
-                    logger.warn(`JSON parse error, backing up corrupted file: ${parseErr.message}`);
-                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                    await fs.promises.rename('starter_packs.json', `starter_packs.${timestamp}.corrupted.json`);
-                }
-            }
-        } catch (err) {
-            logger.error(`Error loading existing packs: ${err.stack || err.message}`);
-            throw err;
+    
+    async safeWrite(stream, content) {
+        if (!stream || stream.destroyed) {
+            throw new Error('Stream is not available');
         }
-    }
-
-    // Write to stream with error handling
-    async writeToStream(type, content) {
-        const stream = this.streams.get(type);
-        if (!stream) throw new Error(`No stream found for type: ${type}`);
-
-        await new Promise((resolve, reject) => {
-            stream.write(content, err => {
+    
+        return new Promise((resolve, reject) => {
+            const writeResult = stream.write(content, err => {
                 if (err) reject(err);
                 else resolve();
             });
+    
+            // Handle backpressure
+            if (!writeResult) {
+                stream.once('drain', resolve);
+            }
         });
     }
-
-    // Handle atomic writes
-    async atomicWrite(path, content, options = {}) {
-        return await this.writer.writeAtomic(path, content, options);
-    }
-
-    // Write user data
-    async writeUser(user, isUpdate = false) {
-        const tempJsonPath = 'users.json.tmp';
-        const tempYamlPath = 'users.yaml.tmp';
-        
-        try {
-            // Update cache
-            this.userCache.set(user.did, user);
     
-            // Write to temp files
-            const allUsers = Array.from(this.userCache.values());
-            await fs.promises.writeFile(tempJsonPath, 
-                JSON.stringify(allUsers, null, 2));
-            await fs.promises.writeFile(tempYamlPath,
-                allUsers.map(u => '---\n' + yaml.dump(u)).join('\n'));
-    
-            // Atomic rename
-            await fs.promises.rename(tempJsonPath, 'users.json');
-            await fs.promises.rename(tempYamlPath, 'users.yaml');
-        } catch (err) {
-            // Cleanup temp files
-            await fs.promises.unlink(tempJsonPath).catch(() => {});
-            await fs.promises.unlink(tempYamlPath).catch(() => {});
-            throw err;
-        }
-    }
-
-    // Handle removed profiles
     async handleRemovedProfiles(pack) {
         const existingPack = this.existingPacks.get(pack.rkey);
         if (!existingPack) return;
@@ -561,6 +437,205 @@ class FileManager {
             removed: removedDids,
             added: [...currentDids].filter(did => !existingDids.has(did))
         };
+    }
+    
+    // Validate file paths
+    async validatePaths(paths) {
+        try {
+            for (const path of paths) {
+                const dir = dirname(path);
+                await fs.promises.access(dir, fs.constants.R_OK | fs.constants.W_OK);
+            }
+            return true;
+        } catch (err) {
+            logger.error(`Path validation failed: ${err.stack || err.message}`);
+            return false;
+        }
+    }
+
+    // Initialize streams with proper error handling
+    async initStream(name, path, options = {}) {
+        if (this.processor?.debug) {
+            this.processor.debugLog(`Initializing stream: ${name}`, { path, options });
+        }
+    
+        const stream = fs.createWriteStream(path, options);
+        
+        stream.on('error', (err) => {
+            logger.error(`Stream error for ${name}: ${err.message}`);
+            if (this.processor?.debug) {
+                this.processor.debugLog(`Stream error: ${name}`, {
+                    error: err.message,
+                    stack: err.stack
+                });
+            }
+        });
+    
+        await new Promise((resolve, reject) => {
+            stream.once('open', resolve); // more reliable for detecting when a stream is ready for writing
+            stream.once('error', reject);
+        });
+    
+        this.streams.set(name, stream);
+        return stream;
+    }
+
+    // Initialize the file manager
+    async init() {
+        try {
+            if (!await this.validatePaths(['starter_packs.json', 'starter_packs.yaml', 'users.json', 'users.yaml'])) {
+                throw new Error('Required file paths are not accessible');
+            }
+    
+            await this.loadExistingPacks();
+    
+            // Initialize streams with append mode instead of write mode
+            await this.initStream('json', 'starter_packs.json', { flags: 'a' });
+            await this.initStream('yaml', 'starter_packs.yaml', { flags: 'a' });
+            await this.initStream('users-json', 'users.json', { flags: 'a' });
+            await this.initStream('users-yaml', 'users.yaml', { flags: 'a' });
+    
+            // Only write initial content if files are empty
+            const stats = await fs.promises.stat('starter_packs.json').catch(() => ({ size: 0 }));
+            if (stats.size === 0) {
+                await this.writeToStream('json', '[');
+                this.isFirstEntry = true;
+            } else {
+                // Check if the last character is ']' to determine if the array is closed
+                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
+                const trimmedContent = content.trim();
+                if (trimmedContent.endsWith(']')) {
+                    // Remove the closing ']' to append new entries
+                    await fs.promises.truncate('starter_packs.json', content.lastIndexOf(']'));
+                    this.isFirstEntry = false;
+                } else {
+                    this.isFirstEntry = false;
+                }
+            }
+    
+            if (this.processor?.debug) {
+                this.processor.debugLog('File manager initialized', {
+                    existingPacks: this.existingPacks.size,
+                    streams: Array.from(this.streams.keys())
+                });
+            }
+    
+        } catch (err) {
+            logger.error(`Error initializing file manager: ${err.stack || err.message}`);
+            throw err;
+        }
+    }
+
+    // Load existing packs from files
+    async loadExistingPacks() {
+        try {
+            const jsonExists = await fs.promises.access('starter_packs.json')
+                .then(() => true)
+                .catch(() => false);
+    
+            if (jsonExists) {
+                const content = await fs.promises.readFile('starter_packs.json', 'utf-8');
+                let packs = [];
+                try {
+                    packs = JSON.parse(content);
+                    if (Array.isArray(packs)) {
+                        packs.forEach(pack => {
+                            this.existingPacks.set(pack.rkey, pack);
+                        });
+                    }
+                } catch (parseErr) {
+                    logger.warn(`JSON parse error: ${parseErr.message}`);
+                    // Handle corrupted JSON if necessary
+                    // For now, we'll ignore and start fresh
+                }
+            }
+        } catch (err) {
+            logger.error(`Error loading existing packs: ${err.stack || err.message}`);
+            throw err;
+        }
+    }
+
+    // Write to stream with error handling
+    async writeToStream(type, content) {
+        const stream = this.streams.get(type);
+        if (!stream) throw new Error(`No stream found for type: ${type}`);
+
+        return new Promise((resolve, reject) => {
+            const writeResult = stream.write(content, err => {
+                if (err) reject(err);
+                else resolve();
+            });
+
+            // Handle backpressure
+            if (!writeResult) {
+                stream.once('drain', resolve);
+            }
+        });
+    }
+
+    // Handle atomic writes
+    async atomicWrite(path, content, options = {}) {
+        return await this.writer.writeAtomic(path, content, options);
+    }
+
+    // Write user data
+    async writeUser(user, isUpdate = false) {
+        const tempJsonPath = 'users.json.tmp';
+        const tempYamlPath = 'users.yaml.tmp';
+        
+        try {
+            // Update cache
+            this.userCache.set(user.did, user);
+    
+            // Read existing content if any
+            let existingJson = '[]';
+            let existingYaml = '';
+            
+            try {
+                existingJson = await fs.promises.readFile('users.json', 'utf-8');
+                existingYaml = await fs.promises.readFile('users.yaml', 'utf-8');
+            } catch (err) {
+                if (err.code !== 'ENOENT') throw err;
+            }
+
+            // Prepare new content
+            const userData = {...user, last_updated: new Date() };
+            const jsonArray = existingJson === '[]' ? [] : JSON.parse(existingJson);
+            const userIndex = jsonArray.findIndex(u => u.did === user.did);
+
+            if (userIndex >= 0) {
+                jsonArray[userIndex] = userData;
+            } else {
+                jsonArray.push(userData);
+            }
+
+            // Write atomically
+            await this.writer.writeAtomic(tempJsonPath, JSON.stringify(jsonArray, null, 2));
+            await this.writer.writeAtomic(tempYamlPath, 
+                existingYaml + (existingYaml ? '\n' : '') + '---\n' + yaml.dump(userData));
+
+            await fs.promises.rename(tempJsonPath, 'users.json');
+            await fs.promises.rename(tempYamlPath, 'users.yaml');
+
+        } catch (err) {
+            await fs.promises.unlink(tempJsonPath).catch(() => {});
+            await fs.promises.unlink(tempYamlPath).catch(() => {});
+            throw err;
+        }
+    }
+
+    async createBackup(filename, timestamp) {
+        try {
+            const exists = await fs.promises.access(filename)
+                .then(() => true)
+                .catch(() => false);
+            
+            if (exists) {
+                await fs.promises.copyFile(filename, `${filename}.${timestamp}.backup`);
+            }
+        } catch (err) {
+            logger.warn(`Failed to create backup for ${filename}: ${err.message}`);
+        }
     }
 
     // Clean up temporary files
@@ -610,39 +685,34 @@ class FileManager {
                 streams: Array.from(this.streams.keys())
             });
         }
-
+    
         await this.cleanupTempFiles();
-
+    
         const closePromises = Array.from(this.streams.entries()).map(
             async ([name, stream]) => {
                 try {
-                    if (name.includes('json')) {
-                        await new Promise((resolve, reject) => {
-                            stream.write('\n]\n', err => {
-                                if (err) reject(err);
-                                else stream.end(resolve);
-                            });
-                        });
-                    } else {
-                        await new Promise((resolve, reject) => {
-                            stream.end(err => {
-                                if (err) reject(err);
-                                else resolve();
-                            });
-                        });
+                    if (name === 'json') {
+                        // Close the JSON array properly
+                        await this.writeToStream('json', '\n]\n');
                     }
-
+                    await new Promise((resolve, reject) => {
+                        stream.end(err => {
+                            if (err) reject(err);
+                            else resolve();
+                        });
+                    });
+    
                     if (this.processor?.debug) {
                         this.processor.debugLog(`Stream closed: ${name}`);
                     }
-
+    
                 } catch (err) {
                     logger.error(`Error closing stream ${name}: ${err.message}`);
                     throw err;
                 }
             }
         );
-
+    
         await Promise.all(closePromises);
         this.streams.clear();
         this.userCache.clear();
@@ -938,31 +1008,33 @@ class CheckpointManager {
                 filename: this.filename
             });
         }
-
+    
         try {
             const data = await fs.promises.readFile(this.filename, 'utf-8');
             const loaded = JSON.parse(data);
-
-            // Convert serialized collections back to proper types
+    
+            // Convert serialized collections back to proper types with safety checks
             const state = {
                 ...this.getInitialState(),
                 ...loaded,
-                completedPacks: new Set(loaded.completedPacks || []),
-                missingPacks: new Set(loaded.missingPacks || []),
-                missingProfiles: new Set(loaded.missingProfiles || []),
-                processedUsers: new Set(loaded.processedUsers || []),
-                packStats: new Map(Object.entries(loaded.packStats || {}))
+                // Ensure arrays exist before creating Sets
+                completedPacks: new Set(Array.isArray(loaded.completedPacks) ? loaded.completedPacks : []),
+                missingPacks: new Set(Array.isArray(loaded.missingPacks) ? loaded.missingPacks : []),
+                missingProfiles: new Set(Array.isArray(loaded.missingProfiles) ? loaded.missingProfiles : []),
+                processedUsers: new Set(Array.isArray(loaded.processedUsers) ? loaded.processedUsers : []),
+                // Ensure object exists before creating Map
+                packStats: new Map(loaded.packStats ? Object.entries(loaded.packStats || {}) : [])
             };
-
+    
             // Validate and repair any corrupted data
             if (!this.validateCheckpoints(state)) {
                 logger.warn('Corrupted checkpoint data detected, creating backup and starting fresh');
                 await this.backupCorruptedFile();
                 return this.getInitialState();
             }
-
+    
             return state;
-
+    
         } catch (err) {
             if (err.code === 'ENOENT') {
                 if (this.processor?.debug) {
@@ -970,19 +1042,19 @@ class CheckpointManager {
                 }
                 return this.getInitialState();
             }
-
+    
             if (err instanceof SyntaxError) {
                 logger.warn('Checkpoint file corrupted, backing up and starting fresh');
                 await this.backupCorruptedFile();
                 return this.getInitialState();
             }
-
+    
             throw err;
         }
     }
-
+    
     validateCheckpoints(state) {
-        // Basic structure validation
+        // Basic structure validation with type checking
         const requiredFields = [
             'version',
             'lastProcessedIndex',
@@ -996,14 +1068,15 @@ class CheckpointManager {
             'processedUsers',
             'packStats'
         ];
-
+    
+        // Check all required fields exist
         for (const field of requiredFields) {
             if (!(field in state)) {
                 logger.error(`Missing required field in checkpoints: ${field}`);
                 return false;
             }
         }
-
+    
         // Validate data types
         if (!(state.completedPacks instanceof Set) ||
             !(state.missingPacks instanceof Set) ||
@@ -1012,7 +1085,17 @@ class CheckpointManager {
             !(state.packStats instanceof Map)) {
             return false;
         }
-
+    
+        // Validate dailyStats is an object
+        if (typeof state.dailyStats !== 'object' || state.dailyStats === null) {
+            return false;
+        }
+    
+        // Validate arrays
+        if (!Array.isArray(state.errors) || !Array.isArray(state.rateLimitHits)) {
+            return false;
+        }
+    
         return true;
     }
 
@@ -1516,20 +1599,43 @@ class StarterPackProcessor {
     }
 
     async checkMemoryUsage() {
-        const now = Date.now();
-        if (now - this.lastMemoryCheck < this.memoryCheckInterval) return;
-        
         const used = process.memoryUsage();
-        const heapUsed = used.heapUsed / used.heapTotal;
-        
-        if (heapUsed > this.memoryThreshold) {
-            logger.warn(`High memory usage detected: ${(heapUsed * 100).toFixed(1)}%`);
+        const heapUsage = used.heapUsed / used.heapTotal;
+    
+        if (heapUsage > 0.85) {
+            logger.warn(`High heap usage (${(heapUsage * 100).toFixed(1)}%), performing memory cleanup...`);
+            
+            // Clear caches
+            this.profileCache.clear();
+            
+            // Force garbage collection
             if (global.gc) {
                 global.gc();
-                await this.delay(100);
+                
+                // Add a small delay to allow GC to complete
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Check if GC helped
+                const afterGC = process.memoryUsage();
+                const heapAfterGC = afterGC.heapUsed / afterGC.heapTotal;
+                
+                if (heapAfterGC > 0.80) {
+                    // If still high after GC, take more aggressive measures
+                    logger.warn(`Memory still high after GC (${(heapAfterGC * 100).toFixed(1)}%), performing emergency cleanup`);
+                    
+                    // Clear all caches
+                    this.profileCache = new LRUCache(1000);
+                    if (this.fileManager) {
+                        this.fileManager.existingPacks.clear();
+                        this.fileManager.userCache.clear();
+                    }
+                    
+                    // Force GC again
+                    global.gc();
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
             }
         }
-        this.lastMemoryCheck = now;
     }
     
     async handleDuplicateKeyError(batch, session) {
@@ -1757,56 +1863,43 @@ class StarterPackProcessor {
     }
 
     async writeToMongoDB(packData, userOperations) {
-        if (this.debug) {
-            this.debugLog('MongoDB write operation', {
-                packRkey: packData.rkey,
-                userCount: userOperations.length,
-                timestamp: new Date().toISOString()
-            });
-        }
-    
         if (this.noMongoDB) return;
     
-        let session;
         try {
-            session = await this.mongoClient.startSession();
-            await session.withTransaction(async () => {
-                const batchSize = Math.min(this.maxBatchSize || BATCH_SIZE, BATCH_SIZE);
-                
-                // Ensure the starter pack exists with all fields
-                await this.db.collection('starter_packs').updateOne(
-                    { rkey: packData.rkey },
-                    {
-                        $set: {
-                            rkey: packData.rkey,
-                            name: packData.name,
-                            creator: packData.creator,
-                            creator_did: packData.creator_did,
-                            description: packData.description || '',
-                            user_count: parseInt(packData.user_count),
-                            created_at: new Date(packData.created_at),
-                            updated_at: new Date(packData.updated_at),
-                            users: packData.users,
-                            weekly_joins: packData.weekly_joins || 0,
-                            total_joins: packData.total_joins || 0
-                        }
-                    },
-                    { 
-                        upsert: true, 
-                        session,
-                        writeConcern: { w: 'majority' }
+            // First update starter pack - without transaction
+            await this.db.collection('starter_packs').updateOne(
+                { rkey: packData.rkey },
+                {
+                    $set: {
+                        rkey: packData.rkey,
+                        name: packData.name,
+                        creator: packData.creator,
+                        creator_did: packData.creator_did,
+                        description: packData.description || '',
+                        user_count: parseInt(packData.user_count),
+                        created_at: new Date(packData.created_at),
+                        updated_at: new Date(packData.updated_at),
+                        users: packData.users,
+                        weekly_joins: packData.weekly_joins || 0,
+                        total_joins: packData.total_joins || 0
                     }
-                );
+                },
+                { 
+                    upsert: true,
+                    writeConcern: { w: 1 }
+                }
+            );
     
-                // Process user operations in controlled batches
-                for (let i = 0; i < userOperations.length; i += batchSize) {
-                    const batch = userOperations.slice(i, i + batchSize);
-    
-                    // Maintain all necessary fields in $set
-                    const modifiedBatch = batch.map(op => ({
-                        updateOne: {
-                            filter: op.updateOne.filter,
-                            update: {
+            // Process users in smaller batches without transaction
+            const batchSize = 25; // Even smaller batch size for Cosmos DB
+            for (let i = 0; i < userOperations.length; i += batchSize) {
+                const batch = userOperations.slice(i, i + batchSize);
+                
+                for (const op of batch) {
+                    try {
+                        await this.db.collection('users').updateOne(
+                            op.updateOne.filter,
+                            {
                                 $set: {
                                     did: op.updateOne.update.$set.did,
                                     handle: op.updateOne.update.$set.handle,
@@ -1818,43 +1911,56 @@ class StarterPackProcessor {
                                 },
                                 $addToSet: { pack_ids: packData.rkey }
                             },
-                            upsert: true
-                        }
-                    }));
-    
-                    try {
-                        await this.db.collection('users').bulkWrite(modifiedBatch, {
-                            ordered: false,
-                            session,
-                            writeConcern: { w: 'majority' }
-                        });
+                            { 
+                                upsert: true,
+                                writeConcern: { w: 1 }
+                            }
+                        );
                     } catch (err) {
                         if (err.code === 11000) {
-                            await this.handleDuplicateKeyError(modifiedBatch, session);
+                            // Handle duplicate key error by retrying without upsert
+                            await this.db.collection('users').updateOne(
+                                op.updateOne.filter,
+                                {
+                                    $set: op.updateOne.update.$set,
+                                    $addToSet: { pack_ids: packData.rkey }
+                                },
+                                { writeConcern: { w: 1 } }
+                            );
                         } else {
                             throw err;
                         }
                     }
+                    
+                    // Small delay between individual operations
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
     
-                    // Prevent memory buildup on large batches
-                    if (i % (batchSize * 5) === 0) {
-                        await new Promise(resolve => setImmediate(resolve));
+                // Delay between batches
+                if (i + batchSize < userOperations.length) {
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    
+                    // Force GC if available
+                    if (global.gc && i % (batchSize * 4) === 0) {
+                        global.gc();
+                        await new Promise(resolve => setTimeout(resolve, 100));
                     }
                 }
-            }, {
-                readPreference: 'primary',
-                readConcern: { level: 'majority' },
-                writeConcern: { w: 'majority' },
-                maxTimeMS: 60000  // Increased timeout for large transactions
-            });
+    
+                // Log progress
+                const progress = ((i + batch.length) / userOperations.length * 100).toFixed(1);
+                logger.info(`Processed ${i + batch.length}/${userOperations.length} users (${progress}%)`);
+            }
+    
         } catch (err) {
             logger.error(`MongoDB write failed: ${err.stack || err.message}`);
             throw err;
-        } finally {
-            if (session) {
-                await session.endSession().catch(err => 
-                    logger.warn(`Error ending MongoDB session: ${err.message}`));
-            }
+        }
+    
+        // Final cleanup
+        if (global.gc) {
+            global.gc();
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
     }
     
@@ -2193,8 +2299,8 @@ class StarterPackProcessor {
 
     async getListMembers(uri, cursor) {
         await this.refreshTokenIfNeeded();
-    
-        const maxRetries = 2;  // Reduced from 3 since list not found is usually permanent
+        const maxRetries = 2;  // Keep the existing retry count
+        
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 await this.rateLimiter.throttle();
@@ -2220,7 +2326,7 @@ class StarterPackProcessor {
                 };
     
             } catch (err) {
-                // Don't retry on list not found
+                // Keep exact same error handling as current version
                 if (err.status === 404 || err.message.includes('List not found')) {
                     logger.warn(`List not found: ${uri}`);
                     return null;
@@ -2238,7 +2344,6 @@ class StarterPackProcessor {
                     }
                 }
     
-                // Only log error and retry if it's a retryable error
                 if (this.isRetryableError(err) && attempt < maxRetries - 1) {
                     logger.error(`Error fetching list page (attempt ${attempt + 1}/${maxRetries}): ${err.message}`);
                     await this.delay(Math.pow(2, attempt) * 1000);
@@ -2257,6 +2362,14 @@ class StarterPackProcessor {
             throw new Error('DID parameter is required');
         }
     
+        if (this.debug) {
+            this.debugLog('Starting profile fetch', {
+                did,
+                forceUpdate,
+                timestamp: new Date().toISOString()
+            });
+        }
+    
         // 2. Check if profile is known to be missing
         if (!forceUpdate && this.checkpointManager.isMissingProfile(did)) {
             logger.info(`Skipping fetch for known missing profile: ${did}`);
@@ -2269,6 +2382,12 @@ class StarterPackProcessor {
             // 3. Check Memory Cache
             const cached = this.profileCache.get(did);
             if (cached && !forceUpdate && Date.now() - cached.timestamp < this.profileCacheExpiry) {
+                if (this.debug) {
+                    this.debugLog('Returning cached profile', {
+                        did,
+                        cacheAge: Date.now() - cached.timestamp
+                    });
+                }
                 return cached.profile;
             }
     
@@ -2291,6 +2410,12 @@ class StarterPackProcessor {
                                 profile,
                                 timestamp: Date.now()
                             });
+                            if (this.debug) {
+                                this.debugLog('Returning MongoDB profile', {
+                                    did,
+                                    lastUpdated: userDoc.last_updated
+                                });
+                            }
                             return profile;
                         }
     
@@ -2300,6 +2425,9 @@ class StarterPackProcessor {
                                 { did },
                                 { $set: { profile_check_needed: true } }
                             );
+                            if (this.debug) {
+                                this.debugLog('Marked profile for update', { did });
+                            }
                         }
                     }
                 } catch (err) {
@@ -2307,9 +2435,102 @@ class StarterPackProcessor {
                 }
             }
     
-            // 5. Fetch from API
-            const apiProfile = await this.fetchProfileFromAPI(did);
+            // 5. Fetch from API with fallback strategy
+            const endpoints = [
+                { url: 'https://api.bsky.app', auth: true },  // Try main API first
+                { url: 'https://public.api.bsky.app', auth: false }, // Then public API
+                { url: 'https://bsky.social', auth: true }  // Finally social endpoint
+            ];
+        
+            let apiProfile = null;
+            let lastError = null;
+        
+            for (const endpoint of endpoints) {
+                try {
+                    if (this.debug) {
+                        this.debugLog('Attempting profile fetch', {
+                            did,
+                            endpoint: endpoint.url,
+                            requiresAuth: endpoint.auth
+                        });
+                    }
+        
+                    if (endpoint.auth) {
+                        // Use existing authenticated API call path
+                        const response = await this.makeApiCall('getProfile',
+                            this.agent.api.app.bsky.actor.getProfile({
+                                actor: did
+                            })
+                        );
+                        apiProfile = response?.data;
+                    } else {
+                        // For public API, use authorized agent but different base URL
+                        const response = await this.makeApiCall('getProfile',
+                            this.agent.api.app.bsky.actor.getProfile({
+                                actor: did
+                            }),
+                            { 
+                                baseUrl: endpoint.url,
+                                maxRetries: 2 
+                            }
+                        );
+                        apiProfile = response?.data;
+                    }
+        
+                    if (apiProfile) {
+                        if (this.debug) {
+                            this.debugLog('Profile fetch successful', {
+                                did,
+                                endpoint: endpoint.url
+                            });
+                        }
+                        break;
+                    }
+        
+                } catch (err) {
+                    lastError = err;
+                    if (this.debug) {
+                        this.debugLog('Profile fetch failed', {
+                            did,
+                            endpoint: endpoint.url,
+                            error: err.message
+                        });
+                    }
+        
+                    // Handle rate limits consistently
+                    if (err.status === 429) {
+                        const shouldRetry = await this.rateLimiter.handleResponse(err);
+                        if (shouldRetry) {
+                            await this.delay(2000);
+                            continue;
+                        }
+                    }
+        
+                    // For 502s and network errors, try next endpoint
+                    if (err.status === 502 || this.isNetworkError(err)) {
+                        await this.delay(1000);
+                        continue;
+                    }
+        
+                    // For auth errors, refresh token and retry
+                    if (err.message?.includes('Token has expired') ||
+                        err.message?.includes('Authentication Required')) {
+                        await this.refreshTokenIfNeeded(true);
+                        continue;
+                    }
+        
+                    // For other errors, try next endpoint
+                    await this.delay(1000);
+                }
+            }
+    
             if (!apiProfile) {
+                if (this.debug) {
+                    this.debugLog('Failed to fetch profile from all endpoints', {
+                        did,
+                        lastError: lastError?.message
+                    });
+                }
                 await this.checkpointManager.addMissingProfile(did, 'api_fetch_failed');
                 return null;
             }
@@ -2428,6 +2649,14 @@ class StarterPackProcessor {
                 profile: profile,
                 timestamp: Date.now(),
             });
+    
+            if (this.debug) {
+                this.debugLog('Profile fetch complete', {
+                    did,
+                    handle: profile.handle,
+                    starterPackCount: starterPacks.length
+                });
+            }
     
             return profile;
         } catch (err) {
@@ -4070,261 +4299,321 @@ class StarterPackProcessor {
 
     async processUrls(filename) {
         try {
-            const content = await fs.promises.readFile(filename, 'utf-8');
-            const urls = content
+            logger.info('Starting URL processing...');
+            const startTime = Date.now();
+            let lastStatusReport = startTime;
+            
+            // Initialize processing state
+            let startIndex = Math.max(0, this.checkpointManager.getLastProcessedIndex() + 1);
+            const todayStats = this.checkpointManager.getDailyStats();
+            logger.info(`Today's progress: ${JSON.stringify(todayStats, null, 2)}`);
+    
+            // Read and process file in smaller chunks
+            logger.info(`Reading ${filename}...`);
+            let fileContent = await fs.promises.readFile(filename, 'utf-8');
+            
+            // Split into lines and filter valid ones
+            logger.info('Processing file content...');
+            const lines = fileContent
                 .split('\n')
                 .map(line => line.trim())
                 .filter(line => line && line.includes('|'));
+            
+            // Clear the original content to free memory
+            fileContent = null;
+            if (global.gc) global.gc();
     
-            // Split packs into new and existing
-            const newPacks = [];
-            const oldPacks = [];
-            const DAYS_THRESHOLD = 14; // Adjust as needed
+            const totalUrls = lines.length;
+            logger.info(`Found ${totalUrls} total URLs to process`);
+            logger.info(`Starting from index ${startIndex}`);
     
-            for (const url of urls) {
-                const [_, rkey] = url.split('|').map(s => s.trim());
-                const existingPack = this.fileManager.getExistingPack(rkey);
+            // Process in smaller chunks
+            const CHUNK_SIZE = 50; // Reduced chunk size
+            let processedCount = 0;
+            let currentChunk = [];
     
-                if (!existingPack) {
-                    newPacks.push(url);
-                } else {
-                    const lastUpdated = new Date(existingPack.updated_at);
-                    const daysSinceUpdate = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-    
-                    if (daysSinceUpdate > DAYS_THRESHOLD) {
-                        oldPacks.push(url);
+            for (let i = startIndex; i < lines.length; i++) {
+                // Memory check and cleanup
+                if (i % 10 === 0) {
+                    const memUsage = process.memoryUsage();
+                    const heapUsage = memUsage.heapUsed / memUsage.heapTotal;
+                    
+                    if (heapUsage > 0.85) {
+                        logger.info(`Memory cleanup at ${(heapUsage * 100).toFixed(1)}% heap usage`);
+                        this.profileCache.clear();
+                        if (global.gc) {
+                            global.gc();
+                            await this.delay(100);
+                        }
                     }
                 }
-            }
     
-            logger.info(`Found ${newPacks.length} new packs and ${oldPacks.length} packs needing update`);
+                const line = lines[i];
+                const [_, rkey] = line.split('|').map(s => s.trim());
     
-            // Process new packs first, then old ones
-            const processingOrder = [...newPacks, ...oldPacks];
-    
-            let startIndex = Math.max(0, this.checkpointManager.getLastProcessedIndex() + 1);
-            logger.info(`Resuming from index ${startIndex}`);
-    
-            const todayStats = this.checkpointManager.getDailyStats();
-            if (todayStats) {
-                logger.info(`Today's progress: ${JSON.stringify(todayStats, null, 2)}`);
-            }
-    
-            const startTime = Date.now();
-            let lastStatusReport = startTime;
-    
-            for (const [index, urlLine] of processingOrder.entries()) {
-                if (index < startIndex) continue;
-    
-                const [creatorHandle, rkey] = urlLine.trim().split('|').map(s => s.trim());
-    
-                if (!this.checkpointManager.shouldProcessPack(rkey, newPacks.includes(urlLine) || oldPacks.includes(urlLine))) {
-                    logger.info(`Skipping already processed pack: ${rkey}`);
+                if (!this.checkpointManager.shouldProcessPack(rkey)) {
+                    processedCount++;
                     continue;
                 }
     
-                let retries = 0;
-                const MAX_RETRIES = 3;
-                let success = false;
+                currentChunk.push({ index: i, line });
     
-                while (!success && retries < MAX_RETRIES) {
-                    try {
-                        const result = await this.processStarterPack(urlLine.trim());
-                        if (result !== false) {  // false indicates a non-retryable skip
-                            success = true;
-                            this.checkpointManager.updateProgress(index, rkey, 'success');
-                        } else {
-                            // result === false indicates a non-retryable skip, mark as success to avoid retrying
-                            success = true;
-                            this.checkpointManager.updateProgress(index, rkey, 'skipped');
-                        }
-                    } catch (err) {
-                        // Distinguish between retryable and non-retryable errors
-                        if (err.status === 429) { // Rate limit
-                            logger.warn(`Rate limit reached at index ${index}. Saving progress and exiting...`);
-                            this.checkpointManager.updateProgress(index, rkey, 'rateLimit', err);
-                            await this.cleanup();
-                            process.exit(0);
-                        } else if (err.code === 'ECONNRESET' || err.message.includes('socket hang up')) {
-                            logger.warn(`Network error at index ${index}, retrying...`);
-                            retries++;
-                            if (retries < MAX_RETRIES) {
-                                await this.delay(Math.pow(2, retries) * 1000);
-                                continue;
-                            }
-                        } else {
-                            logger.error(`Error processing pack ${rkey}: ${err.stack || err.message}`);
-                            this.checkpointManager.updateProgress(index, rkey, 'error', err);
-                            retries++;
-                            if (retries < MAX_RETRIES) {
-                                logger.info(`Retrying after error (${retries}/${MAX_RETRIES})...`);
-                                await this.delay(Math.pow(2, retries) * 1000);
-                                continue;
-                            }
-                        }
+                if (currentChunk.length >= CHUNK_SIZE) {
+                    await this.processUrlChunk(currentChunk, totalUrls, processedCount);
+                    processedCount += currentChunk.length;
+                    currentChunk = [];
     
-                        // If max retries reached without success
-                        if (retries >= MAX_RETRIES) {
-                            logger.error(`Max retries reached for pack ${rkey}. Skipping...`);
-                            this.checkpointManager.updateProgress(index, rkey, 'error', err);
-                            break;
-                        }
+                    // Force cleanup after each chunk
+                    this.profileCache.clear();
+                    if (global.gc) {
+                        global.gc();
+                        await this.delay(200);
+                    }
+    
+                    // Status report
+                    const now = Date.now();
+                    if (now - lastStatusReport > 300000) { // Every 5 minutes
+                        await this.reportProcessingStatus(startTime, processedCount, totalUrls, todayStats);
+                        lastStatusReport = now;
                     }
                 }
-    
-                // Add delays for rate limiting
-                if (index % 10 === 0 && index !== 0) {
-                    logger.info('Adding small delay to prevent rate limiting...');
-                    await this.delay(1000);
-                }
-                if (index % 100 === 0 && index !== 0) {
-                    logger.info('Adding longer delay to prevent rate limiting...');
-                    await this.delay(5000);
-                }
-    
-                // Status report at intervals
-                const now = Date.now();
-                if (now - lastStatusReport > 5 * 60 * 1000) { // Every 5 minutes
-                    const elapsed = (now - startTime) / 1000;
-                    const processed = index - startIndex;
-                    const rate = processed / (elapsed / 60);
-                    const remaining = processingOrder.length - index;
-                    const estimatedTimeLeft = remaining / rate;
-                    const statusReport = `
-    Status Report:
-    New packs: ${newPacks.length}
-    Updates needed: ${oldPacks.length}
-    Total to process: ${processingOrder.length}
-    Processed: ${processed}/${processingOrder.length} (${(processed / processingOrder.length * 100).toFixed(2)}%)
-    Rate: ${rate.toFixed(2)} packs/minute
-    Est. time remaining: ${(estimatedTimeLeft / 60).toFixed(2)} hours
-    Success rate: ${todayStats ? (todayStats.successful / todayStats.processed * 100).toFixed(2) : 0}%
-    Rate limits hit: ${todayStats?.rateLimitHits || 0}
-    Errors: ${todayStats?.errors || 0}
-    `;
-    
-                    logger.info(statusReport);
-    
-                    lastStatusReport = now;
-                }
             }
     
-            await this.cleanup();
+            // Process remaining items
+            if (currentChunk.length > 0) {
+                await this.processUrlChunk(currentChunk, totalUrls, processedCount);
+            }
+    
+            logger.info('URL processing completed successfully');
+    
         } catch (err) {
-            logger.error(`Error reading file ${filename}: ${err.stack || err.message}`);
-            if (this.debug) {
-                this.debugLog('Process URLs error details', {
-                    error: err.message,
-                    stack: err.stack,
-                    filename,
-                    timestamp: new Date().toISOString()
-                });
-            }
+            logger.error(`Error processing URLs: ${err.stack || err.message}`);
             throw err;
         }
+    }
+    
+    async processUrlChunk(chunk, totalUrls, processedSoFar) {
+        logger.info(`Processing chunk of ${chunk.length} items (${processedSoFar + 1}-${processedSoFar + chunk.length}/${totalUrls})`);
+    
+        for (const {index, line} of chunk) {
+            const [handle, rkey] = line.split('|').map(s => s.trim());
+            
+            try {
+                const success = await this.processStarterPack(line);
+                if (success !== false) {
+                    await this.checkpointManager.updateProgress(index, rkey, 'success');
+                } else {
+                    await this.checkpointManager.updateProgress(index, rkey, 'skipped');
+                }
+    
+                // Rate limiting delays
+                if ((processedSoFar + chunk.indexOf({index, line})) % 10 === 0) {
+                    await this.delay(1000);
+                }
+            } catch (err) {
+                if (err.status === 429) {
+                    logger.warn(`Rate limit reached at index ${index}. Saving progress...`);
+                    await this.checkpointManager.updateProgress(index, rkey, 'rateLimit', err);
+                    throw err; // Let the main process handle rate limits
+                }
+                
+                logger.error(`Error processing ${rkey}: ${err.message}`);
+                await this.checkpointManager.updateProgress(index, rkey, 'error', err);
+                await this.delay(2000); // Add delay after errors
+            }
+        }
+    }
+    
+    async reportProcessingStatus(startTime, processed, total, todayStats) {
+        const now = Date.now();
+        const elapsed = (now - startTime) / 1000;
+        const rate = processed / (elapsed / 60);
+        const remaining = total - processed;
+        const estimatedTimeLeft = remaining / rate;
+        const memUsage = process.memoryUsage();
+        
+        const statusReport = `
+    Processing Status:
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Progress   : ${processed}/${total} (${(processed/total*100).toFixed(2)}%)
+    Rate       : ${rate.toFixed(2)} packs/minute
+    Time Left  : ${(estimatedTimeLeft/60).toFixed(2)} hours
+    Success    : ${todayStats ? (todayStats.successful/todayStats.processed*100).toFixed(2) : 0}%
+    Rate Limits: ${todayStats?.rateLimitHits || 0}
+    Errors     : ${todayStats?.errors || 0}
+    Memory     : ${(memUsage.heapUsed/1024/1024).toFixed(1)}MB / ${(memUsage.heapTotal/1024/1024).toFixed(1)}MB
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    
+        logger.info(statusReport);
     }
 
     async cleanup() {
         const errors = [];
+        let cleanupTimeout;
         
         try {
             logger.info('Starting cleanup process...');
             
             // Add timeout for cleanup
-            const cleanupTimeout = setTimeout(() => {
+            cleanupTimeout = setTimeout(() => {
                 logger.error('Cleanup timeout - forcing exit');
                 process.exit(1);
-            }, 1200000); // 120 second timeout
-
+            }, 120000); // 120 second timeout
+    
+            // First save any pending checkpoints
+            if (this.checkpointManager) {
+                try {
+                    await this.checkpointManager.saveCheckpoints(true)
+                        .catch(err => {
+                            logger.error(`Error saving checkpoints: ${err.message}`);
+                            errors.push(['checkpoint_save', err]);
+                        });
+                    
+                    await this.checkpointManager.cleanup()
+                        .catch(err => {
+                            logger.error(`Error cleaning up checkpoints: ${err.message}`);
+                            errors.push(['checkpoint_cleanup', err]);
+                        });
+                } catch (err) {
+                    errors.push(['checkpoint', err]);
+                }
+            }
+    
+            // Clear profile cache
             try {
-                // First save any pending checkpoints
-                if (this.checkpointManager) {
-                    try {
-                        await this.checkpointManager.cleanup()
-                            .catch(err => errors.push(['checkpoint', err]));
-                    } catch (err) {
-                        errors.push(['checkpoint', err]);
-                    }
-                }
-        
-                // Clear profile cache
                 if (this.profileCache) {
-                    try {
-                        this.profileCache.clear();
-                    } catch (err) {
-                        errors.push(['cache', err]);
-                    }
+                    this.profileCache.clear();
                 }
-                
-                // Clean up file manager and its resources
-                if (this.fileManager) {
-                    try {
-                        await this.fileManager.cleanup()
-                            .catch(err => errors.push(['fileManager', err]));
-                    } catch (err) {
-                        errors.push(['fileManager', err]);
-                    }
+            } catch (err) {
+                errors.push(['cache', err]);
+            }
+    
+            // Clean up file manager and its resources
+            if (this.fileManager) {
+                try {
+                    await this.fileManager.cleanup()
+                        .catch(err => {
+                            logger.error(`Error cleaning up file manager: ${err.message}`);
+                            errors.push(['fileManager', err]);
+                        });
+                } catch (err) {
+                    errors.push(['fileManager', err]);
                 }
-                
-                // Clean up MongoDB resources
-                if (this.mongoClient) {
-                    try {
-                        // Ensure all pending operations are complete
-                        if (this.db) {
+            }
+    
+            // Clean up MongoDB resources
+            if (this.mongoClient) {
+                try {
+                    // Ensure all pending operations are complete
+                    if (this.db && !this.noMongoDB) {
+                        try {
                             await this.db.command({ fsync: 1 })
                                 .catch(err => logger.warn(`Fsync warning: ${err.message}`));
+                        } catch (fsyncErr) {
+                            logger.warn(`Fsync error: ${fsyncErr.message}`);
                         }
-                        
-                        await this.mongoClient.close(true) // Force close
-                            .catch(err => errors.push(['mongodb', err]));
-                    } catch (err) {
-                        errors.push(['mongodb', err]);
                     }
-                }
-        
-                // Clean up any remaining resources
-                if (this.resourceManager) {
+    
+                    // Close MongoDB connection
                     try {
-                        await this.resourceManager.cleanup()
-                            .catch(err => errors.push(['resources', err]));
-                    } catch (err) {
-                        errors.push(['resources', err]);
+                        await this.mongoClient.close(true) // Force close
+                            .catch(err => {
+                                logger.error(`Error closing MongoDB connection: ${err.message}`);
+                                errors.push(['mongodb_close', err]);
+                            });
+                    } catch (closeErr) {
+                        errors.push(['mongodb', closeErr]);
                     }
+                } catch (err) {
+                    errors.push(['mongodb', err]);
                 }
-        
-                // Log cleanup status
-                if (errors.length > 0) {
-                    const errorMsg = errors.map(([type, err]) => 
-                        `${type}: ${err.message}`
-                    ).join('; ');
-                    
-                    logger.error(`Cleanup completed with errors: ${errorMsg}`);
-                    throw new AggregateError(errors.map(([,err]) => err), 
-                        'Multiple cleanup errors occurred');
-                }
-        
-                logger.info('Cleanup completed successfully');
-            
-            } finally {
-                clearTimeout(cleanupTimeout);
             }
+    
+            // Clear any remaining timeouts
+            if (this.rateLimiter?.saveIntervalId) {
+                clearInterval(this.rateLimiter.saveIntervalId);
+            }
+    
+            // Force garbage collection if available
+            if (global.gc) {
+                try {
+                    global.gc();
+                } catch (gcErr) {
+                    logger.warn(`GC error: ${gcErr.message}`);
+                }
+            }
+    
+            // Clean up temporary files
+            try {
+                const tempFiles = await fs.promises.readdir('.')
+                    .then(files => files.filter(f => 
+                        f.endsWith('.tmp') || 
+                        f.endsWith('.temp') || 
+                        f.endsWith('.lock')
+                    ))
+                    .catch(() => []);
+                    
+                for (const file of tempFiles) {
+                    await fs.promises.unlink(file)
+                        .catch(err => logger.warn(`Error deleting temp file ${file}: ${err.message}`));
+                }
+            } catch (tempErr) {
+                logger.error(`Error cleaning temporary files: ${tempErr.message}`);
+                errors.push(['tempfiles', tempErr]);
+            }
+    
+            // Handle any errors that occurred during cleanup
+            if (errors.length > 0) {
+                const errorMsg = errors
+                    .map(([type, err]) => `${type}: ${err.message}`)
+                    .join('; ');
+                
+                logger.error(`Cleanup completed with errors: ${errorMsg}`);
+                
+                // Only throw if we have errors other than fsync warnings
+                const criticalErrors = errors.filter(([type]) => 
+                    !['fsync_warning'].includes(type));
+                
+                if (criticalErrors.length > 0) {
+                    throw new AggregateError(
+                        errors.map(([,err]) => err),
+                        'Multiple cleanup errors occurred'
+                    );
+                }
+            }
+    
+            logger.info('Cleanup completed successfully');
     
         } catch (err) {
             logger.error(`Critical error during cleanup: ${err.stack || err.message}`);
             throw err;
         } finally {
-            // Emergency cleanup of file handles if needed
+            // Clear timeout
+            if (cleanupTimeout) {
+                clearTimeout(cleanupTimeout);
+            }
+    
+            // Final emergency cleanup of file handles
             try {
-                const tempFiles = await fs.promises.readdir('.')
-                    .then(files => files.filter(f => f.endsWith('.tmp')))
+                const emergencyFiles = await fs.promises.readdir('.')
+                    .then(files => files.filter(f => 
+                        f.endsWith('.tmp') || 
+                        f.endsWith('.temp') || 
+                        f.endsWith('.lock')
+                    ))
                     .catch(() => []);
                     
-                for (const file of tempFiles) {
+                for (const file of emergencyFiles) {
                     await fs.promises.unlink(file).catch(() => {});
                 }
             } catch (err) {
                 logger.error(`Emergency cleanup failed: ${err.message}`);
             }
+    
+            // Clear all class-level references
+            this.db = null;
+            this.profileCache = null;
+            this.rateLimiter = null;
         }
     }
 

@@ -1544,28 +1544,23 @@ class FileHandler {
     }
 
     async cleanupBackups(retainDays = 7) {
-        try {
-            const dir = path.dirname(FILE_PATHS.users);
-            const files = await fs.readdir(dir);
-            const now = Date.now();
-            const backupFiles = files.filter(f => f.endsWith('.bak'));
-            
-            for (const file of backupFiles) {
+        const backupFiles = await fs.readdir('.');
+        const now = Date.now();
+        
+        for (const file of backupFiles) {
+            if (file.endsWith('.bak')) {
                 try {
-                    const filePath = path.join(dir, file);
-                    const stats = await fs.stat(filePath);
+                    const stats = await fs.stat(file);
                     const ageInDays = (now - stats.mtimeMs) / (1000 * 60 * 60 * 24);
                     
                     if (ageInDays > retainDays) {
-                        await fs.unlink(filePath);
-                        logger.debug(`Removed old backup: ${file}`);
+                        await fs.unlink(file);
+                        logger.debug(`Removed old backup file: ${file}`);
                     }
                 } catch (err) {
-                    logger.warn(`Failed to process backup file ${file}: ${err.message}`);
+                    logger.warn(`Error processing backup file ${file}:`, err);
                 }
             }
-        } catch (err) {
-            logger.error('Error cleaning up backups:', err);
         }
     }
     
@@ -1607,6 +1602,8 @@ class FileHandler {
             this.packCache.clear();
             this.fileFormats.clear();
             this.failureLog.clear();
+
+            await this.cleanupBackups();
     
             logger.debug('File handler cleanup completed');
         } catch (err) {
@@ -2585,11 +2582,13 @@ class MainProcessor {
     }
 
     async processStarterPack(urlLine) {
-        logger.debug(`Processing starter pack ${urlLine}`);
         const [handle, rkey] = urlLine.split('|').map(s => s.trim());
         if (!handle || !rkey) {
             throw new Error('Invalid URL line format');
         }
+
+        logger.info(`Processing pack: ${handle}|${rkey}`);
+        logger.info(`Progress: ${this.taskManager.completedTaskCount}/${this.taskManager.totalTasks} packs`);
     
         try {
             const startTime = Date.now();
@@ -2681,6 +2680,15 @@ class MainProcessor {
             // Then save to MongoDB if enabled
             if (!this.noMongoDB) {
                 await this.saveToDB(packData, processedUsers);
+            }
+
+            if (this.debug) {
+                const dbCounts = await this.dbManager.getCollectionCounts();
+                logger.debug('Current database status:', {
+                    collections: dbCounts,
+                    pendingTasks: this.taskManager.pendingTasks.size,
+                    completedTasks: this.taskManager.completedTasks.size
+                });
             }
     
             // 7. Update task state and metrics
@@ -3304,38 +3312,39 @@ class MainProcessor {
     }
 
     async saveToDB(packData, users) {
-        if (this.noMongoDB) {
-            return;
-        }
-    
-        if (this.noDBWrites) {
-            await this.dbManager.saveToDB(packData, users);
-            return;
-        }
+        if (this.noMongoDB) return;
     
         try {
             // First save the pack
-            logger.debug('safe write to DB of:', packData);
+            logger.debug('Writing pack to MongoDB:', packData.rkey);
             await this.dbManager.safeWrite('starter_packs', {
                 filter: { rkey: packData.rkey },
                 update: { $set: packData },
                 upsert: true
             });
     
-            // Then process users
-            const userOps = users.map(user => ({
-                filter: { did: user.did },
-                update: { 
-                    $set: user,
-                    $addToSet: { pack_ids: packData.rkey }
-                },
-                upsert: true
+            // Then process users in batches
+            logger.debug(`Writing ${users.length} users to MongoDB`);
+            const userOperations = users.map(user => ({
+                updateOne: {  // Changed from generic operation to explicit updateOne
+                    filter: { did: user.did },
+                    update: { 
+                        $set: user,
+                        $addToSet: { pack_ids: packData.rkey }
+                    },
+                    upsert: true
+                }
             }));
     
-            logger.debug('attempting bulk write to DB of:', userOps);
-            await this.dbManager.safeBulkWrite('users', userOps);
+            await this.dbManager.safeBulkWrite('users', userOperations);
+    
+            // Log collection counts when in debug mode
+            if (this.debug) {
+                const counts = await this.dbManager.getCollectionCounts();
+                logger.debug('MongoDB collection counts after write:', counts);
+            }
         } catch (err) {
-            logger.error(`Database write failed: ${err.stack || err.message}`);
+            logger.error(`Database write failed for pack ${packData.rkey}:`, err);
             throw err;
         }
     }
@@ -3561,14 +3570,28 @@ function validateEnv(args) {
 
 // Handle cleanup and shutdown
 async function handleShutdown(signal) {
-    logger.info(`Received ${signal}. Starting cleanup...`);
+    logger.info(`\nReceived ${signal}. Starting graceful shutdown...`);
+    
     try {
         if (processor) {
+            // Save current state
+            await processor.taskManager.maybeWriteCheckpoint(true);
+            
+            // Clean up resources
             await processor.cleanup();
+            
+            // Log final stats
+            const stats = processor.metrics.getMetrics();
+            logger.info('Final processing statistics:', {
+                packsProcessed: stats.processing.packsProcessed,
+                usersProcessed: stats.processing.usersProcessed,
+                totalDuration: `${Math.floor((Date.now() - processor.startTime) / 60000)} minutes`
+            });
         }
     } catch (err) {
-        logger.error(`Error during cleanup: ${err.message}`);
+        logger.error('Error during shutdown:', err);
     } finally {
+        logger.info('Shutdown complete');
         process.exit(0);
     }
 }
@@ -3731,6 +3754,10 @@ class TaskManager {
         this.lastCheckpoint = Date.now();
         this.CHECKPOINT_INTERVAL = 20 * 60 * 1000; // 20 minutes
         this.checkpointDirty = false;  // Track if we need to write
+        this.totalTasks = 0;
+        this.completedTaskCount = 0;
+        this.currentPackUsersTotal = 0;
+        this.currentPackUsersProcessed = 0;
     }
 
     async initializeTaskList() {
@@ -4440,38 +4467,34 @@ class TaskManager {
     async processNextTask(processor) {
         const task = await this.getNextTask();
         if (!task) return null;
-    
-        const maxRetries = 3;
-        let attempts = 0;
-    
-        while (attempts < maxRetries) {
-            try {
-                if (processor.debug) {
-                    logger.debug('Processing task:', {
-                        rkey: task.rkey,
-                        handle: task.handle,
-                        attempt: task.attempts,
-                        source: task.source,
-                        priority: task.priority
-                    });
-                }
-                const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
-                if (success) {
-                    await this.markTaskCompleted(task.rkey);
-                    return true;
-                }
-                break; // Exit on intentional failure
-            } catch (err) {
-                attempts++;
-                if (attempts === maxRetries || !this.isRetryableError(err)) {
-                    logger.error(`Failed to process task after ${attempts} attempts:`, err);
-                    await this.recordFailure(task.rkey, err.message);
-                    break;
-                }
-                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 1000));
+
+        this.completedTaskCount++;
+        logger.info(`Processing pack ${this.completedTaskCount}/${this.totalTasks}: ${task.rkey} (${task.handle})`);
+
+        try {
+            const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
+            
+            if (success) {
+                this.completedTasks.add(task.rkey);
+                this.pendingTasks.delete(task.rkey);
+                this.markDirty();
+
+                // Log progress
+                const progress = ((this.completedTaskCount / this.totalTasks) * 100).toFixed(1);
+                logger.info(`Pack processing complete (${progress}% overall progress)`);
             }
+
+            return success;
+        } catch (err) {
+            logger.error(`Error processing task ${task.rkey}:`, err);
+            return false;
         }
-        return false;
+    }
+
+    updateUserProgress(total, current) {
+        this.currentPackUsersTotal = total;
+        this.currentPackUsersProcessed = current;
+        logger.info(`Processing user ${current}/${total}`);
     }
 
     async loadExistingData() {
@@ -4756,6 +4779,9 @@ process.on('uncaughtException', (error) => {
     logger.error('Uncaught Exception:', error);
     process.exit(1);
 });
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // Run the program
 main().catch(err => {

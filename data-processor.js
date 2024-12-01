@@ -3927,35 +3927,63 @@ class TaskManager {
         }
     }
 
-    shouldProcessPack(rkey, existingPack, failure) {
-        // Don't check completedTasks here anymore! We only skip if:
+    async shouldProcessPack(rkey, existingPack, failure) {
+        // First check permanent failures
         if (failure?.permanent) {
             return { process: false, reason: 'permanent_failure' };
         }
-    
-        // If we have an existing pack, check its age
-        if (existingPack) {
-            const lastUpdate = new Date(existingPack.updated_at);
-            const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
-            
-            // Skip if recently updated (unless it previously failed)
-            if (daysSinceUpdate < 7 && !failure) {
-                return { process: false, reason: 'recently_updated' };
+
+        try {
+            // Check MongoDB first if available
+            if (!this.noMongoDB && !this.noDBWrites) {
+                const mongoDbPack = await this.dbManager.db.collection('starter_packs')
+                    .findOne({ rkey: rkey });
+                
+                if (mongoDbPack) {
+                    const lastUpdate = new Date(mongoDbPack.updated_at);
+                    const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
+                    
+                    if (daysSinceUpdate < 10) {
+                        return { process: false, reason: 'recently_processed_in_mongodb' };
+                    } else {
+                        // Pack exists but needs update - mark for lower priority
+                        return { 
+                            process: true, 
+                            lowPriority: true,
+                            reason: 'mongodb_needs_update' 
+                        };
+                    }
+                }
             }
-        }
-    
-        // If it failed before, check cooling period
-        if (failure) {
-            const lastAttempt = new Date(failure.lastAttempt);
-            const daysSinceAttempt = (Date.now() - lastAttempt.getTime()) / (1000 * 60 * 60 * 24);
-            const requiredCooling = Math.pow(2, failure.attempts);
-            
-            if (daysSinceAttempt < requiredCooling) {
-                return { process: false, reason: 'cooling_period' };
+
+            // If we have an existing pack in local files, check its age
+            if (existingPack) {
+                const lastUpdate = new Date(existingPack.updated_at);
+                const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
+                
+                if (daysSinceUpdate < 7 && !failure) {
+                    return { process: false, reason: 'recently_updated_in_files' };
+                }
             }
+
+            // If it failed before, check cooling period
+            if (failure) {
+                const lastAttempt = new Date(failure.lastAttempt);
+                const daysSinceAttempt = (Date.now() - lastAttempt.getTime()) / (1000 * 60 * 60 * 24);
+                const requiredCooling = Math.pow(2, failure.attempts);
+                
+                if (daysSinceAttempt < requiredCooling) {
+                    return { process: false, reason: 'cooling_period' };
+                }
+            }
+
+            return { process: true };
+            
+        } catch (err) {
+            logger.error(`Error checking MongoDB for pack ${rkey}:`, err);
+            // If MongoDB check fails, fall back to file-based checks
+            return { process: true };
         }
-    
-        return { process: true };
     }
 
     async cleanup() {
@@ -4142,27 +4170,32 @@ class TaskManager {
         }
     }
 
-    calculateTaskPriority(rkey, existingPack, failure) {
+    calculateTaskPriority(rkey, existingPack, failure, mongoStatus) {
         let priority = 0;
 
+        // If MongoDB indicates this is a low priority update, reduce priority significantly
+        if (mongoStatus?.lowPriority) {
+            priority -= 5;
+        }
+
         // Higher priority for packs we've never processed
-        if (!existingPack) {
+        if (!existingPack && !mongoStatus?.lowPriority) {
             priority += 3;
         } else {
             // Priority based on age of data
-            const daysSinceUpdate = (Date.now() - new Date(existingPack.updated_at).getTime()) 
+            const daysSinceUpdate = (Date.now() - new Date(existingPack?.updated_at || 0).getTime()) 
                 / (1000 * 60 * 60 * 24);
             if (daysSinceUpdate > 30) priority += 2;
             else if (daysSinceUpdate > 7) priority += 1;
 
             // Priority based on user count (more users = higher priority)
-            if (existingPack.user_count > 1000) priority += 2;
-            else if (existingPack.user_count > 100) priority += 1;
+            if (existingPack?.user_count > 1000) priority += 2;
+            else if (existingPack?.user_count > 100) priority += 1;
         }
 
         // Lower priority for previously failed attempts
         if (failure) {
-            priority = Math.max(0, priority - failure.attempts);
+            priority = Math.max(-10, priority - failure.attempts);
         }
 
         return priority;
@@ -4646,38 +4679,34 @@ class TaskManager {
                 continue;
             }
 
-            // Check permanent failures
             const failure = this.failures.get(rkey);
-            if (failure) {
-                const daysSinceLastAttempt = 
-                    (Date.now() - new Date(failure.lastAttempt).getTime()) / (1000 * 60 * 60 * 24);
-                
-                if (failure.attempts >= 3 && daysSinceLastAttempt < 7) {
-                    skipped.push({ 
-                        rkey, 
-                        reason: `permanent_failure: ${failure.reason}`,
-                        attempts: failure.attempts
-                    });
-                    continue;
-                }
-            }
-
             const existingPack = existingPacks.get(rkey);
-            if (existingPack && this.isRecentlyProcessed(existingPack.updated_at)) {
-                skipped.push({ rkey, reason: 'recently_processed' });
+
+            // Check if we should process this pack
+            const processStatus = await this.shouldProcessPack(rkey, existingPack, failure);
+            
+            if (!processStatus.process) {
+                skipped.push({ 
+                    rkey, 
+                    reason: processStatus.reason,
+                    attempts: failure?.attempts
+                });
                 continue;
             }
+
+            const priority = this.calculateTaskPriority(rkey, existingPack, failure, processStatus);
 
             tasks.push({
                 handle,
                 rkey,
-                priority: existingPack ? 1 : 0,
+                priority,
                 existingPack,
-                previousAttempts: failure?.attempts || 0
+                previousAttempts: failure?.attempts || 0,
+                mongoStatus: processStatus
             });
         }
 
-        // Sort by priority (new packs first) and retry attempts
+        // Sort by priority (high to low) and retry attempts
         tasks.sort((a, b) => {
             if (a.priority !== b.priority) return b.priority - a.priority;
             return a.previousAttempts - b.previousAttempts;
@@ -4687,8 +4716,9 @@ class TaskManager {
             logger.debug('Task list built', {
                 total: tasks.length,
                 skipped: skipped.length,
-                new: tasks.filter(t => t.priority === 0).length,
-                updates: tasks.filter(t => t.priority === 1).length,
+                new: tasks.filter(t => !t.existingPack && !t.mongoStatus?.lowPriority).length,
+                updates: tasks.filter(t => t.existingPack || t.mongoStatus?.lowPriority).length,
+                lowPriority: tasks.filter(t => t.mongoStatus?.lowPriority).length,
                 failureRetries: tasks.filter(t => t.previousAttempts > 0).length
             });
         }

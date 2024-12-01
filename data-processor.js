@@ -2570,17 +2570,8 @@ class MainProcessor {
             // Step 1: Initialize file handler first
             logger.debug('Initialize file handler');
             await this.fileHandler.init();
-    
-            // Step 2: Create TaskManager with dbManager
-            logger.debug('Create TaskManager');
-            this.taskManager = new TaskManager(this.fileHandler, this.debug, this.dbManager);
-            
-            
-            // Step 3: Load tasks and data
-            logger.debug('Load tasks and data');
-            await this.taskManager.initializeTaskList();
-            
-            // Step 4: Initialize database if needed
+
+            // Step 2: Initialize database if needed
             logger.debug('Setting up handling of Mongo-DB', this.noDBWrites)
             if (!this.noMongoDB) {
                 if (this.noDBWrites) {
@@ -2609,7 +2600,15 @@ class MainProcessor {
                 }
             }
     
-            // Step 6: Verify system state
+            // Step 3: Create TaskManager after DB is initialized
+            logger.debug('Create TaskManager');
+            this.taskManager = new TaskManager(this.fileHandler, this.debug, this.dbManager);
+            
+            // Step 4: Load tasks and data
+            logger.debug('Load tasks and data');
+            await this.taskManager.initializeTaskList();            
+    
+            // Step 5: Verify system state
             logger.debug('Verify system state');
             const verificationResults = await this.verificationHandler.verifySystemState();
             
@@ -3810,7 +3809,7 @@ class TaskManager {
     constructor(fileHandler, debug = false, dbManager = null) {
         this.fileHandler = fileHandler;
         this.debug = debug;
-        this.dbManager = dbManager; 
+        this.dbManager = dbManager;
         this.pendingTasks = new Map();
         this.completedTasks = new Set();
         this.failures = new Map();
@@ -3818,8 +3817,8 @@ class TaskManager {
         this.packRelationships = new Map();
         this.startTime = Date.now();
         this.lastCheckpoint = Date.now();
-        this.CHECKPOINT_INTERVAL = 20 * 60 * 1000; // 20 minutes
-        this.checkpointDirty = false;  // Track if we need to write
+        this.CHECKPOINT_INTERVAL = 20 * 60 * 1000;
+        this.checkpointDirty = false;
         this.totalTasks = 0;
         this.completedTaskCount = 0;
         this.currentPackUsersTotal = 0;
@@ -3936,24 +3935,31 @@ class TaskManager {
         }
 
         try {
-            // Check MongoDB if available and we have a dbManager
-            if (this.dbManager && !this.dbManager.noDBWrites) {
-                const mongoDbPack = await this.dbManager.db.collection('starter_packs')
-                    .findOne({ rkey: rkey });
+            // Check if we have valid MongoDB access
+            if (this.dbManager && 
+                !this.dbManager.noDBWrites && 
+                this.dbManager.db) {
                 
-                if (mongoDbPack) {
-                    const lastUpdate = new Date(mongoDbPack.updated_at);
-                    const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
+                // Double check collection exists
+                const collection = this.dbManager.db.collection('starter_packs');
+                if (collection) {
+                    const mongoDbPack = await collection.findOne({ rkey: rkey });
                     
-                    if (daysSinceUpdate < 10) {
-                        return { process: false, reason: 'recently_processed_in_mongodb' };
-                    } else {
-                        // Pack exists but needs update - mark for lower priority
-                        return { 
-                            process: true, 
-                            lowPriority: true,
-                            reason: 'mongodb_needs_update' 
-                        };
+                    if (mongoDbPack) {
+                        const lastUpdate = new Date(mongoDbPack.updated_at);
+                        const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
+                        
+                        if (daysSinceUpdate < 10) {
+                            logger.debug(`Pack ${rkey} was recently processed in MongoDB (${daysSinceUpdate.toFixed(1)} days ago)`);
+                            return { process: false, reason: 'recently_processed_in_mongodb' };
+                        } else {
+                            logger.debug(`Pack ${rkey} exists in MongoDB but needs update (${daysSinceUpdate.toFixed(1)} days old)`);
+                            return { 
+                                process: true, 
+                                lowPriority: true,
+                                reason: 'mongodb_needs_update' 
+                            };
+                        }
                     }
                 }
             }
@@ -3982,7 +3988,7 @@ class TaskManager {
             return { process: true };
             
         } catch (err) {
-            logger.error(`Error checking MongoDB for pack ${rkey}:`, err);
+            logger.warn(`MongoDB check skipped for pack ${rkey}: ${err.message}`);
             // If MongoDB check fails, fall back to file-based checks
             return { process: true };
         }

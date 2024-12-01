@@ -2124,6 +2124,25 @@ class DatabaseManager {
     }
 
     async safeBulkWrite(collection, operations, options = {}) {
+        if (!Array.isArray(operations) || operations.length === 0) {
+            logger.debug('No operations to bulk write');
+            return;
+        }
+        
+        const formattedOps = operations.map(op => {
+            if (!op.updateOne && !op.insertOne && !op.deleteOne) {
+                // Convert to proper format if needed
+                return {
+                    updateOne: {
+                        filter: op.filter,
+                        update: op.update,
+                        upsert: true
+                    }
+                };
+            }
+            return op;
+        });
+        
         if (this.isCosmosDb) {
             // For Cosmos DB, process operations sequentially
             const batchSize = 1; // Process one at a time for maximum safety
@@ -2146,9 +2165,32 @@ class DatabaseManager {
                 }
             }
         } else {
-            // Original MongoDB bulk write logic
-            await this.db.collection(collection).bulkWrite(operations, { ordered: false, ...options });
-        }
+            try {
+                    // Original MongoDB bulk write logic
+                await this.db.collection(collection).bulkWrite(formattedOps, {
+                    ordered: false,
+                    ...options
+                });
+            } catch (err) {
+                // Handle bulk write errors
+                if (err.code === 11000) { // Duplicate key error
+                    logger.warn(`Duplicate key errors in bulk write, falling back to individual writes`);
+                    for (const op of formattedOps) {
+                        try {
+                            await this.safeWrite(collection, {
+                                filter: op.updateOne.filter,
+                                update: op.updateOne.update
+                            });
+                        } catch (innerErr) {
+                            if (innerErr.code !== 11000) throw innerErr;
+                        }
+                    }
+                } else {
+                    throw err;
+                }
+            }
+        } 
+        
     }
 
     isCosmosThrottlingError(err) {
@@ -2593,11 +2635,7 @@ class MainProcessor {
         try {
             const startTime = Date.now();
             
-            // 1. Initial checks and state loading
-            if (this.debug) {
-                logger.debug('Starting pack processing', { handle, rkey });
-            }
-    
+            // 1. Initial checks and state loading 
             if (this.taskManager.completedTasks.has(rkey)) {
                 logger.debug(`Skipping already processed pack: ${rkey}`);
                 return true;
@@ -2610,6 +2648,7 @@ class MainProcessor {
             // 2. Resolve creator and fetch pack
             const creatorDID = await this.apiHandler.resolveHandle(handle);
             if (!creatorDID) {
+                logger.warn(`Creator not found for pack ${rkey}`);
                 if (existingPack && !this.noMongoDB && !this.noDBWrites) {
                     await this.dbManager.markPackDeleted(rkey, 'creator_not_found');
                 }
@@ -2621,6 +2660,7 @@ class MainProcessor {
             const pack = await this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri });
     
             if (!pack?.starterPack?.record?.list) {
+                logger.warn(`Invalid pack structure for ${rkey}`);
                 if (existingPack && !this.noMongoDB && !this.noDBWrites) {
                     await this.dbManager.markPackDeleted(rkey, 'invalid_pack_structure');
                 }
@@ -2633,6 +2673,7 @@ class MainProcessor {
             const listMembers = await this.apiHandler.makeApiCall('app.bsky.graph.getList', { list: pack.starterPack.record.list });
             
             if (!listMembers?.items?.length) {
+                logger.warn(`Empty list for pack ${rkey}`);
                 if (existingPack && !this.noMongoDB && !this.noDBWrites) {
                     await this.dbManager.markPackDeleted(rkey, 'empty_list');
                 }
@@ -2697,11 +2738,13 @@ class MainProcessor {
     
             // Log completion
             if (this.debug) {
+                const duration = Date.now() - startTime;
                 logger.debug('Pack processing completed', {
                     rkey,
+                    duration,
                     userCount: processedUsers.length,
-                    removedUsers: removedDids.length,
-                    duration: Date.now() - startTime
+                    usersProcessed: processedUsers.length,
+                    usersRemoved: removedDids.length
                 });
             }
     
@@ -2825,6 +2868,7 @@ class MainProcessor {
         };
     
         if (currentDepth >= maxDepth || processedDIDs.has(profile.did)) {
+            logger.debug(`Skipping associated packs for ${profile.did} (depth: ${currentDepth}, maxDepth: ${maxDepth})`);
             return results;
         }
     
@@ -2832,6 +2876,7 @@ class MainProcessor {
     
         try {
             // Get packs for current profile
+            logger.debug(`Fetching packs for ${profile.handle} (depth: ${currentDepth})`);
             const packs = await this.apiHandler.getActorStarterPacks(profile.did);
             
             if (!packs?.starterPacks?.length) {
@@ -2839,16 +2884,16 @@ class MainProcessor {
             }
     
             results.discovered = packs.starterPacks.length;
+            logger.info(`Found ${results.discovered} associated packs for ${profile.handle}`);
     
             // Process each pack
             for (const pack of packs.starterPacks) {
                 try {
                     const rkey = await this.extractRkeyFromURI(pack.uri);
 
-                    // Add to URLs file when we discover a new pack
+                    // Add to URLs file
                     await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
                     
-                    // CHANGE: Use TaskManager's shouldProcess check
                     const shouldProcess = this.taskManager.shouldProcessPack(
                         rkey,
                         await this.fileHandler.getPack(rkey),
@@ -2857,10 +2902,11 @@ class MainProcessor {
     
                     if (!shouldProcess.process) {
                         results.skipped++;
+                        logger.debug(`Skipping pack ${rkey}: ${shouldProcess.reason}`);
                         continue;
                     }
     
-                    // CHANGE: Add to task queue instead of processing immediately
+                    // Add to task queue
                     const added = await this.taskManager.addAssociatedPack({
                         creator: profile.handle,
                         rkey,
@@ -2871,7 +2917,9 @@ class MainProcessor {
                     if (added) {
                         results.queued++;
                         this.taskManager.markDirty();  // Mark for checkpoint update
+                        this.taskManager.recordPackRelationship(rkey, profile.did);
                         await this.taskManager.maybeWriteCheckpoint();
+                        logger.info(`Queued associated pack ${rkey} from ${profile.handle}`);
                     } else {
                         results.skipped++;
                     }
@@ -2885,6 +2933,15 @@ class MainProcessor {
             }
     
             metrics.recordAssociatedPacksMetrics(results);
+
+            if (this.debug) {
+                logger.debug('Associated packs processing complete', {
+                    profile: profile.handle,
+                    results,
+                    depth: currentDepth
+                });
+            }
+
             return results;
     
         } catch (err) {
@@ -3326,11 +3383,13 @@ class MainProcessor {
             // Then process users in batches
             logger.debug(`Writing ${users.length} users to MongoDB`);
             const userOperations = users.map(user => ({
-                updateOne: {  // Changed from generic operation to explicit updateOne
+                updateOne: {
                     filter: { did: user.did },
                     update: { 
-                        $set: user,
-                        $addToSet: { pack_ids: packData.rkey }
+                        $set: {
+                            ...user,
+                            pack_ids: user.pack_ids // Include pack_ids in $set instead of $addToSet
+                        }
                     },
                     upsert: true
                 }
@@ -3338,10 +3397,15 @@ class MainProcessor {
     
             await this.dbManager.safeBulkWrite('users', userOperations);
     
-            // Log collection counts when in debug mode
             if (this.debug) {
                 const counts = await this.dbManager.getCollectionCounts();
-                logger.debug('MongoDB collection counts after write:', counts);
+                logger.debug('MongoDB collection counts after write:', {
+                    collections: counts,
+                    lastOperation: {
+                        pack: packData.rkey,
+                        usersProcessed: users.length
+                    }
+                });
             }
         } catch (err) {
             logger.error(`Database write failed for pack ${packData.rkey}:`, err);
@@ -4135,6 +4199,7 @@ class TaskManager {
     
         this.pendingTasks.clear();
         const skipped = new Map();
+        this.totalTasks = urlPacks.size;  // Set total tasks count here
     
         // Process URLs if we have any
         for (const [rkey, urlData] of urlPacks) {
@@ -4161,12 +4226,12 @@ class TaskManager {
     
         if (this.debug) {
             logger.debug('Task list built:', {
+                total: this.totalTasks,
                 pending: this.pendingTasks.size,
                 skipped: skipped.size,
-                skippedReasons: Array.from(skipped.entries()).reduce((acc, [rkey, reason]) => {
-                    acc[reason] = (acc[reason] || 0) + 1;
-                    return acc;
-                }, {})
+                new: Array.from(this.pendingTasks.values()).filter(t => !t.existingData).length,
+                updates: Array.from(this.pendingTasks.values()).filter(t => t.existingData).length,
+                failureRetries: Array.from(this.pendingTasks.values()).filter(t => t.previousAttempts > 0).length
             });
         }
     }

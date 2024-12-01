@@ -2173,27 +2173,38 @@ class DatabaseManager {
     
         const requiredIndexes = {
             users: [
-                { spec: { handle: 1 } }, // Remove unique: null
-                { spec: { pack_ids: 1 } },
-                { spec: { last_updated: 1 } }
+                { 
+                    spec: { did: 1 }, 
+                    options: { unique: true }  // Changed to use options object
+                },
+                { 
+                    spec: { handle: 1 },
+                    options: { background: true }  // Remove unique field entirely
+                },
+                { 
+                    spec: { pack_ids: 1 },
+                    options: { background: true }
+                },
+                { 
+                    spec: { last_updated: 1 },
+                    options: { background: true }
+                }
             ],
             starter_packs: [
-                { spec: { creator_did: 1 } },
-                { spec: { updated_at: 1 } }
+                { 
+                    spec: { rkey: 1 }, 
+                    options: { unique: true }
+                },
+                { 
+                    spec: { creator_did: 1 },
+                    options: { background: true }
+                },
+                { 
+                    spec: { updated_at: 1 },
+                    options: { background: true }
+                }
             ]
         };
-    
-        // Only add unique indexes for MongoDB
-        if (!this.isCosmosDb) {
-            requiredIndexes.users.unshift({ 
-                spec: { did: 1 }, 
-                unique: true  // Explicitly set to true
-            });
-            requiredIndexes.starter_packs.unshift({ 
-                spec: { rkey: 1 }, 
-                unique: true  // Explicitly set to true
-            });
-        }
     
         for (const [collection, indexes] of Object.entries(requiredIndexes)) {
             const existing = await this.withRetry(
@@ -2206,15 +2217,10 @@ class DatabaseManager {
             for (const index of indexes) {
                 const indexKey = JSON.stringify(index.spec);
                 if (!existingKeys.has(indexKey)) {
-                    const indexOptions = {
-                        background: true,
-                        unique: index.unique === true  // Only set if explicitly true
-                    };
-                    
                     await this.withRetry(
                         () => this.db.collection(collection).createIndex(
                             index.spec, 
-                            indexOptions
+                            index.options || { background: true }  // Use provided options or default
                         ),
                         `create index ${collection}.${indexKey}`
                     );

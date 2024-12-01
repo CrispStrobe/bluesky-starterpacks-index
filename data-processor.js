@@ -2173,13 +2173,13 @@ class DatabaseManager {
     
         for (const [collection, indexes] of Object.entries({
             users: [
-                { key: { did: 1 }, options: { unique: true } },
-                { key: { handle: 1 }, options: { background: true } }, // removed unique entirely
+                { key: { did: 1 }, options: { unique: true, background: true } },
+                { key: { handle: 1 }, options: { background: true } }, // Removed unique constraint
                 { key: { pack_ids: 1 }, options: { background: true } },
                 { key: { last_updated: 1 }, options: { background: true } }
             ],
             starter_packs: [
-                { key: { rkey: 1 }, options: { unique: true } },
+                { key: { rkey: 1 }, options: { unique: true, background: true } },
                 { key: { creator_did: 1 }, options: { background: true } },
                 { key: { updated_at: 1 }, options: { background: true } }
             ]
@@ -2197,10 +2197,7 @@ class DatabaseManager {
                     await this.withRetry(
                         () => this.db.collection(collection).createIndex(
                             index.key,
-                            {
-                                ...index.options,
-                                background: true // Always set background
-                            }
+                            index.options
                         ),
                         `create index ${collection}.${indexKey}`
                     );

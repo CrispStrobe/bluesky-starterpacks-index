@@ -1014,25 +1014,19 @@ class FileHandler {
     }
 
     async ensureFilesExist() {
-        const files = [
-            FILE_PATHS.users,
-            FILE_PATHS.packs,
-            FILE_PATHS.urls,
-        ];
-    
-        for (const file of files) {
+        const files = [FILE_PATHS.users, FILE_PATHS.packs, FILE_PATHS.urls];
+        await Promise.all(files.map(async (file) => {
             try {
                 await fs.access(file);
             } catch (err) {
                 if (err.code === 'ENOENT') {
-                    // Create empty file
                     await fs.writeFile(file, '');
                     logger.info(`Created empty file: ${file}`);
                 } else {
                     throw err;
                 }
             }
-        }
+        }));
     }
 
     async ensureFileFormats() {
@@ -3504,10 +3498,11 @@ class RateLimiter {
     }
 
     calculateBackoff() {
-        return Math.min(
+        const backoff = Math.min(
             this.initialBackoff * Math.pow(2, this.consecutive429s),
             this.maxBackoff
         );
+        return backoff + (Math.random() * 1000); // Add jitter
     }
 
     getStats() {
@@ -4446,41 +4441,37 @@ class TaskManager {
         const task = await this.getNextTask();
         if (!task) return null;
     
-        try {
-            task.attempts++;
-            this.pendingTasks.set(task.rkey, task);
+        const maxRetries = 3;
+        let attempts = 0;
     
-            // CHANGE: Log task processing start
-            if (processor.debug) {
-                logger.debug('Processing task:', {
-                    rkey: task.rkey,
-                    handle: task.handle,
-                    attempt: task.attempts,
-                    source: task.source,
-                    priority: task.priority
-                });
-            }
-    
-            const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
-            
-            if (success) {
-                this.completedTasks.add(task.rkey);
-                this.pendingTasks.delete(task.rkey);
-                // CHANGE: Only write checkpoint periodically
-                this.markDirty();
-            } else {
-                // Handle failure
-                if (task.attempts >= 3) {
-                    await this.recordFailure(task.rkey, 'Max attempts reached', true);
-                    this.pendingTasks.delete(task.rkey);
+        while (attempts < maxRetries) {
+            try {
+                if (processor.debug) {
+                    logger.debug('Processing task:', {
+                        rkey: task.rkey,
+                        handle: task.handle,
+                        attempt: task.attempts,
+                        source: task.source,
+                        priority: task.priority
+                    });
                 }
+                const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
+                if (success) {
+                    await this.markTaskCompleted(task.rkey);
+                    return true;
+                }
+                break; // Exit on intentional failure
+            } catch (err) {
+                attempts++;
+                if (attempts === maxRetries || !this.isRetryableError(err)) {
+                    logger.error(`Failed to process task after ${attempts} attempts:`, err);
+                    await this.recordFailure(task.rkey, err.message);
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 1000));
             }
-    
-            return success;
-        } catch (err) {
-            logger.error(`Error processing task ${task.rkey}:`, err);
-            return false;
         }
+        return false;
     }
 
     async loadExistingData() {
@@ -4516,10 +4507,12 @@ class TaskManager {
     
             return { packs: existingPacks, users: existingUsers };
         } catch (err) {
-            if (err.code !== 'ENOENT') {
-                logger.warn('Error loading existing data:', err);
+            if (err.code === 'ENOENT') {
+                logger.info('No existing data files found, starting fresh');
+                return { packs: new Map(), users: new Map() };
             }
-            return { packs: new Map(), users: new Map() };
+            logger.warn('Error loading existing data:', err);
+            throw err;
         }
     }
 
@@ -4551,7 +4544,7 @@ class TaskManager {
         return daysSinceUpdate < daysThreshold;
     }
 
-    async buildTaskList(urlsContent, existingPacks) {
+    async buildTaskList(urlsContent, existingPacks = new Map()) {
         const tasks = [];
         const skipped = [];
         
@@ -4599,7 +4592,7 @@ class TaskManager {
         // Sort by priority (new packs first) and retry attempts
         tasks.sort((a, b) => {
             if (a.priority !== b.priority) return b.priority - a.priority;
-            return a.previousAttempts - b.previousAttempts; // Try older failures first
+            return a.previousAttempts - b.previousAttempts;
         });
 
         if (this.debug) {
@@ -4697,9 +4690,12 @@ async function main() {
         // Initialize from checkpoint
         await processor.taskManager.initializeFromCheckpoint();
         
+        // Load existing data first
+        const { packs: existingPacks } = await processor.taskManager.loadExistingData();
+        
         // Load and parse tasks
         const urlsContent = await fs.readFile(FILE_PATHS.urls, 'utf8');
-        const { tasks } = await processor.taskManager.buildTaskList(urlsContent);
+        const { tasks } = await processor.taskManager.buildTaskList(urlsContent, existingPacks);
 
         // Add all tasks to task manager
         for (const task of tasks) {
@@ -4714,29 +4710,21 @@ async function main() {
         // Process tasks until none remain
         let processedCount = 0;
         let failedCount = 0;
-        let lastCheckpoint = Date.now();
-        const CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-        while (true) {
+        while (processor.taskManager.pendingTasks.size > 0) {
             const success = await processor.taskManager.processNextTask(processor);
-            if (success === null) { // no more tasks
-                // Check if we have any pending associated packs
-                const pendingAssociated = Array.from(processor.taskManager.pendingTasks.values())
-                    .filter(task => task.source === 'associated').length;
-                
-                if (pendingAssociated === 0) {
-                    // Force a final checkpoint write before breaking
-                    await processor.taskManager.maybeWriteCheckpoint(true);
-                    break;
-                }
-                
-                // Process any remaining associated packs
-                continue;
-            }
+            
+            if (success === null) break; // no more tasks
             
             processedCount++;
             if (!success) failedCount++;
+
+            // Write checkpoint periodically
+            await processor.taskManager.maybeWriteCheckpoint();
         }
+
+        // Force final checkpoint write
+        await processor.taskManager.maybeWriteCheckpoint(true);
 
         // Final metrics
         const finalMetrics = metrics.getMetrics();

@@ -1905,6 +1905,300 @@ class DatabaseManager {
         this.dbName = dbName;
         this.db = null;
         this.isCosmosDb = DB_INFO[dbType]?.isCosmosDb || false;
+        this.lastOperation = Date.now();
+        this.operationDelay = 1000; // Base delay between operations
+        this.consecutiveThrottles = 0;
+        this.maxConsecutiveThrottles = 5;
+        this.baseBackoffDelay = 1000;
+    }
+
+    async connect(maxRetries = 2) {
+        logger.debug('connect');
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                await this.client.connect();
+                this.db = this.client.db(this.dbName);
+                if (!this.isCosmosDb) {
+                    await this.db.command({ ping: 1 });
+                }
+                return;
+            } catch (err) {
+                if (attempt === maxRetries - 1) throw err;
+                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+            }
+        }
+    }
+
+    async init() {
+        logger.debug('DB Manager init');
+        try {
+            await this.connect();
+            await this.setupCollections();
+            if (!this.isCosmosDb) {
+                await this.setupIndexes();
+            }
+        } catch (err) {
+            this.logger.error(`Database initialization failed: ${err.message}`);
+            throw err;
+        }
+    }
+
+    async setupCollections() {
+        logger.debug('setupCollections');
+        const collections = ['starter_packs', 'users']; // , 'schema_versions'
+        const existing = await this.withRetry(
+            () => this.db.listCollections().toArray(),
+            'list collections'
+        );
+        const existingNames = new Set(existing.map(c => c.name));
+
+        for (const collection of collections) {
+            if (!existingNames.has(collection)) {
+                logger.debug('setupCollection:', collection);
+                await this.withRetry(
+                    async () => {
+                        try {
+                            await this.db.createCollection(collection);
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        } catch (err) {
+                            if (err.code !== 48) throw err; // Ignore if exists
+                        }
+                    },
+                    `create collection ${collection}`
+                );
+            }
+        }
+    }
+
+    async delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async getCollectionCounts() {
+        try {
+            // Use cached counts if recent enough
+            const now = Date.now();
+            if (this.countCache && (now - this.lastCountCheck) < this.countCacheTimeout) {
+                return this.countCache;
+            }
+
+            // Add delay before counting to respect rate limits
+            await this.delay(1000);
+
+            const counts = {};
+            for (const collection of ['users', 'starter_packs']) {
+                try {
+                    counts[collection] = await this.db.collection(collection).countDocuments();
+                    await this.delay(500); // Add delay between counts
+                } catch (err) {
+                    if (this.isCosmosThrottlingError(err)) {
+                        // Return cached counts on throttling
+                        if (this.countCache) {
+                            this.logger?.warn('Using cached counts due to rate limit');
+                            return this.countCache;
+                        }
+                        // If no cache, return null but don't throw
+                        return null;
+                    }
+                    throw err;
+                }
+            }
+
+            // Cache the results
+            this.countCache = counts;
+            this.lastCountCheck = now;
+            await this.delay(1000);
+            return counts;
+        } catch (err) {
+            this.logger?.error(`Error getting collection counts: ${err.message}`);
+            return null;
+        }
+    }
+
+    calculateBackoff(retryAfterMs) {
+        // Use the RetryAfterMs from Cosmos DB if available
+        if (retryAfterMs) {
+            return retryAfterMs + 100; // Add small buffer
+        }
+
+        // Otherwise use exponential backoff
+        const backoff = this.baseBackoffDelay * Math.pow(2, this.consecutiveThrottles);
+        return Math.min(backoff, 30000); // Cap at 30 seconds
+    }
+
+    async enforceOperationDelay() {
+        if (this.isCosmosDb) {
+            const timeSinceLastOp = Date.now() - this.lastOperation;
+            if (timeSinceLastOp < this.operationDelay) {
+                await this.delay(this.operationDelay - timeSinceLastOp);
+            }
+            this.lastOperation = Date.now();
+        }
+    }
+
+    async handleThrottlingError(err) {
+        this.consecutiveThrottles++;
+        
+        // Extract RetryAfterMs from error message
+        let retryAfterMs = 1000;
+        const match = err.message.match(/RetryAfterMs=(\d+)/);
+        if (match) {
+            retryAfterMs = parseInt(match[1]);
+            this.logger?.debug(`retry after: ${err.message}`);
+            this.logger?.debug(`so we should wait RetryAfterMs=${retryAfterMs},${retryAfterMs}`);
+        }
+
+        const waitTime = this.calculateBackoff(retryAfterMs);
+        this.logger?.info(`Rate limit hit, waiting ${waitTime}ms`);
+        await this.delay(waitTime);
+
+        // Increase operation delay if we're getting too many throttles
+        if (this.consecutiveThrottles > this.maxConsecutiveThrottles) {
+            this.operationDelay = Math.min(this.operationDelay * 1.5, 5000);
+        }
+    }
+
+    async withRetry(operation, name, maxRetries = 5) {
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                return await operation();
+            } catch (err) {
+                if (err.code === 16500 || err.code === 429 || err.message?.includes('TooManyRequests')) {
+                    const retryAfterMs = err.RetryAfterMs || 1000 * Math.pow(2, attempt);
+                    this.logger.warn(`Rate limit hit on ${name}, waiting ${retryAfterMs}ms before retry ${attempt + 1}/${maxRetries}`);
+                    await new Promise(resolve => setTimeout(resolve, retryAfterMs));
+                    continue;
+                }
+                throw err;
+            }
+        }
+        throw new Error(`Max retries (${maxRetries}) exceeded for ${name}`);
+    }
+
+    async safeWrite(collection, operation, options = {}) {
+        const maxRetries = 5;
+        let lastError = null;
+
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                await this.enforceOperationDelay();
+
+                // For pack_ids operations, handle specially
+                if (operation.update.$addToSet?.pack_ids) {
+                    try {
+                        // First check if document exists
+                        const doc = await this.db.collection(collection)
+                            .findOne(operation.filter, { projection: { _id: 1, pack_ids: 1 }});
+
+                        await this.enforceOperationDelay();
+
+                        if (!doc) {
+                            // Document doesn't exist, create with empty array
+                            await this.db.collection(collection).insertOne({
+                                ...operation.filter,
+                                pack_ids: [operation.update.$addToSet.pack_ids],
+                                ...(operation.update.$set || {})
+                            });
+                        } else {
+                            const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
+                            if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
+                                await this.db.collection(collection).updateOne(
+                                    operation.filter,
+                                    { 
+                                        $set: { 
+                                            pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
+                                            ...(operation.update.$set || {})
+                                        }
+                                    }
+                                );
+                            }
+                        }
+                    } catch (err) {
+                        if (this.isCosmosThrottlingError(err)) {
+                            throw err; // Let retry logic handle it
+                        }
+                        this.logger?.error(`Error handling pack_ids:`, err);
+                        throw err;
+                    }
+                } else {
+                    // Regular update
+                    await this.db.collection(collection).updateOne(
+                        operation.filter,
+                        operation.update,
+                        { ...options, upsert: true }
+                    );
+                }
+
+                // Reset throttle counter on success
+                this.consecutiveThrottles = 0;
+
+                const countsAfter = await this.getCollectionCounts();
+                if (countsAfter) {
+                    this.logger?.debug(`Collection counts before write:`, countsAfter);
+                }
+
+                return;
+
+            } catch (err) {
+                lastError = err;
+                if (this.isCosmosThrottlingError(err)) {
+                    await this.handleThrottlingError(err);
+                    continue;
+                }
+                throw err;
+            }
+        }
+
+        // If we get here, we've exhausted our retries
+        debug.logger ('We exhausted our mongoDB retries.');
+        throw lastError;
+    }
+
+    async safeBulkWrite(collection, operations, options = {}) {
+        if (this.isCosmosDb) {
+            // For Cosmos DB, process operations sequentially
+            const batchSize = 1; // Process one at a time for maximum safety
+            
+            for (let i = 0; i < operations.length; i += batchSize) {
+                const batch = operations.slice(i, i + batchSize);
+                
+                for (const op of batch) {
+                    await this.safeWrite(collection, {
+                        filter: op.filter || op.updateOne.filter,
+                        update: op.update || op.updateOne.update,
+                        upsert: true
+                    }, options);
+                }
+
+                // Log progress periodically
+                if ((i + batchSize) % 10 === 0) {
+                    const progress = ((i + batch.length) / operations.length * 100).toFixed(1);
+                    this.logger?.info(`Processed ${i + batch.length}/${operations.length} operations (${progress}%)`);
+                }
+            }
+        } else {
+            // Original MongoDB bulk write logic
+            await this.db.collection(collection).bulkWrite(operations, { ordered: false, ...options });
+        }
+    }
+
+    isCosmosThrottlingError(err) {
+        return err.code === 16500 || 
+               err.code === 429 || 
+               err.message?.includes('TooManyRequests') ||
+               err.message?.includes('Request rate is large') ||
+               err.message?.includes('RetryAfterMs');
+    }
+}
+
+class DatabaseManager_old {
+    constructor(mongoClient, dbType, logger, dbName = 'starterpacks') {
+        this.client = mongoClient;
+        this.dbType = dbType;
+        this.logger = logger || console;
+        this.dbName = dbName;
+        this.db = null;
+        this.isCosmosDb = DB_INFO[dbType]?.isCosmosDb || false;
         this.supportsCollMod = DB_INFO[dbType]?.supportsCollMod || false;
         this.lastCountCheck = 0;
         this.countCacheTimeout = 10000; // 10 seconds cache for counts
@@ -1958,6 +2252,7 @@ class DatabaseManager {
             // Cache the results
             this.countCache = counts;
             this.lastCountCheck = now;
+            await this.delay(1000);
             return counts;
         } catch (err) {
             this.logger?.error(`Error getting collection counts: ${err.message}`);
@@ -2064,19 +2359,6 @@ class DatabaseManager {
         }
     }
 
-    async getCollectionCounts() {
-        try {
-            const counts = {};
-            for (const collection of ['users', 'starter_packs']) {
-                counts[collection] = await this.db.collection(collection).countDocuments();
-            }
-            return counts;
-        } catch (err) {
-            this.logger?.error(`Error getting collection counts: ${err.message}`);
-            return null;
-        }
-    }
-
     async safeWrite(collection, operation, options = {}) {
         const maxRetries = 5;
         let lastError = null;
@@ -2084,6 +2366,10 @@ class DatabaseManager {
 
         while (retryCount < maxRetries) {
             try {
+                const countsBefore = await this.getCollectionCounts();
+                if (countsBefore) {
+                    this.logger?.debug(`Collection counts before write:`, countsBefore);
+                }
                 // For pack_ids operations, handle differently for Cosmos DB
                 if (operation.update.$addToSet?.pack_ids) {
                     const doc = await this.db.collection(collection)
@@ -2155,7 +2441,9 @@ class DatabaseManager {
     extractRetryAfterMs(err) {
         try {
             // First try to extract from error message
+            logger.debug('retry after:', err);
             const match = err.message.match(/RetryAfterMs=(\d+)/);
+            logger.debug(`so we should wait ${match}`);
             if (match) {
                 return parseInt(match[1]) + 100; // Add small buffer
             }

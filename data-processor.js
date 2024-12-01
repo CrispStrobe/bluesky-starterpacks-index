@@ -2171,42 +2171,19 @@ class DatabaseManager {
     async setupIndexes() {
         if (this.isCosmosDb) return; // Skip for Cosmos DB
     
-        const requiredIndexes = {
+        for (const [collection, indexes] of Object.entries({
             users: [
-                { 
-                    spec: { did: 1 }, 
-                    options: { unique: true }  // Changed to use options object
-                },
-                { 
-                    spec: { handle: 1 },
-                    options: { background: true }  // Remove unique field entirely
-                },
-                { 
-                    spec: { pack_ids: 1 },
-                    options: { background: true }
-                },
-                { 
-                    spec: { last_updated: 1 },
-                    options: { background: true }
-                }
+                { key: { did: 1 }, options: { unique: true } },
+                { key: { handle: 1 }, options: { background: true } }, // removed unique entirely
+                { key: { pack_ids: 1 }, options: { background: true } },
+                { key: { last_updated: 1 }, options: { background: true } }
             ],
             starter_packs: [
-                { 
-                    spec: { rkey: 1 }, 
-                    options: { unique: true }
-                },
-                { 
-                    spec: { creator_did: 1 },
-                    options: { background: true }
-                },
-                { 
-                    spec: { updated_at: 1 },
-                    options: { background: true }
-                }
+                { key: { rkey: 1 }, options: { unique: true } },
+                { key: { creator_did: 1 }, options: { background: true } },
+                { key: { updated_at: 1 }, options: { background: true } }
             ]
-        };
-    
-        for (const [collection, indexes] of Object.entries(requiredIndexes)) {
+        })) {
             const existing = await this.withRetry(
                 () => this.db.collection(collection).indexes(),
                 `get ${collection} indexes`
@@ -2215,12 +2192,15 @@ class DatabaseManager {
             const existingKeys = new Set(existing.map(idx => JSON.stringify(idx.key)));
     
             for (const index of indexes) {
-                const indexKey = JSON.stringify(index.spec);
+                const indexKey = JSON.stringify(index.key);
                 if (!existingKeys.has(indexKey)) {
                     await this.withRetry(
                         () => this.db.collection(collection).createIndex(
-                            index.spec, 
-                            index.options || { background: true }  // Use provided options or default
+                            index.key,
+                            {
+                                ...index.options,
+                                background: true // Always set background
+                            }
                         ),
                         `create index ${collection}.${indexKey}`
                     );

@@ -2571,9 +2571,10 @@ class MainProcessor {
             logger.debug('Initialize file handler');
             await this.fileHandler.init();
     
-            // Step 2: Create TaskManager
+            // Step 2: Create TaskManager with dbManager
             logger.debug('Create TaskManager');
-            this.taskManager = new TaskManager(this.fileHandler, this.debug);
+            this.taskManager = new TaskManager(this.fileHandler, this.debug, this.dbManager);
+            
             
             // Step 3: Load tasks and data
             logger.debug('Load tasks and data');
@@ -3806,9 +3807,10 @@ async function cleanFiles() {
 
 // Main function
 class TaskManager {
-    constructor(fileHandler, debug = false) {
+    constructor(fileHandler, debug = false, dbManager = null) {
         this.fileHandler = fileHandler;
         this.debug = debug;
+        this.dbManager = dbManager; 
         this.pendingTasks = new Map();
         this.completedTasks = new Set();
         this.failures = new Map();
@@ -3934,8 +3936,8 @@ class TaskManager {
         }
 
         try {
-            // Check MongoDB first if available
-            if (!this.noMongoDB && !this.noDBWrites) {
+            // Check MongoDB if available and we have a dbManager
+            if (this.dbManager && !this.dbManager.noDBWrites) {
                 const mongoDbPack = await this.dbManager.db.collection('starter_packs')
                     .findOne({ rkey: rkey });
                 

@@ -2078,67 +2078,47 @@ class DatabaseManager {
     async safeWrite(collection, operation, options = {}) {
         const maxRetries = 5;
         let lastError = null;
-
+    
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 await this.enforceOperationDelay();
-
-                // For pack_ids operations, handle specially
+    
+                // Add safety check for pack_ids operations
                 if (operation.update.$addToSet?.pack_ids) {
-                    try {
-                        // First check if document exists
-                        const doc = await this.db.collection(collection)
-                            .findOne(operation.filter, { projection: { _id: 1, pack_ids: 1 }});
-
-                        await this.enforceOperationDelay();
-
-                        if (!doc) {
-                            // Document doesn't exist, create with empty array
-                            await this.db.collection(collection).insertOne({
-                                ...operation.filter,
-                                pack_ids: [operation.update.$addToSet.pack_ids],
-                                ...(operation.update.$set || {})
-                            });
-                        } else {
-                            const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
-                            if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
-                                await this.db.collection(collection).updateOne(
-                                    operation.filter,
-                                    { 
-                                        $set: { 
-                                            pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
-                                            ...(operation.update.$set || {})
-                                        }
+                    const doc = await this.db.collection(collection)
+                        .findOne(operation.filter, { projection: { _id: 1, pack_ids: 1 }});
+    
+                    if (!doc) {
+                        await this.db.collection(collection).insertOne({
+                            ...operation.filter,
+                            pack_ids: [operation.update.$addToSet.pack_ids],
+                            ...(operation.update.$set || {})
+                        });
+                    } else {
+                        const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
+                        if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
+                            await this.db.collection(collection).updateOne(
+                                operation.filter,
+                                { 
+                                    $set: { 
+                                        pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
+                                        ...(operation.update.$set || {})
                                     }
-                                );
-                            }
+                                }
+                            );
                         }
-                    } catch (err) {
-                        if (this.isCosmosThrottlingError(err)) {
-                            throw err; // Let retry logic handle it
-                        }
-                        this.logger?.error(`Error handling pack_ids:`, err);
-                        throw err;
                     }
                 } else {
-                    // Regular update
                     await this.db.collection(collection).updateOne(
                         operation.filter,
                         operation.update,
                         { ...options, upsert: true }
                     );
                 }
-
-                // Reset throttle counter on success
+    
                 this.consecutiveThrottles = 0;
-
-                const countsAfter = await this.getCollectionCounts();
-                if (countsAfter) {
-                    this.logger?.debug(`Collection counts before write:`, countsAfter);
-                }
-
                 return;
-
+    
             } catch (err) {
                 lastError = err;
                 if (this.isCosmosThrottlingError(err)) {
@@ -2148,9 +2128,7 @@ class DatabaseManager {
                 throw err;
             }
         }
-
-        // If we get here, we've exhausted our retries
-        debug.logger ('We exhausted our mongoDB retries.');
+    
         throw lastError;
     }
 
@@ -2189,495 +2167,13 @@ class DatabaseManager {
                err.message?.includes('Request rate is large') ||
                err.message?.includes('RetryAfterMs');
     }
-}
-
-class DatabaseManager_old {
-    constructor(mongoClient, dbType, logger, dbName = 'starterpacks') {
-        this.client = mongoClient;
-        this.dbType = dbType;
-        this.logger = logger || console;
-        this.dbName = dbName;
-        this.db = null;
-        this.isCosmosDb = DB_INFO[dbType]?.isCosmosDb || false;
-        this.supportsCollMod = DB_INFO[dbType]?.supportsCollMod || false;
-        this.lastCountCheck = 0;
-        this.countCacheTimeout = 10000; // 10 seconds cache for counts
-        this.countCache = null;
-    }
-
-    async init() {
-        logger.debug('DB Manager init');
-        try {
-            await this.connect();
-            await this.setupCollections();
-            if (!this.isCosmosDb) {
-                await this.setupIndexes();
-            }
-        } catch (err) {
-            this.logger.error(`Database initialization failed: ${err.message}`);
-            throw err;
-        }
-    }
-
-    async getCollectionCounts() {
-        try {
-            // Use cached counts if recent enough
-            const now = Date.now();
-            if (this.countCache && (now - this.lastCountCheck) < this.countCacheTimeout) {
-                return this.countCache;
-            }
-
-            // Add delay before counting to respect rate limits
-            await this.delay(1000);
-
-            const counts = {};
-            for (const collection of ['users', 'starter_packs']) {
-                try {
-                    counts[collection] = await this.db.collection(collection).countDocuments();
-                    await this.delay(500); // Add delay between counts
-                } catch (err) {
-                    if (this.isCosmosThrottlingError(err)) {
-                        // Return cached counts on throttling
-                        if (this.countCache) {
-                            this.logger?.warn('Using cached counts due to rate limit');
-                            return this.countCache;
-                        }
-                        // If no cache, return null but don't throw
-                        return null;
-                    }
-                    throw err;
-                }
-            }
-
-            // Cache the results
-            this.countCache = counts;
-            this.lastCountCheck = now;
-            await this.delay(1000);
-            return counts;
-        } catch (err) {
-            this.logger?.error(`Error getting collection counts: ${err.message}`);
-            return null;
-        }
-    }
-
-    async connect(maxRetries = 2) {
-        logger.debug('connect');
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-                await this.client.connect();
-                this.db = this.client.db(this.dbName);
-                if (!this.isCosmosDb) {
-                    await this.db.command({ ping: 1 });
-                }
-                return;
-            } catch (err) {
-                if (attempt === maxRetries - 1) throw err;
-                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
-            }
-        }
-    }
-
-    async withRetry(operation, name, maxRetries = 5) {
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-                return await operation();
-            } catch (err) {
-                if (err.code === 16500 || err.code === 429 || err.message?.includes('TooManyRequests')) {
-                    const retryAfterMs = err.RetryAfterMs || 1000 * Math.pow(2, attempt);
-                    this.logger.warn(`Rate limit hit on ${name}, waiting ${retryAfterMs}ms before retry ${attempt + 1}/${maxRetries}`);
-                    await new Promise(resolve => setTimeout(resolve, retryAfterMs));
-                    continue;
-                }
-                throw err;
-            }
-        }
-        throw new Error(`Max retries (${maxRetries}) exceeded for ${name}`);
-    }
-
-    async setupCollections() {
-        logger.debug('setupCollections');
-        const collections = ['starter_packs', 'users']; // , 'schema_versions'
-        const existing = await this.withRetry(
-            () => this.db.listCollections().toArray(),
-            'list collections'
-        );
-        const existingNames = new Set(existing.map(c => c.name));
-
-        for (const collection of collections) {
-            if (!existingNames.has(collection)) {
-                logger.debug('setupCollection:', collection);
-                await this.withRetry(
-                    async () => {
-                        try {
-                            await this.db.createCollection(collection);
-                            await new Promise(resolve => setTimeout(resolve, 1000));
-                        } catch (err) {
-                            if (err.code !== 48) throw err; // Ignore if exists
-                        }
-                    },
-                    `create collection ${collection}`
-                );
-            }
-        }
-    }
-
-    async setupCosmosCollections() {
-        logger.debug('initializeCosmosCollections');
-        // Important: Create collections sequentially with careful throughput management
-        const collections = [
-            { name: 'schema_versions', throughput: 200 },
-            { name: 'users', throughput: 400 },
-            { name: 'starter_packs', throughput: 400 }
-        ];
-
-        const existing = await this.db.listCollections().toArray();
-        const existingNames = new Set(existing.map(c => c.name));
-
-        let currentThroughput = 0;
-        for (const col of collections) {
-            if (existingNames.has(col.name)) continue;
-
-            if (currentThroughput + col.throughput > this.throughputLimit) {
-                this.logger.warn(`Waiting to respect throughput limits...`);
-                await new Promise(resolve => setTimeout(resolve, 5000));
-                currentThroughput = 0;
-            }
-
-            try {
-                await this.db.createCollection(col.name, {
-                    throughput: col.throughput
-                });
-                currentThroughput += col.throughput;
-                this.logger.info(`Created collection ${col.name} with ${col.throughput} RU/s`);
-                // Wait between collection creations
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            } catch (err) {
-                if (err.code !== 48) { // Ignore "already exists" error
-                    throw err;
-                }
-            }
-        }
-    }
-
-    async safeWrite(collection, operation, options = {}) {
-        const maxRetries = 5;
-        let lastError = null;
-        let retryCount = 0;
-
-        while (retryCount < maxRetries) {
-            try {
-                const countsBefore = await this.getCollectionCounts();
-                if (countsBefore) {
-                    this.logger?.debug(`Collection counts before write:`, countsBefore);
-                }
-                // For pack_ids operations, handle differently for Cosmos DB
-                if (operation.update.$addToSet?.pack_ids) {
-                    const doc = await this.db.collection(collection)
-                        .findOne(operation.filter, { projection: { _id: 1, pack_ids: 1 }});
-
-                    if (!doc) {
-                        // Document doesn't exist, create with pack_ids array
-                        await this.db.collection(collection).insertOne({
-                            ...operation.filter,
-                            pack_ids: [operation.update.$addToSet.pack_ids],
-                            ...(operation.update.$set || {})
-                        });
-                    } else {
-                        // Update existing document
-                        const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
-                        const newPackId = operation.update.$addToSet.pack_ids;
-                        
-                        if (!currentPackIds.includes(newPackId)) {
-                            await this.db.collection(collection).updateOne(
-                                operation.filter,
-                                {
-                                    $set: {
-                                        pack_ids: [...currentPackIds, newPackId],
-                                        ...(operation.update.$set || {})
-                                    }
-                                }
-                            );
-                        }
-                    }
-                } else {
-                    // Regular update
-                    await this.db.collection(collection).updateOne(
-                        operation.filter,
-                        operation.update,
-                        { ...options, upsert: true }
-                    );
-                }
-
-                // Add delay for Cosmos DB rate limiting
-                if (this.isCosmosDb) {
-                    await this.delay(500);
-                }
-
-                return;
-            } catch (err) {
-                lastError = err;
-
-                if (this.isCosmosThrottlingError(err)) {
-                    const retryAfter = this.extractRetryAfterMs(err) || 
-                                     Math.min(Math.pow(2, retryCount) * 1000, 8000);
-                    
-                    this.logger?.info(`Rate limit hit, waiting ${retryAfter}ms`);
-                    await this.delay(retryAfter);
-                    retryCount++;
-                    continue;
-                }
-
-                throw err;
-            }
-        }
-
-        throw lastError;
-    }
-
-    delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    extractRetryAfterMs(err) {
-        try {
-            // First try to extract from error message
-            logger.debug('retry after:', err);
-            const match = err.message.match(/RetryAfterMs=(\d+)/);
-            logger.debug(`so we should wait ${match}`);
-            if (match) {
-                return parseInt(match[1]) + 100; // Add small buffer
-            }
-
-            // Then check headers if available
-            if (err.headers && err.headers['retry-after']) {
-                return (parseInt(err.headers['retry-after']) * 1000) + 100;
-            }
-
-            return null;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    async safeBulkWrite(collection, operations, options = {}) {
-        if (this.isCosmosDb) {
-            // Much smaller batch size for Cosmos DB
-            const batchSize = 5;
-            
-            for (let i = 0; i < operations.length; i += batchSize) {
-                const batch = operations.slice(i, i + batchSize);
-                
-                // Process batch sequentially
-                for (const op of batch) {
-                    await this.safeWrite(collection, {
-                        filter: op.filter,
-                        update: op.update,
-                        upsert: op.upsert
-                    }, options);
-                    
-                    // Longer delay between operations
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                }
-
-                // Longer delay between batches
-                if (i + batchSize < operations.length) {
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    
-                    // Log progress
-                    const progress = ((i + batch.length) / operations.length * 100).toFixed(1);
-                    this.logger?.info(`Processed ${i + batch.length}/${operations.length} operations (${progress}%)`);
-                }
-            }
-        } else {
-            // Original MongoDB bulk write logic
-            try {
-                await this.db.collection(collection).bulkWrite(
-                    operations,
-                    { ordered: false, ...options }
-                );
-            } catch (err) {
-                if (err.code === 11000) {
-                    for (const op of operations) {
-                        await this.safeWrite(collection, op, options)
-                            .catch(err => {
-                                if (err.code !== 11000) throw err;
-                            });
-                    }
-                } else {
-                    throw err;
-                }
-            }
-        }
-    }
-
-    isCosmosThrottlingError(err) {
-        return err.code === 16500 || 
-               err.code === 429 || 
-               err.message?.includes('TooManyRequests') ||
-               err.message?.includes('Request rate is large') ||
-               err.message?.includes('RetryAfterMs');
-    }
-
-    async markPackDeleted(rkey, reason) {
-        logger.debug('markPackDeleted');
-        try {
-            if (this.isCosmosDb) {
-                // First mark the pack as deleted
-                await this.safeWrite('starter_packs', {
-                    filter: { rkey },
-                    update: {
-                        $set: {
-                            deleted: true,
-                            deleted_at: new Date(),
-                            deletion_reason: reason
-                        }
-                    }
-                });
-
-                // Get affected users in batches
-                let lastId = null;
-                while (true) {
-                    const query = lastId ? 
-                        { pack_ids: rkey, _id: { $gt: lastId } } : 
-                        { pack_ids: rkey };
-
-                    const users = await this.safeFind('users', query, { 
-                        limit: this.batchSize,
-                        sort: { _id: 1 }
-                    });
-
-                    if (!users.length) break;
-
-                    for (const user of users) {
-                        await this.safeWrite('users', {
-                            filter: { did: user.did },
-                            update: { 
-                                $pull: { pack_ids: rkey },
-                                $set: { last_updated: new Date() }
-                            }
-                        });
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                    }
-
-                    lastId = users[users.length - 1]._id;
-                    if (users.length < this.batchSize) break;
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-
-                this.logger.info(`Pack ${rkey} marked as deleted in Cosmos DB`);
-            } else {
-                // For MongoDB, use bulk operations
-                await this.safeBulkWrite('users', [{
-                    updateMany: {
-                        filter: { pack_ids: rkey },
-                        update: { 
-                            $pull: { pack_ids: rkey },
-                            $set: { last_updated: new Date() }
-                        }
-                    }
-                }]);
-
-                await this.safeWrite('starter_packs', {
-                    filter: { rkey },
-                    update: {
-                        $set: {
-                            deleted: true,
-                            deleted_at: new Date(),
-                            deletion_reason: reason
-                        }
-                    }
-                });
-
-                this.logger.info(`Pack ${rkey} marked as deleted in MongoDB`);
-            }
-        } catch (err) {
-            this.logger.error(`Failed to mark pack ${rkey} as deleted:`, err);
-            throw err;
-        }
-    }
-
-    async cleanupRemovedUsers(rkey, removedDids) {
-        logger.debug('cleanupRemovedUsers');
-        try {
-            if (this.isCosmosDb) {
-                // Process in small batches for Cosmos DB
-                for (let i = 0; i < removedDids.length; i += this.batchSize) {
-                    const batch = removedDids.slice(i, i + this.batchSize);
-                    
-                    for (const did of batch) {
-                        // Update the user
-                        await this.safeWrite('users', {
-                            filter: { did },
-                            update: {
-                                $pull: { pack_ids: rkey },
-                                $set: { last_updated: new Date() }
-                            }
-                        });
-
-                        // Check if user should be deleted
-                        const user = await this.safeFindOne('users', { did });
-                        if (user && (!user.pack_ids || user.pack_ids.length === 0)) {
-                            await this.safeWrite('users', {
-                                filter: { did },
-                                update: { $set: { deleted: true, deleted_at: new Date() } }
-                            });
-                        }
-
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                    }
-
-                    // Add delay between batches
-                    if (i + this.batchSize < removedDids.length) {
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-                }
-
-                this.logger.info(`Cleaned up ${removedDids.length} removed users for pack ${rkey} in Cosmos DB`);
-            } else {
-                // For MongoDB, use bulk operations
-                const bulkOps = removedDids.map(did => ({
-                    updateOne: {
-                        filter: { did },
-                        update: {
-                            $pull: { pack_ids: rkey },
-                            $set: { last_updated: new Date() }
-                        }
-                    }
-                }));
-
-                await this.safeBulkWrite('users', bulkOps);
-
-                // Clean up users with no packs
-                await this.safeWrite('users', {
-                    filter: {
-                        did: { $in: removedDids },
-                        $or: [
-                            { pack_ids: { $size: 0 } },
-                            { pack_ids: { $exists: false } }
-                        ]
-                    },
-                    update: {
-                        $set: { 
-                            deleted: true, 
-                            deleted_at: new Date() 
-                        }
-                    }
-                });
-
-                this.logger.info(`Cleaned up ${removedDids.length} removed users for pack ${rkey} in MongoDB`);
-            }
-        } catch (err) {
-            this.logger.error(`Failed to cleanup removed users for pack ${rkey}:`, err);
-            throw err;
-        }
-    }
 
     async setupIndexes() {
         if (this.isCosmosDb) return; // Skip for Cosmos DB
-
+    
         const requiredIndexes = {
             users: [
-                { spec: { handle: 1 } },
+                { spec: { handle: 1 } }, // Remove unique: null
                 { spec: { pack_ids: 1 } },
                 { spec: { last_updated: 1 } }
             ],
@@ -2686,13 +2182,19 @@ class DatabaseManager_old {
                 { spec: { updated_at: 1 } }
             ]
         };
-
+    
         // Only add unique indexes for MongoDB
         if (!this.isCosmosDb) {
-            requiredIndexes.users.unshift({ spec: { did: 1 }, unique: true });
-            requiredIndexes.starter_packs.unshift({ spec: { rkey: 1 }, unique: true });
+            requiredIndexes.users.unshift({ 
+                spec: { did: 1 }, 
+                unique: true  // Explicitly set to true
+            });
+            requiredIndexes.starter_packs.unshift({ 
+                spec: { rkey: 1 }, 
+                unique: true  // Explicitly set to true
+            });
         }
-
+    
         for (const [collection, indexes] of Object.entries(requiredIndexes)) {
             const existing = await this.withRetry(
                 () => this.db.collection(collection).indexes(),
@@ -2700,15 +2202,20 @@ class DatabaseManager_old {
             );
             
             const existingKeys = new Set(existing.map(idx => JSON.stringify(idx.key)));
-
+    
             for (const index of indexes) {
                 const indexKey = JSON.stringify(index.spec);
                 if (!existingKeys.has(indexKey)) {
+                    const indexOptions = {
+                        background: true,
+                        unique: index.unique === true  // Only set if explicitly true
+                    };
+                    
                     await this.withRetry(
-                        () => this.db.collection(collection).createIndex(index.spec, {
-                            background: true,
-                            unique: index.unique
-                        }),
+                        () => this.db.collection(collection).createIndex(
+                            index.spec, 
+                            indexOptions
+                        ),
                         `create index ${collection}.${indexKey}`
                     );
                     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -2717,172 +2224,75 @@ class DatabaseManager_old {
         }
     }
 
-    async getCurrentSchemaVersion() {
-        logger.debug('getCurrentSchemaVersion');
+    async markPackDeleted(rkey, reason) {
+        logger.debug('markPackDeleted');
         try {
-            // Use safeFindOne here
-            const versionDoc = await this.safeFindOne('schema_versions', {}, 
-                { sort: { version: -1 } }
-            );
-            return versionDoc?.version || 0;
+            // First mark the pack as deleted
+            await this.safeWrite('starter_packs', {
+                filter: { rkey },
+                update: {
+                    $set: {
+                        deleted: true,
+                        deleted_at: new Date(),
+                        deletion_reason: reason
+                    }
+                }
+            });
+    
+            // Update affected users
+            await this.safeBulkWrite('users', [{
+                updateMany: {
+                    filter: { pack_ids: rkey },
+                    update: { 
+                        $pull: { pack_ids: rkey },
+                        $set: { last_updated: new Date() }
+                    }
+                }
+            }]);
+    
+            logger.info(`Pack ${rkey} marked as deleted`);
         } catch (err) {
-            this.logger.warn('Error getting schema version:', err);
-            return 0;
+            logger.error(`Failed to mark pack ${rkey} as deleted:`, err);
+            throw err;
         }
     }
 
-    async updateSchemaVersion(version) {
-        logger.debug('updateSchemaVersion');
-        await this.safeWrite('schema_versions', {
-            filter: { version },
-            update: {
-                $set: {
-                    version,
-                    appliedAt: new Date().toISOString()
-                }
-            }
-        }, { upsert: true });
-    }
-
-    async applySchemaUpdates(updates) {
-        logger.debug('applySchemaUpdates');
-        const currentVersion = await this.getCurrentSchemaVersion();
-
-        for (const update of updates) {
-            if (update.version <= currentVersion) continue;
-
-            if (this.isCosmosDb) {
-                let lastId = null;
-                while (true) {
-                    const query = lastId ? { _id: { $gt: lastId } } : {};
-                    const batch = await this.db.collection(update.collection)
-                        .find(query)
-                        .limit(this.batchSize)
-                        .toArray();
-
-                    if (!batch.length) break;
-
-                    for (const doc of batch) {
-                        await this.safeWrite(update.collection, {
-                            filter: { _id: doc._id },
-                            update: { $set: update.changes }
-                        });
-                    }
-
-                    lastId = batch[batch.length - 1]._id;
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                }
-            } else {
-                await this.db.collection(update.collection).updateMany(
-                    {},
-                    { $set: update.changes }
-                );
-            }
-
-            await this.updateSchemaVersion(update.version);
-        }
-    }
-
-    async findDuplicates(collection, field) {
+    async cleanupRemovedUsers(rkey, removedDids) {
+        logger.debug('cleanupRemovedUsers');
         try {
-            const pipeline = [
-                {
-                    $group: {
-                        _id: `$${field}`,
-                        count: { $sum: 1 },
-                        docs: { $push: '$$ROOT' }
+            // Update users that were removed from the pack
+            const bulkOps = removedDids.map(did => ({
+                updateOne: {
+                    filter: { did },
+                    update: {
+                        $pull: { pack_ids: rkey },
+                        $set: { last_updated: new Date() }
                     }
+                }
+            }));
+
+            await this.safeBulkWrite('users', bulkOps);
+
+            // Clean up users with no packs
+            await this.safeWrite('users', {
+                filter: {
+                    did: { $in: removedDids },
+                    $or: [
+                        { pack_ids: { $size: 0 } },
+                        { pack_ids: { $exists: false } }
+                    ]
                 },
-                {
-                    $match: {
-                        count: { $gt: 1 }
+                update: {
+                    $set: { 
+                        deleted: true, 
+                        deleted_at: new Date() 
                     }
                 }
-            ];
+            });
 
-            const results = await this.db.collection(collection)
-                .aggregate(pipeline)
-                .toArray();
-
-            return results;
+            logger.info(`Cleaned up ${removedDids.length} removed users for pack ${rkey}`);
         } catch (err) {
-            this.logger.error(`Error finding duplicates in ${collection}.${field}:`, err);
-            throw err;
-        }
-    }
-
-    async safeFindOne(collection, query, options = {}) {
-        logger.debug('safeFindOne', query);
-        try {
-            const result = await this.db.collection(collection).findOne(query, options);
-            if (this.isCosmosDb) {
-                await new Promise(resolve => setTimeout(resolve, 50));
-            }
-            return result;
-        } catch (err) {
-            if (this.isCosmosThrottlingError(err)) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                return this.safeFindOne(collection, query, options);
-            }
-            throw err;
-        }
-    }
-
-    async safeFind(collection, query, options = {}) {
-        logger.debug('safeFind', query);
-        if (this.isCosmosDb) {
-            const results = [];
-            let lastId = null;
-            
-            while (true) {
-                const cosmosQuery = lastId 
-                    ? { ...query, _id: { $gt: lastId } }
-                    : query;
-
-                const batch = await this.db.collection(collection)
-                    .find(cosmosQuery)
-                    .limit(this.batchSize)
-                    .toArray();
-
-                if (!batch.length) break;
-
-                results.push(...batch);
-                lastId = batch[batch.length - 1]._id;
-                await new Promise(resolve => setTimeout(resolve, 100));
-
-                if (options.limit && results.length >= options.limit) {
-                    results.length = options.limit;
-                    break;
-                }
-            }
-
-            return results;
-        } else {
-            return this.db.collection(collection).find(query, options).toArray();
-        }
-    }
-
-    getPartitionKeyForCollection(collectionName) {
-        switch (collectionName) {
-            case 'users':
-                return { paths: ["/did"] };
-            case 'starter_packs':
-                return { paths: ["/rkey"] };
-            case 'schema_versions':
-                return { paths: ["/version"] };
-            default:
-                return { paths: ["/_id"] };
-        }
-    }
-
-    async close() {
-        try {
-            if (this.client) {
-                await this.client.close();
-                this.logger.info('Database connection closed');
-            }
-        } catch (err) {
-            this.logger.error('Error closing database connection:', err);
+            logger.error(`Failed to cleanup removed users for pack ${rkey}:`, err);
             throw err;
         }
     }

@@ -1901,6 +1901,7 @@ class DatabaseManager {
         this.consecutiveThrottles = 0;
         this.maxConsecutiveThrottles = 5;
         this.baseBackoffDelay = 1000;
+        this.session = null;
     }
 
     async connect(maxRetries = 2) {
@@ -1909,6 +1910,12 @@ class DatabaseManager {
             try {
                 await this.client.connect();
                 this.db = this.client.db(this.dbName);
+                
+                // Start a session if we don't have one
+                if (!this.session || this.session.hasEnded) {
+                    this.session = this.client.startSession();
+                }
+                
                 if (!this.isCosmosDb) {
                     await this.db.command({ ping: 1 });
                 }
@@ -1918,6 +1925,21 @@ class DatabaseManager {
                 await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
             }
         }
+    }
+
+    async ensureSession() {
+        if (!this.session || this.session.hasEnded) {
+            try {
+                if (this.session) {
+                    await this.session.endSession();
+                }
+                this.session = this.client.startSession();
+            } catch (err) {
+                logger.error('Error creating new session:', err);
+                throw err;
+            }
+        }
+        return this.session;
     }
 
     async init() {
@@ -2073,18 +2095,29 @@ class DatabaseManager {
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 await this.enforceOperationDelay();
-    
-                // Add safety check for pack_ids operations
+                
+                // Ensure we have an active session
+                await this.ensureSession();
+                
+                // Use the session in the operation
+                const sessionOptions = {
+                    ...options,
+                    session: this.session
+                };
+
                 if (operation.update.$addToSet?.pack_ids) {
                     const doc = await this.db.collection(collection)
-                        .findOne(operation.filter, { projection: { _id: 1, pack_ids: 1 }});
+                        .findOne(operation.filter, { 
+                            projection: { _id: 1, pack_ids: 1 },
+                            session: this.session  // Use session here too
+                        });
     
                     if (!doc) {
                         await this.db.collection(collection).insertOne({
                             ...operation.filter,
                             pack_ids: [operation.update.$addToSet.pack_ids],
                             ...(operation.update.$set || {})
-                        });
+                        }, sessionOptions);
                     } else {
                         const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
                         if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
@@ -2095,7 +2128,8 @@ class DatabaseManager {
                                         pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
                                         ...(operation.update.$set || {})
                                     }
-                                }
+                                },
+                                sessionOptions
                             );
                         }
                     }
@@ -2103,7 +2137,7 @@ class DatabaseManager {
                     await this.db.collection(collection).updateOne(
                         operation.filter,
                         operation.update,
-                        { ...options, upsert: true }
+                        { ...sessionOptions, upsert: true }
                     );
                 }
     
@@ -2112,6 +2146,16 @@ class DatabaseManager {
     
             } catch (err) {
                 lastError = err;
+                if (err.message.includes('session')) {
+                    // If we get a session error, try to create a new session
+                    try {
+                        await this.ensureSession();
+                        continue;
+                    } catch (sessionErr) {
+                        logger.error('Failed to create new session:', sessionErr);
+                        throw sessionErr;
+                    }
+                }
                 if (this.isCosmosThrottlingError(err)) {
                     await this.handleThrottlingError(err);
                     continue;
@@ -2235,6 +2279,24 @@ class DatabaseManager {
                         `create index ${collection}.${indexKey}`
                     );
                     await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        }
+
+        async cleanup() {
+            if (this.session) {
+                try {
+                    await this.session.endSession();
+                } catch (err) {
+                    logger.error('Error ending session:', err);
+                }
+                this.session = null;
+            }
+            if (this.client) {
+                try {
+                    await this.client.close(true);
+                } catch (err) {
+                    logger.error('Error closing MongoDB connection:', err);
                 }
             }
         }
@@ -3633,29 +3695,32 @@ function validateEnv(args) {
 }
 
 // Handle cleanup and shutdown
-async function handleShutdown(signal) {
+async function handleShutdown(signal, currentProcessor = null) {
     logger.info(`\nReceived ${signal}. Starting graceful shutdown...`);
     
     try {
-        if (processor) {
+        if (currentProcessor) {
             // Save current state
-            await processor.taskManager.maybeWriteCheckpoint(true);
+            if (currentProcessor.taskManager) {
+                await currentProcessor.taskManager.maybeWriteCheckpoint(true);
+            }
             
             // Clean up resources
-            await processor.cleanup();
+            await currentProcessor.cleanup();
             
             // Log final stats
-            const stats = processor.metrics.getMetrics();
-            logger.info('Final processing statistics:', {
-                packsProcessed: stats.processing.packsProcessed,
-                usersProcessed: stats.processing.usersProcessed,
-                totalDuration: `${Math.floor((Date.now() - processor.startTime) / 60000)} minutes`
-            });
+            if (currentProcessor.metrics) {
+                const stats = currentProcessor.metrics.getMetrics();
+                logger.info('Final processing statistics:', {
+                    packsProcessed: stats.processing.packsProcessed,
+                    usersProcessed: stats.processing.usersProcessed,
+                    totalDuration: `${Math.floor((Date.now() - currentProcessor.startTime) / 60000)} minutes`
+                });
+            }
         }
     } catch (err) {
         logger.error('Error during shutdown:', err);
     } finally {
-        logger.info('Shutdown complete');
         process.exit(0);
     }
 }
@@ -4799,6 +4864,11 @@ async function main() {
         });
 
         await processor.init();
+
+        // Set up shutdown handlers with the processor
+        process.on('SIGINT', () => handleShutdown('SIGINT', processor));
+        process.on('SIGTERM', () => handleShutdown('SIGTERM', processor));
+
         logger.info('Initialization complete');
 
         // Handle maintenance commands first
@@ -4882,9 +4952,6 @@ process.on('uncaughtException', (error) => {
     logger.error('Uncaught Exception:', error);
     process.exit(1);
 });
-
-process.on('SIGINT', () => handleShutdown('SIGINT'));
-process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // Run the program
 main().catch(err => {

@@ -3909,36 +3909,43 @@ async function quickProcessUser(identifier, options = {}) {
             await processor.dbManager.ensureSession();
         }
 
-        // Now create/verify TaskManager
+        // Create TaskManager but DON'T load full task list
         if (!processor.taskManager) {
             processor.taskManager = new TaskManager(
                 processor.fileHandler, 
                 debug,
                 processor.dbManager
             );
-            await processor.taskManager.initializeTaskList();
+            
+            // Only load existing data for lookups, but don't build task list
+            const { packs: existingPacks } = await processor.taskManager.loadExistingData();
+            processor.taskManager.existingPacks = existingPacks;
+            
+            // Initialize empty task tracking
+            processor.taskManager.pendingTasks = new Map();
+            processor.taskManager.completedTasks = new Set();
+            processor.taskManager.failures = new Map();
         }
 
-        // Get profile first to validate user exists
+        // Get and process ONLY the specified user
         const response = await processor.agent.getProfile({ actor: identifier });
         if (!response?.data) {
             throw new Error(`Could not find profile for ${identifier}`);
         }
 
-        // Process profile
+
         const result = await processor.processProfile(response.data, {
             force,
-            processAssociated,
-            debug
+            processAssociated,  // This will discover related packs
+            debug,
+            source: 'quick_process'  // Mark as quick process source
         });
 
-        // Process tasks until completion
+        // Process ONLY the discovered tasks from this user
         while (processor.taskManager.pendingTasks.size > 0) {
             await processor.taskManager.processNextTask(processor);
             await processor.taskManager.maybeWriteCheckpoint();
         }
-
-        await processor.taskManager.maybeWriteCheckpoint(true);
 
         return result;
     } catch (err) {
@@ -3951,12 +3958,25 @@ async function quickProcessPack(identifier, options = {}) {
     const { processor } = options;
 
     try {
-        // CHANGE: Initialize task manager if needed AND load existing data
+        // Initialize task manager if needed, do NOT load all existing data
         if (!processor.taskManager) {
-            processor.taskManager = new TaskManager(processor.fileHandler, processor.debug);
-            await processor.taskManager.initializeTaskList();
+            processor.taskManager = new TaskManager(
+                processor.fileHandler,
+                processor.debug,
+                processor.dbManager
+            );
+            
+            // Only load existing data, don't build full task list
+            const { packs: existingPacks } = await processor.taskManager.loadExistingData();
+            processor.taskManager.existingPacks = existingPacks;
+            
+            // Initialize empty task tracking
+            processor.taskManager.pendingTasks = new Map();
+            processor.taskManager.completedTasks = new Set();
+            processor.taskManager.failures = new Map();
         }
 
+        // Add ONLY the specified pack
         let urlLine;
         if (identifier.startsWith('at://')) {
             const [_, handle, __, rkey] = identifier.split('/');
@@ -3969,7 +3989,7 @@ async function quickProcessPack(identifier, options = {}) {
             urlLine = `${pack.creator}|${identifier}`;
         }
 
-        // Add as task
+        // Add as single initial task
         await processor.taskManager.addTask({
             handle: urlLine.split('|')[0],
             rkey: urlLine.split('|')[1],
@@ -3977,15 +3997,11 @@ async function quickProcessPack(identifier, options = {}) {
             source: 'quick_process'
         });
 
-        // Process until completion
+        // Process this pack and any discovered related tasks
         while (processor.taskManager.pendingTasks.size > 0) {
             const success = await processor.taskManager.processNextTask(processor);
-            // Write checkpoint periodically
             await processor.taskManager.maybeWriteCheckpoint();
         }
-
-        // Force final checkpoint write
-        await processor.taskManager.maybeWriteCheckpoint(true);
 
         return true;
     } catch (err) {
@@ -4038,6 +4054,7 @@ class TaskManager {
 
     async initializeTaskList() {
         try {
+            // Ensure valid session at the start if using MongoDB
             if (this.dbManager && !this.noMongoDB) {
                 await this.dbManager.ensureSession();
             }
@@ -4155,26 +4172,32 @@ class TaskManager {
                 !this.dbManager.noDBWrites && 
                 this.dbManager.db) {
                 
-                // Double check collection exists
+                // Ensure we have a valid session before MongoDB operations
+                await this.dbManager.ensureSession();
+                
+                // Now use the session in the query
                 const collection = this.dbManager.db.collection('starter_packs');
                 if (collection) {
-                    const mongoDbPack = await collection.findOne({ rkey: rkey });
+                    const mongoDbPack = await collection.findOne(
+                        { rkey: rkey },
+                        { session: this.dbManager.session }  // Use the session here
+                    );
                     
                     if (mongoDbPack) {
                         const lastUpdate = new Date(mongoDbPack.updated_at);
                         const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
                         
                         if (daysSinceUpdate < 10) {
-                            logger.debug(`Pack ${rkey} was recently processed in MongoDB (${daysSinceUpdate.toFixed(1)} days ago)`);
+                            logger.debug(`Pack ${rkey} was recently processed in MongoDB`);
                             return { process: false, reason: 'recently_processed_in_mongodb' };
-                        } else {
-                            logger.debug(`Pack ${rkey} exists in MongoDB but needs update (${daysSinceUpdate.toFixed(1)} days old)`);
-                            return { 
-                                process: true, 
-                                lowPriority: true,
-                                reason: 'mongodb_needs_update' 
-                            };
                         }
+                        
+                        logger.debug(`Pack ${rkey} exists in MongoDB but needs update`);
+                        return { 
+                            process: true, 
+                            lowPriority: true,
+                            reason: 'mongodb_needs_update' 
+                        };
                     }
                 }
             }
@@ -4441,55 +4464,6 @@ class TaskManager {
 
     markDirty() {
         this.checkpointDirty = true;
-    }
-
-    async buildConsolidatedTaskList(urlPacks, existingPacks, checkpoint) {
-        // Initialize with empty data if any is undefined
-        urlPacks = urlPacks || new Map();
-        existingPacks = existingPacks || new Map();
-        checkpoint = checkpoint || {
-            completedPacks: [],
-            missingPacks: [],
-            missingProfiles: []
-        };
-    
-        this.pendingTasks.clear();
-        const skipped = new Map();
-        this.totalTasks = urlPacks.size;  // Set total tasks count here
-    
-        // Process URLs if we have any
-        for (const [rkey, urlData] of urlPacks) {
-            const existingPack = existingPacks.get(rkey);
-            const failure = this.failures.get(rkey);
-    
-            const { process, reason } = this.shouldProcessPack(rkey, existingPack, failure);
-    
-            if (process) {
-                const priority = this.calculateTaskPriority(rkey, existingPack, failure);
-                
-                await this.addTask({
-                    handle: urlData.handle,
-                    rkey,
-                    priority,
-                    source: 'initial',
-                    existingData: existingPack || null,
-                    previousAttempts: failure?.attempts || 0
-                });
-            } else {
-                skipped.set(rkey, reason);
-            }
-        }
-    
-        if (this.debug) {
-            logger.debug('Task list built:', {
-                total: this.totalTasks,
-                pending: this.pendingTasks.size,
-                skipped: skipped.size,
-                new: Array.from(this.pendingTasks.values()).filter(t => !t.existingData).length,
-                updates: Array.from(this.pendingTasks.values()).filter(t => t.existingData).length,
-                failureRetries: Array.from(this.pendingTasks.values()).filter(t => t.previousAttempts > 0).length
-            });
-        }
     }
 
     async loadExistingPacks() {
@@ -4947,6 +4921,65 @@ class TaskManager {
         }
 
         return { tasks, skipped };
+    }
+
+    async buildConsolidatedTaskList(urlPacks, existingPacks, checkpoint) {
+        try {
+            // If using MongoDB, ensure session is valid before starting
+            if (this.dbManager && !this.dbManager.noDBWrites) {
+                await this.dbManager.ensureSession();
+            }
+
+            // Initialize with empty data if any is undefined
+            urlPacks = urlPacks || new Map();
+            existingPacks = existingPacks || new Map();
+            checkpoint = checkpoint || {
+                completedPacks: [],
+                missingPacks: [],
+                missingProfiles: []
+            };
+        
+            this.pendingTasks.clear();
+            const skipped = new Map();
+            this.totalTasks = urlPacks.size;  // Set total tasks count here
+        
+            // Process URLs if we have any
+            for (const [rkey, urlData] of urlPacks) {
+                const existingPack = existingPacks.get(rkey);
+                const failure = this.failures.get(rkey);
+        
+                const { process, reason } = this.shouldProcessPack(rkey, existingPack, failure);
+        
+                if (process) {
+                    const priority = this.calculateTaskPriority(rkey, existingPack, failure);
+                    
+                    await this.addTask({
+                        handle: urlData.handle,
+                        rkey,
+                        priority,
+                        source: 'initial',
+                        existingData: existingPack || null,
+                        previousAttempts: failure?.attempts || 0
+                    });
+                } else {
+                    skipped.set(rkey, reason);
+                }
+            }
+        
+            if (this.debug) {
+                logger.debug('Task list built:', {
+                    total: this.totalTasks,
+                    pending: this.pendingTasks.size,
+                    skipped: skipped.size,
+                    new: Array.from(this.pendingTasks.values()).filter(t => !t.existingData).length,
+                    updates: Array.from(this.pendingTasks.values()).filter(t => t.existingData).length,
+                    failureRetries: Array.from(this.pendingTasks.values()).filter(t => t.previousAttempts > 0).length
+                });
+            }
+        } catch (err) {
+            logger.error('Error building consolidated task list:', err);
+            throw err;
+        }
     }
 
     async saveCheckpoint() {

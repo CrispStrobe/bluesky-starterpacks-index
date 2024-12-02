@@ -1218,7 +1218,7 @@ class FileHandler {
             const formattedUser = {
                 did: userData.did,
                 handle: userData.handle,
-                display_name: userData.displayName || '',
+                display_name: userData.displayName || userData.display_name ||'',
                 followers_count: userData.followers || userData.followers_count || 0,
                 follows_count: userData.following || userData.follows_count || 0,
                 last_updated: userData.last_updated,

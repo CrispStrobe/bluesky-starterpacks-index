@@ -117,9 +117,19 @@ const logger = winston.createLogger({
         new winston.transports.Console({
             format: winston.format.combine(
                 winston.format.colorize(),
-                winston.format.simple(),
-                winston.format.printf(({ timestamp, level, message }) => {
-                    return `${timestamp} [${level}]: ${message}`;
+                // Remove simple format to handle custom formatting
+                winston.format.printf(({ timestamp, level, message, ...meta }) => {
+                    // Exclude 'service' from metadata
+                    const { service, ...rest } = meta;
+                    // Check if there are additional metadata fields
+                    const hasAdditionalMeta = Object.keys(rest).length > 0;
+                    // Format the log message
+                    let log = `${timestamp} [${level}]: ${message}`;
+                    // Append additional metadata if present
+                    if (hasAdditionalMeta) {
+                        log += `\n${JSON.stringify(rest, null, 2)}`;
+                    }
+                    return log;
                 })
             )
         }),
@@ -3694,10 +3704,15 @@ class MainProcessor {
     
             // await this.dbManager.safeBulkWrite('users', userOperations);
             const batchSize = 100;
-            for (let i = 0; i < users.length; i += batchSize) {
+            /* for (let i = 0; i < users.length; i += batchSize) {
                 const batch = users.slice(i, i + batchSize);
                 await this.dbManager.safeBulkWrite('users', batch);
+            } */
+            for (let i = 0; i < userOperations.length; i += batchSize) {
+                const batch = userOperations.slice(i, i + batchSize);
+                await this.dbManager.safeBulkWrite('users', batch);
             }
+            //await this.dbManager.safeBulkWrite('users', userOperations);
     
             if (this.debug) {
                 const counts = await this.dbManager.getCollectionCounts();

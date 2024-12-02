@@ -1207,6 +1207,8 @@ class FileHandler {
     async appendUser(userData) {
         try {
             await this.acquireLock();
+
+            logger.debug('FileHandler: Received user data for append:', userData);
             
             if (!userData.did || !userData.last_updated) {
                 throw new Error('Invalid user data');
@@ -1228,6 +1230,8 @@ class FileHandler {
                 indexed_at: userData.indexed_at || null,
                 created_at: userData.created_at || null
             };
+
+            logger.debug('FileHandler: Formatted user data:', formattedUser);
     
             // Update cache
             this.updateUserCache(formattedUser);
@@ -1239,6 +1243,8 @@ class FileHandler {
             // Append to YAML file with proper document separator
             const yamlDoc = '---\n' + yaml.dump(formattedUser);
             await fs.writeFile(FILE_PATHS.usersBackup, yamlDoc, { flag: 'a' });
+
+            logger.debug('FileHandler: Successfully saved user data to files');
     
             return true;
         } finally {
@@ -3261,6 +3267,18 @@ class MainProcessor {
     }
 
     async processProfile(profile, options = {}) {
+        // Add debug logging for initial profile data
+        if (this.debug) {
+            logger.debug('Processing profile with raw data:', {
+                did: profile.did,
+                handle: profile.handle,
+                displayName: profile.displayName,
+                description: profile.description,
+                // Log all available fields
+                rawProfile: profile
+            });
+        }
+        
         const {
             rkey = null,
             force = false,
@@ -3390,6 +3408,9 @@ class MainProcessor {
                 handle_history: existing?.handle_history || [],
                 last_check: new Date()
             };
+
+            // Log prepared data before saving
+            logger.debug('Prepared user data for storage:', userData);
     
             // Handle renamed profiles
             if (existing && existing.handle !== profile.handle) {
@@ -3407,6 +3428,14 @@ class MainProcessor {
             // First save to file system
             const fileStart = Date.now();
             await this.fileHandler.appendUser(userData);
+
+            logger.debug('Saved to file system:', {
+                did: userData.did,
+                handle: userData.handle,
+                display_name: userData.display_name,
+                description: userData.description
+            });
+
             metrics?.recordOperation('file_write', Date.now() - fileStart);
     
             // Then save to MongoDB if enabled
@@ -3430,6 +3459,7 @@ class MainProcessor {
                         },
                         upsert: true
                     });
+                    logger.debug('Saved to MongoDB:', userData);
                     metrics?.recordOperation('db_write', Date.now() - dbStart);
                 }
             }

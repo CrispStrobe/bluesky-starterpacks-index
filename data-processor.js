@@ -2766,6 +2766,45 @@ class MainProcessor {
         }
     }
 
+    async initMinimal() {
+        logger.debug('Minimal initialization for quick process');
+        
+        // Initialize API components
+        await this.initializeApiComponents();
+        
+        // Initialize file handler (needed for lookups)
+        await this.fileHandler.init();
+        
+        // Initialize DB if needed, but don't load all data
+        if (!this.noMongoDB) {
+            if (!this.noDBWrites) {
+                const dbType = process.env.DB_TYPE || 'cosmos';
+                const dbConfig = {
+                    ...DB_CONFIGS[dbType],
+                    maxPoolSize: 10,
+                    minPoolSize: 5,
+                    waitQueueTimeoutMS: 30000,
+                    serverSelectionTimeoutMS: 30000
+                };
+                
+                this.mongoClient = new MongoClient(process.env.MONGODB_URI, dbConfig);
+                this.dbManager = new DatabaseManager(
+                    this.mongoClient,
+                    dbType,
+                    this.logger,
+                    'starterpacks'
+                );
+                await this.dbManager.init();
+                await this.dbManager.ensureSession();
+            } else {
+                this.dbManager = new MockDatabaseManager();
+                await this.dbManager.init();
+            }
+        }
+        
+        logger.debug('Minimal initialization complete');
+    }
+
     async init() {
         try {
             // Step 0: Initialize Bluesky API components
@@ -5040,13 +5079,32 @@ async function main() {
     try {
         metrics.recordStartup();
         
+        // For quick process, we want minimal initialization
+        if (args.addUser || args.addPack) {
+            logger.debug('Starting with quick processing...');
+            processor = new MainProcessor({
+                noMongoDB: args.noMongoDB,
+                noDBWrites: args.noDBWrites,
+                fromApi: args.fromApi,
+                debug: args.debug || process.env.DEBUG,
+                quickProcess: true  
+            });
+            
+            // Only initialize basic components
+            await processor.initMinimal();
+            
+            const result = await handleQuickProcess(args, processor);
+            return result;
+        }
+        
+        // Normal full initialization for regular run
         processor = new MainProcessor({
             noMongoDB: args.noMongoDB,
-            noDBWrites: args.noDBWrites,  
+            noDBWrites: args.noDBWrites,
             fromApi: args.fromApi,
             debug: args.debug || process.env.DEBUG
         });
-
+        
         await processor.init();
 
         // Set up shutdown handlers with the processor
@@ -5059,13 +5117,6 @@ async function main() {
         if (args.purge || args.cleanFiles) {
             await handleMaintenanceCommands(args, processor);
             return;
-        }
-
-        // Handle single-item processing
-        if (args.addUser || args.addPack) {
-            logger.debug('Commencing quick process handling');
-            const result = await handleQuickProcess(args, processor);
-            return result;
         }
 
         // Initialize from checkpoint

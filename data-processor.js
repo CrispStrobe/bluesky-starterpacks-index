@@ -1859,7 +1859,7 @@ class ApiHandler {
 
             // Try public API first
             try {
-                const publicData = await this.apiHandler.makePublicApiCall(
+                const publicData = await this.makePublicApiCall(
                     'com.atproto.identity.resolveHandle',
                     { handle: sanitized }
                 );
@@ -3044,7 +3044,7 @@ class MainProcessor {
             logger.debug(`getListMembers for uri: ${uri}`)
             // Try public API first
             try {
-                const publicData = await this.makePublicApiCall('app.bsky.graph.getList', {
+                const publicData = await this.ApiHandler.makePublicApiCall('app.bsky.graph.getList', {
                     list: uri,
                     limit: 100
                 });
@@ -3285,7 +3285,8 @@ class MainProcessor {
             processAssociated = true,
             parentPack = null,
             processingId = `${Date.now()}-${Math.random()}`,
-            source = 'direct'
+            source = 'direct',
+            isInitialUser = false  
         } = options;
     
         const startTime = Date.now();
@@ -3355,7 +3356,8 @@ class MainProcessor {
             const existing = await this.fileHandler.getUser(profile.did);
             
             // Handle cache unless forced
-            if (existing && !force) {
+            // Skip cache check for initial user
+            if (existing && !force && !isInitialUser) {
                 const lastUpdated = new Date(existing.last_updated);
                 const daysSinceUpdate = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
                 if (daysSinceUpdate < 7) {
@@ -4003,11 +4005,11 @@ async function quickProcessUser(identifier, options = {}) {
             throw new Error(`Could not find profile for ${identifier}`);
         }
 
-
         const result = await processor.processProfile(response.data, {
             force,
             processAssociated,  // This will discover related packs
             debug,
+            isInitialUser: true,  // Set this flag for the initial user
             source: 'quick_process'  // Mark as quick process source
         });
 

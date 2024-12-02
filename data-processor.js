@@ -4122,6 +4122,8 @@ class TaskManager {
         this.completedTaskCount = 0;
         this.currentPackUsersTotal = 0;
         this.currentPackUsersProcessed = 0;
+        this.newlyDiscoveredTasks = 0;
+        this.totalInitialTasks = 0;
     }
 
     async initializeTaskList() {
@@ -4642,9 +4644,10 @@ class TaskManager {
                 timestamp: data.lastAttempt
             })),
             missingProfiles: Array.from(this.missingProfiles),
-            fileStates: {
-                lastPackUpdate: this.fileHandler.packCache.size,
-                lastUserUpdate: this.fileHandler.userCache.size
+            progress: {
+                initialTasks: this.totalInitialTasks,
+                discoveredTasks: this.newlyDiscoveredTasks,
+                completedTasks: this.completedTaskCount
             }
         };
     
@@ -4808,7 +4811,7 @@ class TaskManager {
         // Add to URLs file first
         await this.fileHandler.appendToUrlsFile(packInfo.creator, packInfo.rkey);
         
-        return this.addTask({
+        const added = await this.addTask({
             handle: packInfo.creator,
             rkey: packInfo.rkey,
             priority,
@@ -4817,6 +4820,12 @@ class TaskManager {
             discoveredAt: new Date().toISOString(),
             memberCount: packInfo.memberCount
         });
+
+        if (added) {
+            this.recordNewlyDiscoveredTask();
+        }
+
+        return added;
     }
 
     // Track relationships between packs and their discoverers
@@ -4836,7 +4845,14 @@ class TaskManager {
         if (!task) return null;
 
         this.completedTaskCount++;
-        logger.info(`Processing pack ${this.completedTaskCount}/${this.totalTasks}: ${task.rkey} (${task.handle})`);
+        const totalExpectedTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
+        const progress = ((this.completedTaskCount / totalExpectedTasks) * 100).toFixed(1);
+        logger.info(`Processing pack ${this.completedTaskCount}/${totalExpectedTasks}: ${task.rkey} (${task.handle})`, {
+            initialTasks: this.totalInitialTasks,
+            discovered: this.newlyDiscoveredTasks,
+            completed: this.completedTaskCount,
+            pending: this.pendingTasks.size
+        });
 
         try {
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
@@ -4845,9 +4861,6 @@ class TaskManager {
                 this.completedTasks.add(task.rkey);
                 this.pendingTasks.delete(task.rkey);
                 this.markDirty();
-
-                // Log progress
-                const progress = ((this.completedTaskCount / this.totalTasks) * 100).toFixed(1);
                 logger.info(`Pack processing complete (${progress}% overall progress)`);
             }
 
@@ -4856,6 +4869,10 @@ class TaskManager {
             logger.error(`Error processing task ${task.rkey}:`, err);
             return false;
         }
+    }
+
+    recordNewlyDiscoveredTask() {
+        this.newlyDiscoveredTasks = (this.newlyDiscoveredTasks || 0) + 1;
     }
 
     updateUserProgress(total, current) {
@@ -5013,7 +5030,8 @@ class TaskManager {
         
             this.pendingTasks.clear();
             const skipped = new Map();
-            this.totalTasks = urlPacks.size;  // Set total tasks count here
+            this.totalTasks = urlPacks.size;
+            this.totalInitialTasks = urlPacks.size;  // Store initial count
         
             // Process URLs if we have any
             for (const [rkey, urlData] of urlPacks) {
@@ -5174,17 +5192,44 @@ async function main() {
         // Process tasks until none remain
         let processedCount = 0;
         let failedCount = 0;
+        let continueProcessing = true;
 
-        while (processor.taskManager.pendingTasks.size > 0) {
+        while (continueProcessing) {
+            // Check if we have pending tasks
+            if (processor.taskManager.pendingTasks.size === 0) {
+                // Give a chance for new tasks to be added from associated pack discovery
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // Double check if we're really done
+                if (processor.taskManager.pendingTasks.size === 0) {
+                    logger.info('No more tasks to process', {
+                        initialTasks: processor.taskManager.totalInitialTasks,
+                        discoveredTasks: processor.taskManager.newlyDiscoveredTasks,
+                        completedTasks: processor.taskManager.completedTaskCount,
+                        failedTasks: failedCount
+                    });
+                    continueProcessing = false;
+                    continue;
+                }
+            }
+
             const success = await processor.taskManager.processNextTask(processor);
             
-            if (success === null) break; // no more tasks
-            
-            processedCount++;
-            if (!success) failedCount++;
+            if (success !== null) {  // Only count if we actually processed something
+                processedCount++;
+                if (!success) failedCount++;
+            }
 
             // Write checkpoint periodically
             await processor.taskManager.maybeWriteCheckpoint();
+
+            // Log progress
+            logger.debug('Processing status:', {
+                pendingTasks: processor.taskManager.pendingTasks.size,
+                processedCount,
+                failedCount,
+                totalProcessed: processedCount + failedCount
+            });
         }
 
         // Force final checkpoint write

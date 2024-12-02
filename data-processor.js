@@ -1034,12 +1034,22 @@ class FileHandler {
         // Check users.json format
         try {
             const usersContent = await fs.readFile(FILE_PATHS.users, 'utf8');
-            if (usersContent.trim().startsWith('[') || usersContent.trim().startsWith('{')) {
-                // Convert JSON to NDJSON
-                logger.debug(`Converting to NDJSON ...`);
-                const users = JSON.parse(usersContent);
-                await this.convertToNDJSON(FILE_PATHS.users, users);
-                this.fileFormats.set(FILE_PATHS.users, 'ndjson');
+            if (usersContent.trim()) {  // Only process if file is not empty
+                try {
+                    // Try parsing first line to determine format
+                    const firstLine = usersContent.split('\n')[0].trim();
+                    if (firstLine.startsWith('[') || firstLine.startsWith('{')) {
+                        // Convert JSON to NDJSON
+                        logger.debug(`Converting to NDJSON ...`);
+                        const users = JSON.parse(firstLine.startsWith('[') ? usersContent : `[${usersContent}]`);
+                        await this.convertToNDJSON(FILE_PATHS.users, users);
+                    }
+                    this.fileFormats.set(FILE_PATHS.users, 'ndjson');
+                } catch (parseErr) {
+                    // If parse fails, assume it's already NDJSON
+                    logger.debug('Assuming users file is already NDJSON format');
+                    this.fileFormats.set(FILE_PATHS.users, 'ndjson');
+                }
             } else {
                 this.fileFormats.set(FILE_PATHS.users, 'ndjson');
             }
@@ -1052,11 +1062,18 @@ class FileHandler {
         // Check starter_packs.json format
         try {
             const packsContent = await fs.readFile(FILE_PATHS.packs, 'utf8');
-            if (packsContent.trim().startsWith('[') || packsContent.trim().startsWith('{')) {
-                // Convert JSON to NDJSON
-                const packs = JSON.parse(packsContent);
-                await this.convertToNDJSON(FILE_PATHS.packs, packs);
-                this.fileFormats.set(FILE_PATHS.packs, 'ndjson');
+            if (packsContent.trim()) {
+                try {
+                    const firstLine = packsContent.split('\n')[0].trim();
+                    if (firstLine.startsWith('[') || firstLine.startsWith('{')) {
+                        const packs = JSON.parse(firstLine.startsWith('[') ? packsContent : `[${packsContent}]`);
+                        await this.convertToNDJSON(FILE_PATHS.packs, packs);
+                    }
+                    this.fileFormats.set(FILE_PATHS.packs, 'ndjson');
+                } catch (parseErr) {
+                    logger.debug('Assuming packs file is already NDJSON format');
+                    this.fileFormats.set(FILE_PATHS.packs, 'ndjson');
+                }
             } else {
                 this.fileFormats.set(FILE_PATHS.packs, 'ndjson');
             }
@@ -3867,15 +3884,8 @@ async function quickProcessUser(identifier, options = {}) {
             logger.debug(`Quick processing user: ${identifier}`);
         }
 
-        // Get profile
-        const response = await processor.agent.getProfile({ actor: identifier });
-        if (!response?.data) {
-            throw new Error(`Could not find profile for ${identifier}`);
-        }
-
-        // CRITICAL CHANGE: Ensure DB is properly initialized before creating TaskManager
+        // Ensure proper MongoDB initialization and session
         if (!processor.dbManager && !processor.noMongoDB) {
-            // We need to initialize the DB connection first
             const dbType = process.env.DB_TYPE || 'cosmos';
             const dbConfig = {
                 ...DB_CONFIGS[dbType],
@@ -3893,18 +3903,29 @@ async function quickProcessUser(identifier, options = {}) {
                 'starterpacks'
             );
             await processor.dbManager.init(); // This establishes the connection
+            await processor.dbManager.ensureSession(); // Explicitly ensure session
+        } else if (processor.dbManager) {
+            // If dbManager exists, ensure it has a valid session
+            await processor.dbManager.ensureSession();
         }
 
-        // Now create TaskManager with properly initialized DB manager
+        // Now create/verify TaskManager
         if (!processor.taskManager) {
             processor.taskManager = new TaskManager(
                 processor.fileHandler, 
                 debug,
-                processor.dbManager  // Pass the initialized DB manager
+                processor.dbManager
             );
             await processor.taskManager.initializeTaskList();
         }
 
+        // Get profile first to validate user exists
+        const response = await processor.agent.getProfile({ actor: identifier });
+        if (!response?.data) {
+            throw new Error(`Could not find profile for ${identifier}`);
+        }
+
+        // Process profile
         const result = await processor.processProfile(response.data, {
             force,
             processAssociated,

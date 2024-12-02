@@ -974,6 +974,7 @@ class FileHandler {
         this.fileFormats = new Map(); // Track file formats (json/ndjson)
         this.writeLock = false;
         this.writeQueue = [];
+        this.handleCache = new Map();
     }
 
     async init() {
@@ -1194,15 +1195,21 @@ class FileHandler {
                 throw new Error('Invalid user data');
             }
     
-            // Format user data
+            // Format user data - maintain existing structure
             const formattedUser = {
                 did: userData.did,
                 handle: userData.handle,
                 display_name: userData.displayName || '',
-                followers_count: userData.followers || 0,
-                follows_count: userData.following || 0,
+                followers_count: userData.followers || userData.followers_count || 0,
+                follows_count: userData.following || userData.follows_count || 0,
                 last_updated: userData.last_updated,
-                pack_ids: userData.pack_ids || []
+                pack_ids: userData.pack_ids || [],
+                // Add new fields while maintaining backward compatibility
+                handle_history: userData.handle_history || [],
+                description: userData.description || '',
+                avatar: userData.avatar || '',
+                indexed_at: userData.indexed_at || null,
+                created_at: userData.created_at || null
             };
     
             // Update cache
@@ -1220,6 +1227,35 @@ class FileHandler {
         } finally {
             this.releaseLock();
         }
+    }
+
+    async appendUserMetadata(userData) {
+        const metadata = {
+            did: userData.did,
+            handle: userData.handle,
+            display_name: userData.displayName || '',
+            description: userData.description || '',
+            handle_history: userData.handle_history || [],
+            last_updated: new Date().toISOString()
+        };
+
+        // If the user already exists, merge handle history
+        const existing = this.userCache.get(userData.did);
+        if (existing) {
+            if (existing.handle !== userData.handle) {
+                metadata.handle_history = [
+                    ...(existing.handle_history || []),
+                    {
+                        handle: existing.handle,
+                        timestamp: existing.last_updated
+                    }
+                ];
+            } else {
+                metadata.handle_history = existing.handle_history || [];
+            }
+        }
+
+        return metadata;
     }
 
     async appendToUrlsFile(handle, rkey) {
@@ -1356,6 +1392,15 @@ class FileHandler {
         const lastUpdated = new Date(user.last_updated);
         
         if (!existing || lastUpdated > new Date(existing.last_updated)) {
+            // Handle renamed profiles
+            if (existing && existing.handle !== user.handle) {
+                const renameEntry = {
+                    oldHandle: existing.handle,
+                    timestamp: existing.last_updated
+                };
+                user.handle_history = [...(existing.handle_history || []), renameEntry];
+            }
+            
             // Ensure consistent field names
             const formattedUser = {
                 did: user.did,
@@ -1389,6 +1434,28 @@ class FileHandler {
 
     getPack(rkey) {
         return this.packCache.get(rkey);
+    }
+
+    async getUserByHandle(handle) {
+        // Check handle cache first
+        const did = this.handleCache.get(handle);
+        if (did) {
+            return this.userCache.get(did);
+        }
+        return null;
+    }
+
+    async getUserByHistoricalHandle(handle) {
+        const sanitizedHandle = handle.toLowerCase().trim();
+        for (const user of this.userCache.values()) {
+            if (user.handle.toLowerCase() === sanitizedHandle) return user;
+            if (user.handle_history?.some(entry => 
+                entry.oldHandle.toLowerCase() === sanitizedHandle
+            )) {
+                return user;
+            }
+        }
+        return null;
     }
 
     async verifyFileIntegrity() {
@@ -1755,16 +1822,62 @@ class ApiHandler {
 
     async resolveHandle(handle) {
         try {
-            const response = await this.agent.resolveHandle({ handle });
-            return response?.data?.did;
-        } catch (err) {
-            if (err.status === 401) {
-                await this.agent.login({
-                    identifier: process.env.BSKY_USERNAME,
-                    password: process.env.BSKY_PASSWORD
-                });
-                return this.resolveHandle(handle);
+            if (!handle) {
+                throw new Error('No handle provided');
             }
+            // If it's already a DID, return it
+            if (handle.startsWith('did:')) {
+                return handle;
+            }
+
+            // Sanitize the handle
+            const sanitized = handle.trim().toLowerCase();
+            logger.info(`Attempting to resolve sanitized handle: ${sanitized}`);
+
+            // Try public API first
+            try {
+                const publicData = await this.apiHandler.makePublicApiCall(
+                    'com.atproto.identity.resolveHandle',
+                    { handle: sanitized }
+                );
+                if (publicData?.did) return publicData.did;
+            } catch (err) {
+                if (err.status !== 404) {
+                    logger.warn(`Public API handle resolution failed: ${err.message}`);
+                }
+
+                // Only try fallbacks if public API fails
+                // 1. Check local cache for exact handle match
+                const cachedUser = await this.fileHandler.getUser(sanitized);
+                if (cachedUser?.did) return cachedUser.did;
+
+                // 2. Check handle history in local cache
+                const historicalUser = await this.fileHandler.getUserByHistoricalHandle(sanitized);
+                if (historicalUser?.did) {
+                    logger.info(`Found user ${sanitized} in handle history, current handle: ${historicalUser.handle}`);
+                    return historicalUser.did;
+                }
+
+                // 3. Last resort: try search
+                if (err.status === 400) {
+                    try {
+                        const searchResult = await this.apiHandler.makeApiCall(
+                            'app.bsky.actor.searchActors',
+                            { q: sanitized, limit: 1 }
+                        );
+
+                        if (searchResult?.actors?.[0]?.did) {
+                            logger.info(`Found user ${sanitized} via search: ${searchResult.actors[0].did}`);
+                            return searchResult.actors[0].did;
+                        }
+                    } catch (searchErr) {
+                        logger.warn(`Search fallback failed for handle ${sanitized}:`, searchErr);
+                    }
+                }
+                throw err;
+            }
+        } catch (err) {
+            logger.error(`Failed to resolve handle ${handle}:`, err);
             throw err;
         }
     }
@@ -1934,8 +2047,13 @@ class DatabaseManager {
                     await this.session.endSession();
                 }
                 this.session = this.client.startSession();
+                logger.debug('Created new MongoDB session');
             } catch (err) {
                 logger.error('Error creating new session:', err);
+                // Add metrics recording
+                if (this.metrics) {
+                    this.metrics.recordDbOperation('create_session', 0, false);
+                }
                 throw err;
             }
         }
@@ -1979,6 +2097,50 @@ class DatabaseManager {
                     },
                     `create collection ${collection}`
                 );
+            }
+        }
+    }
+
+    async setupIndexes() {
+        if (this.isCosmosDb) return; // Skip for Cosmos DB
+    
+        for (const [collection, indexes] of Object.entries({
+            users: [
+                { key: { did: 1 }, options: { unique: true, background: true } },
+                { key: { handle: 1 }, options: { background: true } },
+                { key: { pack_ids: 1 }, options: { background: true } },
+                { key: { last_updated: 1 }, options: { background: true } },
+                // Add new index for handle history, but don't break existing
+                { key: { 'handle_history.oldHandle': 1 }, options: { 
+                    background: true,
+                    sparse: true  // Only index documents that have handle_history
+                }}
+            ],
+            starter_packs: [
+                { key: { rkey: 1 }, options: { unique: true, background: true } },
+                { key: { creator_did: 1 }, options: { background: true } },
+                { key: { updated_at: 1 }, options: { background: true } }
+            ]
+        })) {
+            const existing = await this.withRetry(
+                () => this.db.collection(collection).indexes(),
+                `get ${collection} indexes`
+            );
+            
+            const existingKeys = new Set(existing.map(idx => JSON.stringify(idx.key)));
+            
+            for (const index of indexes) {
+                const indexKey = JSON.stringify(index.key);
+                if (!existingKeys.has(indexKey)) {
+                    await this.withRetry(
+                        () => this.db.collection(collection).createIndex(
+                            index.key,
+                            index.options
+                        ),
+                        `create index ${collection}.${indexKey}`
+                    );
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
         }
     }
@@ -2245,45 +2407,9 @@ class DatabaseManager {
                err.message?.includes('RetryAfterMs');
     }
 
-    async setupIndexes() {
-        if (this.isCosmosDb) return; // Skip for Cosmos DB
     
-        for (const [collection, indexes] of Object.entries({
-            users: [
-                { key: { did: 1 }, options: { unique: true, background: true } },
-                { key: { handle: 1 }, options: { background: true } }, // Removed unique constraint
-                { key: { pack_ids: 1 }, options: { background: true } },
-                { key: { last_updated: 1 }, options: { background: true } }
-            ],
-            starter_packs: [
-                { key: { rkey: 1 }, options: { unique: true, background: true } },
-                { key: { creator_did: 1 }, options: { background: true } },
-                { key: { updated_at: 1 }, options: { background: true } }
-            ]
-        })) {
-            const existing = await this.withRetry(
-                () => this.db.collection(collection).indexes(),
-                `get ${collection} indexes`
-            );
-            
-            const existingKeys = new Set(existing.map(idx => JSON.stringify(idx.key)));
-    
-            for (const index of indexes) {
-                const indexKey = JSON.stringify(index.key);
-                if (!existingKeys.has(indexKey)) {
-                    await this.withRetry(
-                        () => this.db.collection(collection).createIndex(
-                            index.key,
-                            index.options
-                        ),
-                        `create index ${collection}.${indexKey}`
-                    );
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-            }
-        }
 
-        async cleanup() {
+    async cleanup() {
             if (this.session) {
                 try {
                     await this.session.endSession();
@@ -2300,7 +2426,7 @@ class DatabaseManager {
                 }
             }
         }
-    }
+    
 
     async markPackDeleted(rkey, reason) {
         logger.debug('markPackDeleted');
@@ -2689,6 +2815,13 @@ class MainProcessor {
         const [handle, rkey] = urlLine.split('|').map(s => s.trim());
         if (!handle || !rkey) {
             throw new Error('Invalid URL line format');
+        }
+
+        // check for permanently failed packs
+        const failure = this.taskManager.failures.get(rkey);
+        if (failure?.permanent) {
+            logger.info(`Skipping permanently failed pack ${rkey}`);
+            return false;
         }
 
         logger.info(`Processing pack: ${handle}|${rkey}`);
@@ -3187,22 +3320,31 @@ class MainProcessor {
                 did: profile.did,
                 handle: profile.handle,
                 display_name: profile.displayName || '',
+                description: profile.description || '',  // Add description
+                avatar: profile.avatar || '',           // Add avatar
+                banner: profile.banner || '',           // Add banner
                 followers_count: profile.followersCount,
                 follows_count: profile.followsCount,
+                posts_count: profile.postsCount,        // Add posts count
                 associated: profile.associated || {},
                 last_updated: new Date().toISOString(),
                 pack_ids: [...new Set([...(existing?.pack_ids || []), rkey].filter(Boolean))],
-                handle_history: changes.renamed.length > 0 ? 
-                    [...(existing?.handle_history || []), changes.renamed[0]] : 
-                    existing?.handle_history,
+                indexed_at: profile.indexedAt || null,  // Add indexing timestamp
+                created_at: profile.createdAt || null,  // Add creation timestamp
+                handle_history: existing?.handle_history || [],
                 last_check: new Date()
             };
     
-            if (this.debug) {
-                logger.debug('Prepared user data:', {
-                    userData,
-                    changes
-                });
+            // Handle renamed profiles
+            if (existing && existing.handle !== profile.handle) {
+                const renameEntry = {
+                    did: profile.did,
+                    oldHandle: existing.handle,
+                    newHandle: profile.handle,
+                    timestamp: new Date().toISOString()
+                };
+                userData.handle_history = [...(existing.handle_history || []), renameEntry];
+                changes.renamed.push(renameEntry);
             }
     
             // 6. Save data with proper ordering
@@ -3319,52 +3461,6 @@ class MainProcessor {
                 error: err.message,
                 status: err.status
             };
-        }
-    }
-
-    async resolveHandle(handle) {
-        try {
-            if (!handle) {
-                throw new Error('No handle provided');
-            }
-            // Check if it's already a DID
-            if (handle.startsWith('did:')) {
-                return handle;
-            }
-            // Sanitize the handle
-            const sanitized = this.sanitizeHandle(handle);
-            logger.info(`Attempting to resolve sanitized handle: ${sanitized}`);
-    
-            // Try public API first
-            try {
-                const publicData = await this.makePublicApiCall('com.atproto.identity.resolveHandle', 
-                    { handle });
-                if (publicData?.did) return publicData.did;
-            } catch (err) {
-                if (err.status !== 404) {
-                    logger.warn(`Public API handle resolution failed: ${err.message}`);
-                }
-            }
-
-            // Fall back to authenticated API
-            const response = await this.agent.resolveHandle({ handle });
-            
-            if (response?.data?.did) {
-                logger.info(`Successfully resolved handle ${sanitized} to DID ${response.data.did}`);
-                return response?.data?.did;
-            } else {
-                logger.error(`No DID found in response for handle: ${sanitized}`);
-                return null;
-            }
-        } catch (err) {
-            if (err.status === 401) {
-                await this.agent.login({
-                    identifier: process.env.BSKY_USERNAME,
-                    password: process.env.BSKY_PASSWORD
-                });
-                return this.resolveHandle(handle);
-            }
-            throw err;
         }
     }
 
@@ -3777,10 +3873,36 @@ async function quickProcessUser(identifier, options = {}) {
             throw new Error(`Could not find profile for ${identifier}`);
         }
 
-        // Initialize task manager if needed AND load existing data
+        // CRITICAL CHANGE: Ensure DB is properly initialized before creating TaskManager
+        if (!processor.dbManager && !processor.noMongoDB) {
+            // We need to initialize the DB connection first
+            const dbType = process.env.DB_TYPE || 'cosmos';
+            const dbConfig = {
+                ...DB_CONFIGS[dbType],
+                maxPoolSize: 10,
+                minPoolSize: 5,
+                waitQueueTimeoutMS: 30000,
+                serverSelectionTimeoutMS: 30000
+            };
+
+            processor.mongoClient = new MongoClient(process.env.MONGODB_URI, dbConfig);
+            processor.dbManager = new DatabaseManager(
+                processor.mongoClient,
+                dbType,
+                processor.logger,
+                'starterpacks'
+            );
+            await processor.dbManager.init(); // This establishes the connection
+        }
+
+        // Now create TaskManager with properly initialized DB manager
         if (!processor.taskManager) {
-            processor.taskManager = new TaskManager(processor.fileHandler, debug);
-            await processor.taskManager.initializeTaskList(); // This loads all necessary data
+            processor.taskManager = new TaskManager(
+                processor.fileHandler, 
+                debug,
+                processor.dbManager  // Pass the initialized DB manager
+            );
+            await processor.taskManager.initializeTaskList();
         }
 
         const result = await processor.processProfile(response.data, {
@@ -3789,14 +3911,12 @@ async function quickProcessUser(identifier, options = {}) {
             debug
         });
 
-        // Process tasks until completion, including associated packs
+        // Process tasks until completion
         while (processor.taskManager.pendingTasks.size > 0) {
             await processor.taskManager.processNextTask(processor);
-            // Write checkpoint periodically
             await processor.taskManager.maybeWriteCheckpoint();
         }
 
-        // Force final checkpoint write
         await processor.taskManager.maybeWriteCheckpoint(true);
 
         return result;
@@ -3875,6 +3995,11 @@ class TaskManager {
         this.fileHandler = fileHandler;
         this.debug = debug;
         this.dbManager = dbManager;
+
+        if (!this.noMongoDB && !dbManager) {
+            throw new Error('Database manager is required when MongoDB is enabled');
+        }
+
         this.pendingTasks = new Map();
         this.completedTasks = new Set();
         this.failures = new Map();
@@ -3892,6 +4017,10 @@ class TaskManager {
 
     async initializeTaskList() {
         try {
+            if (this.dbManager && !this.noMongoDB) {
+                await this.dbManager.ensureSession();
+            }
+
             // Try to load checkpoint first, but don't fail if missing/corrupt
             let checkpoint = null;
             try {

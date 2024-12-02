@@ -29,7 +29,7 @@ const DB_CONFIGS = {
 
 const BATCH_SIZES = {
     cosmos: 10,
-    mongodb: 100
+    mongodb: 1000
 };
 
 const DB_INFO = {
@@ -2357,10 +2357,9 @@ class DatabaseManager {
             logger.debug('No operations to bulk write');
             return;
         }
-        
+    
         const formattedOps = operations.map(op => {
             if (!op.updateOne && !op.insertOne && !op.deleteOne) {
-                // Convert to proper format if needed
                 return {
                     updateOne: {
                         filter: op.filter,
@@ -2371,14 +2370,12 @@ class DatabaseManager {
             }
             return op;
         });
-        
+    
         if (this.isCosmosDb) {
-            // For Cosmos DB, process operations sequentially
-            const batchSize = 1; // Process one at a time for maximum safety
-            
+            // Use defined Cosmos DB batch size
+            const batchSize = BATCH_SIZES.cosmos;
             for (let i = 0; i < operations.length; i += batchSize) {
                 const batch = operations.slice(i, i + batchSize);
-                
                 for (const op of batch) {
                     await this.safeWrite(collection, {
                         filter: op.filter || op.updateOne.filter,
@@ -2386,40 +2383,62 @@ class DatabaseManager {
                         upsert: true
                     }, options);
                 }
-
-                // Log progress periodically
                 if ((i + batchSize) % 10 === 0) {
                     const progress = ((i + batch.length) / operations.length * 100).toFixed(1);
                     this.logger?.info(`Processed ${i + batch.length}/${operations.length} operations (${progress}%)`);
                 }
             }
         } else {
-            try {
-                    // Original MongoDB bulk write logic
-                await this.db.collection(collection).bulkWrite(formattedOps, {
-                    ordered: false,
-                    ...options
-                });
-            } catch (err) {
-                // Handle bulk write errors
-                if (err.code === 11000) { // Duplicate key error
-                    logger.warn(`Duplicate key errors in bulk write, falling back to individual writes`);
-                    for (const op of formattedOps) {
-                        try {
-                            await this.safeWrite(collection, {
-                                filter: op.updateOne.filter,
-                                update: op.updateOne.update
-                            });
-                        } catch (innerErr) {
-                            if (innerErr.code !== 11000) throw innerErr;
-                        }
-                    }
-                } else {
-                    throw err;
-                }
+            // Use defined MongoDB batch size
+            const batchSize = BATCH_SIZES.mongodb;
+            const batches = [];
+            
+            // Split into batches
+            for (let i = 0; i < formattedOps.length; i += batchSize) {
+                batches.push(formattedOps.slice(i, i + batchSize));
             }
-        } 
-        
+    
+            try {
+                // Process batches in parallel with a concurrency limit
+                const concurrencyLimit = 3;  // Reduced for consistency with batch size
+                for (let i = 0; i < batches.length; i += concurrencyLimit) {
+                    const currentBatches = batches.slice(i, i + concurrencyLimit);
+                    await Promise.all(currentBatches.map(async batch => {
+                        try {
+                            await this.db.collection(collection).bulkWrite(batch, {
+                                ordered: false,
+                                ...options,
+                                session: this.session
+                            });
+                        } catch (err) {
+                            if (err.code === 11000) {
+                                logger.warn(`Handling duplicates in batch of ${batch.length} operations`);
+                                for (const op of batch) {
+                                    try {
+                                        await this.safeWrite(collection, {
+                                            filter: op.updateOne.filter,
+                                            update: op.updateOne.update
+                                        });
+                                    } catch (innerErr) {
+                                        if (innerErr.code !== 11000) throw innerErr;
+                                    }
+                                }
+                            } else {
+                                throw err;
+                            }
+                        }
+                    }));
+    
+                    // Log progress
+                    const processedOps = Math.min((i + concurrencyLimit) * batchSize, formattedOps.length);
+                    const progress = (processedOps / formattedOps.length * 100).toFixed(1);
+                    logger.info(`Processed ${processedOps}/${formattedOps.length} operations (${progress}%)`);
+                }
+            } catch (err) {
+                logger.error('Bulk write error:', err);
+                throw err;
+            }
+        }
     }
 
     isCosmosThrottlingError(err) {
@@ -2787,8 +2806,8 @@ class MainProcessor {
                 const dbType = process.env.DB_TYPE || 'cosmos';
                 const dbConfig = {
                     ...DB_CONFIGS[dbType],
-                    maxPoolSize: 10,
-                    minPoolSize: 5,
+                    maxPoolSize: 50,
+                    minPoolSize: 10,
                     waitQueueTimeoutMS: 30000,
                     serverSelectionTimeoutMS: 30000
                 };
@@ -3641,7 +3660,12 @@ class MainProcessor {
                 }
             }));
     
-            await this.dbManager.safeBulkWrite('users', userOperations);
+            // await this.dbManager.safeBulkWrite('users', userOperations);
+            const batchSize = 100;
+            for (let i = 0; i < users.length; i += batchSize) {
+                const batch = users.slice(i, i + batchSize);
+                await this.dbManager.safeBulkWrite('users', batch);
+            }
     
             if (this.debug) {
                 const counts = await this.dbManager.getCollectionCounts();
@@ -3754,9 +3778,9 @@ class MainProcessor {
 class RateLimiter {
     constructor() {
         this.requestWindow = 5 * 60 * 1000;  // 5 minutes
-        this.maxRequests = 5000;
+        this.maxRequests = 7500;
         this.requests = [];
-        this.safetyFactor = 0.9;  // Use 90% of max rate
+        this.safetyFactor = 0.95;  // Use 95% of max rate
         this.initialBackoff = 1000;
         this.maxBackoff = 30000;
         this.currentBackoff = this.initialBackoff;
@@ -4124,6 +4148,30 @@ class TaskManager {
         this.currentPackUsersProcessed = 0;
         this.newlyDiscoveredTasks = 0;
         this.totalInitialTasks = 0;
+        this.discoveredPacksMap = new Map();
+    }
+
+    async processBatch(processor, batchSize = 5) {
+        const tasks = [];
+        for (let i = 0; i < batchSize; i++) {
+            const task = await this.getNextTask();
+            if (task) tasks.push(task);
+        }
+
+        if (tasks.length === 0) return null;
+
+        const results = await Promise.all(
+            tasks.map(task => processor.processStarterPack(`${task.handle}|${task.rkey}`))
+        );
+
+        for (let i = 0; i < tasks.length; i++) {
+            if (results[i]) {
+                this.completedTasks.add(tasks[i].rkey);
+                this.pendingTasks.delete(tasks[i].rkey);
+            }
+        }
+
+        return results.some(r => r);
     }
 
     async initializeTaskList() {
@@ -4647,6 +4695,7 @@ class TaskManager {
             progress: {
                 initialTasks: this.totalInitialTasks,
                 discoveredTasks: this.newlyDiscoveredTasks,
+                discoveredPacks: Array.from(this.discoveredPacksMap.entries()),
                 completedTasks: this.completedTaskCount
             }
         };
@@ -4808,6 +4857,23 @@ class TaskManager {
     async addAssociatedPack(packInfo, parentDid) {
         const priority = this.calculateDynamicPriority(packInfo);
 
+        // Only count as newly discovered if we haven't seen it before
+        if (!this.discoveredPacksMap.has(packInfo.rkey)) {
+            this.newlyDiscoveredTasks++;
+            this.discoveredPacksMap.set(packInfo.rkey, {
+                discoveredAt: new Date().toISOString(),
+                discoveredFrom: parentDid
+            });
+            this.totalTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
+            
+            logger.debug('New pack discovered:', {
+                rkey: packInfo.rkey,
+                from: parentDid,
+                totalDiscovered: this.newlyDiscoveredTasks,
+                newTotal: this.totalTasks
+            });
+        }
+
         // Add to URLs file first
         await this.fileHandler.appendToUrlsFile(packInfo.creator, packInfo.rkey);
         
@@ -4822,7 +4888,8 @@ class TaskManager {
         });
 
         if (added) {
-            this.recordNewlyDiscoveredTask();
+            this.recordPackRelationship(packInfo.rkey, parentDid);
+            await this.maybeWriteCheckpoint();
         }
 
         return added;
@@ -4845,13 +4912,15 @@ class TaskManager {
         if (!task) return null;
 
         this.completedTaskCount++;
-        const totalExpectedTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
-        const progress = ((this.completedTaskCount / totalExpectedTasks) * 100).toFixed(1);
-        logger.info(`Processing pack ${this.completedTaskCount}/${totalExpectedTasks}: ${task.rkey} (${task.handle})`, {
+        const totalTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
+        const progress = ((this.completedTaskCount / totalTasks) * 100).toFixed(1);
+        
+        logger.info(`Processing pack ${this.completedTaskCount}/${totalTasks}: ${task.rkey} (${task.handle})`, {
             initialTasks: this.totalInitialTasks,
             discovered: this.newlyDiscoveredTasks,
             completed: this.completedTaskCount,
-            pending: this.pendingTasks.size
+            pending: this.pendingTasks.size,
+            discoveredPacks: this.discoveredPacksMap.size
         });
 
         try {
@@ -4861,7 +4930,11 @@ class TaskManager {
                 this.completedTasks.add(task.rkey);
                 this.pendingTasks.delete(task.rkey);
                 this.markDirty();
-                logger.info(`Pack processing complete (${progress}% overall progress)`);
+                logger.info(`Pack processing complete (${progress}% overall progress)`, {
+                    totalPacks: totalTasks,
+                    processed: this.completedTaskCount,
+                    discovered: this.newlyDiscoveredTasks
+                });
             }
 
             return success;
@@ -5198,7 +5271,7 @@ async function main() {
             // Check if we have pending tasks
             if (processor.taskManager.pendingTasks.size === 0) {
                 // Give a chance for new tasks to be added from associated pack discovery
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                await new Promise(resolve => setTimeout(resolve, 500));
                 
                 // Double check if we're really done
                 if (processor.taskManager.pendingTasks.size === 0) {
@@ -5213,7 +5286,10 @@ async function main() {
                 }
             }
 
-            const success = await processor.taskManager.processNextTask(processor);
+            //use this for single task
+            //const success = await processor.taskManager.processNextTask(processor);
+            //multitask
+            const success = await processor.taskManager.processBatch(processor);
             
             if (success !== null) {  // Only count if we actually processed something
                 processedCount++;

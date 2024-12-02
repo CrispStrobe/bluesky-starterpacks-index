@@ -118,10 +118,8 @@ const logger = winston.createLogger({
             format: winston.format.combine(
                 winston.format.colorize(),
                 winston.format.simple(),
-                winston.format.printf(({ timestamp, level, message, ...meta }) => {
-                    let metaStr = Object.keys(meta).length ? 
-                        '\n' + JSON.stringify(meta, null, 2) : '';
-                    return `${timestamp} [${level}]: ${message}${metaStr}`;
+                winston.format.printf(({ timestamp, level, message }) => {
+                    return `${timestamp} [${level}]: ${message}`;
                 })
             )
         }),
@@ -3130,7 +3128,7 @@ class MainProcessor {
 
     async processAssociatedPacks(profile, options = {}) {
         const {
-            maxDepth = MAX_PACK_DEPTH,  // Now using the global constant
+            maxDepth = MAX_PACK_DEPTH,
             processedDIDs = new Set(),
             currentDepth = 0,
             parentHandle = null
@@ -3143,12 +3141,21 @@ class MainProcessor {
             failed: 0
         };
     
-        if (currentDepth >= maxDepth || processedDIDs.has(profile.did)) {
-            logger.debug(`Skipping associated packs for ${profile.did} (depth: ${currentDepth}, maxDepth: ${maxDepth})`);
+        // First check depth and DID processing status
+        if (currentDepth >= maxDepth) {
+            logger.debug(`Max depth reached for ${profile.handle} (depth: ${currentDepth})`);
+            return results;
+        }
+    
+        // Skip if we've already processed this profile at this depth or shallower
+        if (processedDIDs.has(profile.did)) {
+            logger.debug(`Already processed packs for ${profile.handle}`);
             return results;
         }
     
         processedDIDs.add(profile.did);
+        this.processedProfiles = this.processedProfiles || new Set();
+        this.processedProfiles.add(profile.did);
     
         try {
             // Get packs for current profile
@@ -3160,17 +3167,33 @@ class MainProcessor {
             }
     
             results.discovered = packs.starterPacks.length;
-            logger.info(`Found ${results.discovered} associated packs for ${profile.handle}`);
-    
-            // Process each pack
+            const uniquePacks = new Set(); // Track unique packs in this discovery
+            
+            // First pass: collect unique packs
             for (const pack of packs.starterPacks) {
                 try {
                     const rkey = await this.extractRkeyFromURI(pack.uri);
-
-                    // Add to URLs file
+                    if (!uniquePacks.has(rkey)) {
+                        uniquePacks.add(rkey);
+                    }
+                } catch (err) {
+                    results.failed++;
+                    logger.error(`Failed to extract rkey from pack ${pack.uri}:`, err);
+                }
+            }
+    
+            if (uniquePacks.size > 0) {
+                logger.info(`Found ${uniquePacks.size} unique associated packs for ${profile.handle}`);
+            }
+    
+            // Second pass: process unique packs
+            for (const rkey of uniquePacks) {
+                try {
+                    // Add to URLs file first
                     await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
                     
-                    const shouldProcess = this.taskManager.shouldProcessPack(
+                    // Check if we should process this pack
+                    const shouldProcess = await this.taskManager.shouldProcessPack(
                         rkey,
                         await this.fileHandler.getPack(rkey),
                         this.taskManager.failures.get(rkey)
@@ -3182,42 +3205,51 @@ class MainProcessor {
                         continue;
                     }
     
+                    // Check if pack is already being processed
+                    if (this.taskManager.pendingTasks.has(rkey) || 
+                        this.taskManager.completedTasks.has(rkey)) {
+                        results.skipped++;
+                        continue;
+                    }
+    
                     // Add to task queue
                     const added = await this.taskManager.addAssociatedPack({
                         creator: profile.handle,
                         rkey,
-                        memberCount: pack.starterPack?.record?.items?.length || 0,
-                        updatedAt: pack.starterPack?.record?.createdAt || new Date().toISOString()
+                        memberCount: packs.starterPacks.find(p => p.uri.includes(rkey))?.starterPack?.record?.items?.length || 0,
+                        updatedAt: new Date().toISOString(),
+                        discoveryDepth: currentDepth
                     }, profile.did);
     
                     if (added) {
                         results.queued++;
-                        this.taskManager.markDirty();  // Mark for checkpoint update
+                        this.taskManager.markDirty();
                         this.taskManager.recordPackRelationship(rkey, profile.did);
                         await this.taskManager.maybeWriteCheckpoint();
-                        logger.info(`Queued associated pack ${rkey} from ${profile.handle}`);
+                        logger.info(`Queued new associated pack ${rkey} from ${profile.handle} (depth: ${currentDepth})`);
                     } else {
                         results.skipped++;
                     }
     
                 } catch (err) {
                     results.failed++;
-                    logger.error(`Failed to process associated pack ${pack.uri}:`, err);
+                    logger.error(`Failed to process associated pack ${rkey}:`, err);
                 }
     
                 await this.rateLimiter.throttle();
             }
     
             metrics.recordAssociatedPacksMetrics(results);
-
+    
             if (this.debug) {
                 logger.debug('Associated packs processing complete', {
                     profile: profile.handle,
                     results,
-                    depth: currentDepth
+                    depth: currentDepth,
+                    uniquePacks: uniquePacks.size
                 });
             }
-
+    
             return results;
     
         } catch (err) {
@@ -4149,28 +4181,37 @@ class TaskManager {
         this.newlyDiscoveredTasks = 0;
         this.totalInitialTasks = 0;
         this.discoveredPacksMap = new Map();
+        this.processingDiscoveredTasks = false;
+        this.discoveredTasksQueue = new Set();
+        this.processedProfiles = new Set();  // Track which profiles we've checked for packs
     }
 
     async processBatch(processor, batchSize = 5) {
         const tasks = [];
-        for (let i = 0; i < batchSize; i++) {
+        const seenRkeys = new Set();
+        
+        // Get unique tasks
+        while (tasks.length < batchSize && this.pendingTasks.size > 0) {
             const task = await this.getNextTask();
-            if (task) tasks.push(task);
+            if (task && !seenRkeys.has(task.rkey)) {
+                tasks.push(task);
+                seenRkeys.add(task.rkey);
+            }
         }
-
+    
         if (tasks.length === 0) return null;
-
+    
         const results = await Promise.all(
             tasks.map(task => processor.processStarterPack(`${task.handle}|${task.rkey}`))
         );
-
+    
         for (let i = 0; i < tasks.length; i++) {
             if (results[i]) {
                 this.completedTasks.add(tasks[i].rkey);
                 this.pendingTasks.delete(tasks[i].rkey);
             }
         }
-
+    
         return results.some(r => r);
     }
 
@@ -4888,8 +4929,11 @@ class TaskManager {
         });
 
         if (added) {
+            this.processingDiscoveredTasks = true;
+            this.discoveredTasksQueue.add(packInfo.rkey);
             this.recordPackRelationship(packInfo.rkey, parentDid);
             await this.maybeWriteCheckpoint();
+            logger.info(`Queued associated pack ${packInfo.rkey} from ${parentDid}`);
         }
 
         return added;
@@ -4908,20 +4952,20 @@ class TaskManager {
     }
 
     async processNextTask(processor) {
+        if (this.pendingTasks.size === 0 && this.discoveredTasksQueue.size > 0) {
+            this.processingDiscoveredTasks = true;
+        }
+
         const task = await this.getNextTask();
         if (!task) return null;
 
         this.completedTaskCount++;
         const totalTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
-        const progress = ((this.completedTaskCount / totalTasks) * 100).toFixed(1);
+        const progress = this.processingDiscoveredTasks ? 
+            'Processing discovered packs' :
+            `Processing pack ${this.completedTaskCount}/${this.totalTasks + this.newlyDiscoveredTasks}`;
         
-        logger.info(`Processing pack ${this.completedTaskCount}/${totalTasks}: ${task.rkey} (${task.handle})`, {
-            initialTasks: this.totalInitialTasks,
-            discovered: this.newlyDiscoveredTasks,
-            completed: this.completedTaskCount,
-            pending: this.pendingTasks.size,
-            discoveredPacks: this.discoveredPacksMap.size
-        });
+        logger.info(`${progress}: ${task.rkey} (${task.handle})`);
 
         try {
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
@@ -4929,6 +4973,7 @@ class TaskManager {
             if (success) {
                 this.completedTasks.add(task.rkey);
                 this.pendingTasks.delete(task.rkey);
+                this.discoveredTasksQueue.delete(task.rkey);
                 this.markDirty();
                 logger.info(`Pack processing complete (${progress}% overall progress)`, {
                     totalPacks: totalTasks,
@@ -4942,6 +4987,12 @@ class TaskManager {
             logger.error(`Error processing task ${task.rkey}:`, err);
             return false;
         }
+    }
+
+    hasMoreWork() {
+        return this.pendingTasks.size > 0 || 
+               this.discoveredTasksQueue.size > 0 || 
+               this.processingDiscoveredTasks;
     }
 
     recordNewlyDiscoveredTask() {
@@ -5265,39 +5316,21 @@ async function main() {
         // Process tasks until none remain
         let processedCount = 0;
         let failedCount = 0;
-        let continueProcessing = true;
 
-        while (continueProcessing) {
-            // Check if we have pending tasks
-            if (processor.taskManager.pendingTasks.size === 0) {
-                // Give a chance for new tasks to be added from associated pack discovery
-                await new Promise(resolve => setTimeout(resolve, 500));
-                
-                // Double check if we're really done
-                if (processor.taskManager.pendingTasks.size === 0) {
-                    logger.info('No more tasks to process', {
-                        initialTasks: processor.taskManager.totalInitialTasks,
-                        discoveredTasks: processor.taskManager.newlyDiscoveredTasks,
-                        completedTasks: processor.taskManager.completedTaskCount,
-                        failedTasks: failedCount
-                    });
-                    continueProcessing = false;
-                    continue;
-                }
-            }
-
-            //use this for single task
-            //const success = await processor.taskManager.processNextTask(processor);
-            //multitask
-            const success = await processor.taskManager.processBatch(processor);
+        while (processor.taskManager.hasMoreWork()) {
+            const success = await processor.taskManager.processNextTask(processor);
             
-            if (success !== null) {  // Only count if we actually processed something
-                processedCount++;
-                if (!success) failedCount++;
+            if (success !== null) {
+                if (success) processedCount++;
+                else failedCount++;
             }
 
-            // Write checkpoint periodically
             await processor.taskManager.maybeWriteCheckpoint();
+
+            // Give a small delay to allow for task discovery
+            if (processor.taskManager.pendingTasks.size === 0) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
 
             // Log progress
             logger.debug('Processing status:', {

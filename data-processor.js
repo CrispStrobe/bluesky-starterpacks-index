@@ -3982,51 +3982,7 @@ async function handleShutdown(signal, currentProcessor = null) {
 
 // Quick process functions
 async function handleQuickProcess(args, processor, startTime) {
-    if (args.addUser) {
-        logger.debug('Commencing quick user addition');
-        const result = await quickProcessUser(args.addUser, {
-            processor,
-            force: args.force,
-            debug: args.debug,
-            processAssociated: true
-        });
-
-        // Force checkpoint write after processing
-        await processor.taskManager.maybeWriteCheckpoint(true);
-
-        if (processor.debug) {
-            logger.debug('User processing completed', {
-                changes: result.changes,
-                timing: {
-                    total: Date.now() - startTime
-                }
-            });
-        }
-
-        if (args.addPack) {
-            await quickProcessPack(args.addPack, { processor });
-            // Force another checkpoint write
-            await processor.taskManager.maybeWriteCheckpoint(true);
-        }
-
-        return result;
-    }
-
-    if (args.addPack) {
-        const result = await quickProcessPack(args.addPack, { processor });
-        await processor.taskManager.maybeWriteCheckpoint(true);
-        return result;
-    }
-}
-
-async function quickProcessUser(identifier, options = {}) {
-    const { processor, force = false, debug = false, processAssociated = true } = options;
-    
     try {
-        if (debug) {
-            logger.debug(`Quick processing user: ${identifier}`);
-        }
-
         // Ensure proper MongoDB initialization and session
         if (!processor.dbManager && !processor.noMongoDB) {
             const dbType = process.env.DB_TYPE || 'cosmos';
@@ -4069,6 +4025,55 @@ async function quickProcessUser(identifier, options = {}) {
             processor.taskManager.completedTasks = new Set();
             processor.taskManager.failures = new Map();
         }
+        
+        if (args.addUser) {
+            logger.debug('Commencing quick user addition');
+            const result = await quickProcessUser(args.addUser, {
+                processor,
+                force: args.force,
+                debug: args.debug,
+                processAssociated: true
+            });
+
+            // Force checkpoint write after processing
+            await processor.taskManager.maybeWriteCheckpoint(true);
+
+            if (processor.debug) {
+                logger.debug('User processing completed', {
+                    changes: result.changes,
+                    timing: {
+                        total: Date.now() - startTime
+                    }
+                });
+            }
+
+            if (args.addPack) {
+                await quickProcessPack(args.addPack, { processor });
+                // Force another checkpoint write
+                await processor.taskManager.maybeWriteCheckpoint(true);
+            }
+
+            return result;
+        }
+
+        if (args.addPack) {
+            const result = await quickProcessPack(args.addPack, { processor });
+            await processor.taskManager.maybeWriteCheckpoint(true);
+            return result;
+        }
+    } catch (err) {
+        logger.error(`Error setting up quick processing:`, err);
+        throw err;
+    }
+}
+
+async function quickProcessUser(identifier, options = {}) {
+    const { processor, force = false, debug = false, processAssociated = true } = options;
+    
+    try {
+        if (debug) {
+            logger.debug(`Quick processing user: ${identifier}`);
+        }
 
         // Get and process ONLY the specified user
         const response = await processor.agent.getProfile({ actor: identifier });
@@ -4084,10 +4089,19 @@ async function quickProcessUser(identifier, options = {}) {
             source: 'quick_process'  // Mark as quick process source
         });
 
-        // Process ONLY the discovered tasks from this user
-        while (processor.taskManager.pendingTasks.size > 0) {
-            await processor.taskManager.processNextTask(processor);
-            await processor.taskManager.maybeWriteCheckpoint();
+        // Now process any discovered packs
+        if (processAssociated && processor.taskManager.pendingTasks.size > 0) {
+            logger.debug(`Processing ${processor.taskManager.pendingTasks.size} discovered packs`);
+            
+            while (processor.taskManager.pendingTasks.size > 0) {
+                const success = await processor.taskManager.processNextTask(processor);
+                if (success) {
+                    result.changes.packs.processed = (result.changes.packs.processed || 0) + 1;
+                } else {
+                    result.changes.packs.failed = (result.changes.packs.failed || 0) + 1;
+                }
+                await processor.taskManager.maybeWriteCheckpoint();
+            }
         }
 
         return result;
@@ -4101,23 +4115,6 @@ async function quickProcessPack(identifier, options = {}) {
     const { processor } = options;
 
     try {
-        // Initialize task manager if needed, do NOT load all existing data
-        if (!processor.taskManager) {
-            processor.taskManager = new TaskManager(
-                processor.fileHandler,
-                processor.debug,
-                processor.dbManager
-            );
-            
-            // Only load existing data, don't build full task list
-            const { packs: existingPacks } = await processor.taskManager.loadExistingData();
-            processor.taskManager.existingPacks = existingPacks;
-            
-            // Initialize empty task tracking
-            processor.taskManager.pendingTasks = new Map();
-            processor.taskManager.completedTasks = new Set();
-            processor.taskManager.failures = new Map();
-        }
 
         // Add ONLY the specified pack
         let urlLine;
@@ -4133,9 +4130,10 @@ async function quickProcessPack(identifier, options = {}) {
         }
 
         // Add as single initial task
+        const [handle, rkey] = urlLine.split('|');
         await processor.taskManager.addTask({
-            handle: urlLine.split('|')[0],
-            rkey: urlLine.split('|')[1],
+            handle,
+            rkey,
             priority: 1,
             source: 'quick_process'
         });
@@ -4143,6 +4141,9 @@ async function quickProcessPack(identifier, options = {}) {
         // Process this pack and any discovered related tasks
         while (processor.taskManager.pendingTasks.size > 0) {
             const success = await processor.taskManager.processNextTask(processor);
+            if (success) {
+                processor.taskManager.markTaskCompleted(rkey);
+            }
             await processor.taskManager.maybeWriteCheckpoint();
         }
 

@@ -3841,6 +3841,7 @@ async function handleShutdown(signal, currentProcessor = null) {
 // Quick process functions
 async function handleQuickProcess(args, processor, startTime) {
     if (args.addUser) {
+        logger.debug('Commencing quick user addition');
         const result = await quickProcessUser(args.addUser, {
             processor,
             force: args.force,
@@ -5052,7 +5053,7 @@ async function main() {
         process.on('SIGINT', () => handleShutdown('SIGINT', processor));
         process.on('SIGTERM', () => handleShutdown('SIGTERM', processor));
 
-        logger.info('Initialization complete');
+        logger.info('Processor initialization complete');
 
         // Handle maintenance commands first
         if (args.purge || args.cleanFiles) {
@@ -5062,6 +5063,7 @@ async function main() {
 
         // Handle single-item processing
         if (args.addUser || args.addPack) {
+            logger.debug('Commencing quick process handling');
             const result = await handleQuickProcess(args, processor);
             return result;
         }

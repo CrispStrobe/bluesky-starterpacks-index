@@ -81,6 +81,9 @@ const BATCH_SIZE = BATCH_SIZES[DB_TYPE] || BATCH_SIZES.mongodb;
 
 const MAX_PACK_DEPTH = process.env.MAX_PACK_DEPTH || 2 // Controls how deep to go when discovering associated packs
 
+const MAX_RETRY_ATTEMPTS = 3;
+const MONGODB_TIMEOUT = 5000;
+
 // Error types
 const ERROR_TYPES = {
     RATE_LIMIT: 'RATE_LIMIT',
@@ -2458,7 +2461,7 @@ class DatabaseManager {
     
         if (this.isCosmosDb) {
             // Use defined Cosmos DB batch size
-            const batchSize = BATCH_SIZES.cosmos;
+            const batchSize = BATCH_SIZES[this.dbType] || BATCH_SIZES.mongodb;
             for (let i = 0; i < operations.length; i += batchSize) {
                 const batch = operations.slice(i, i + batchSize);
                 for (const op of batch) {
@@ -2533,8 +2536,6 @@ class DatabaseManager {
                err.message?.includes('Request rate is large') ||
                err.message?.includes('RetryAfterMs');
     }
-
-    
 
     async cleanup() {
             if (this.session) {
@@ -3324,6 +3325,10 @@ class MainProcessor {
                 const publicData = await this.apiHandler.makeApiCall('app.bsky.actor.getProfile', { actor: did });
                 if (publicData) return publicData;
             } catch (err) {
+                if (this.isRateLimitError(err)) {
+                    await this.rateLimiter.handleResponse(err);
+                    return this.getProfile(did);
+                }
                 if (err.status !== 404) {
                     logger.warn(`Public API profile fetch failed for ${did}: ${err.message}`);
                 }
@@ -3340,6 +3345,10 @@ class MainProcessor {
                 });
                 return this.getProfile(did);
             }
+            if (this.isRateLimitError(err)) {
+                await this.rateLimiter.handleResponse(err);
+                return this.getProfile(did);
+            }
             throw err;
         }
     }
@@ -3349,6 +3358,7 @@ class MainProcessor {
             maxDepth = MAX_PACK_DEPTH,
             processedDIDs = new Set(),
             currentDepth = 0,
+            parentDid = null,
             parentHandle = null
         } = options;
     
@@ -3403,7 +3413,7 @@ class MainProcessor {
             }
 
             // Add created_packs to MongoDB record
-            if (!processor.noMongoDB) {
+            if (!this.noMongoDB) { 
                 // Update user's created_packs atomically
                 if (createdPacks.length > 0) {
                     await this.dbManager.safeWrite('users', {
@@ -3418,9 +3428,9 @@ class MainProcessor {
             }
 
             // Update file handler
-            const existingUser = await processor.fileHandler.getUser(profile.did);
+            const existingUser = await this.fileHandler.getUser(profile.did);
             if (existingUser) {
-                await processor.fileHandler.appendUser({
+                await this.fileHandler.appendUser({
                     ...existingUser,
                     created_packs: [...new Set([
                         ...(existingUser.created_packs || []),
@@ -3825,7 +3835,7 @@ class MainProcessor {
                 seenDids.add(memberDid);
                 
                 // Get full profile for the member to check for associated packs
-                const memberProfile = await this.apiHandler.getProfile(member.subject.did);
+                const memberProfile = await this.apiHandler.getProfile(memberDid);
                 logger.debug(`Full profile for member ${processedCount} of pack ${packRkey}:`, memberProfile);
                 
                 if (memberProfile) {
@@ -3863,9 +3873,13 @@ class MainProcessor {
                     });
                 }
             } catch (err) {
+                if (this.isRateLimitError(err)) {
+                    await this.rateLimiter.handleResponse(err);
+                    continue;
+                }
                 logger.warn(`Failed to process member in pack ${packRkey}:`, err);
                 if (err.status === 404) {
-                    this.taskManager.recordMissingProfile(member.did);
+                    this.taskManager.recordMissingProfile(memberDid);
                 }
             }
         }
@@ -3901,7 +3915,8 @@ class MainProcessor {
             }));
     
             // await this.dbManager.safeBulkWrite('users', userOperations);
-            const batchSize = 100;
+            const dbType = process.env.DB_TYPE || 'cosmos';
+            const batchSize = BATCH_SIZES[dbType];
             /* for (let i = 0; i < users.length; i += batchSize) {
                 const batch = users.slice(i, i + batchSize);
                 await this.dbManager.safeBulkWrite('users', batch);

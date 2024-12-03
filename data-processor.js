@@ -4258,7 +4258,7 @@ async function handleMaintenanceCommands(args, processor) {
 
 // Quick process functions
 async function handleQuickProcess(args, processor, startTime) {
-    
+
     try {
         // Ensure proper MongoDB initialization and session
         if (!processor.dbManager && !processor.noMongoDB) {
@@ -4683,37 +4683,43 @@ class TaskManager {
                 !this.dbManager.noDBWrites && 
                 this.dbManager.db) {
                 
-                // Ensure we have a valid session before MongoDB operations
-                await this.dbManager.ensureSession();
-                
-                // Now use the session in the query
-                const collection = this.dbManager.db.collection('starter_packs');
-                if (collection) {
-                    const mongoDbPack = await collection.findOne(
-                        { rkey: rkey },
-                        { session: this.dbManager.session }  // Use the session here
-                    );
+                try {
+                    // Add timeout to MongoDB operation
+                    const mongoPromise = this.dbManager.db.collection('starter_packs')
+                        .findOne({ rkey: rkey }, { session: this.dbManager.session });
+                    
+                    // Set timeout for operation
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('MongoDB operation timed out')), 5000));
+
+                    // Race between MongoDB operation and timeout
+                    const mongoDbPack = await Promise.race([mongoPromise, timeoutPromise])
+                        .catch(err => {
+                            logger.debug(`MongoDB check timed out for pack ${rkey}, proceeding with file check`);
+                            return null;
+                        });
                     
                     if (mongoDbPack) {
                         const lastUpdate = new Date(mongoDbPack.updated_at);
                         const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
                         
                         if (daysSinceUpdate < 10) {
-                            logger.debug(`Pack ${rkey} was recently processed in MongoDB`);
                             return { process: false, reason: 'recently_processed_in_mongodb' };
                         }
                         
-                        logger.debug(`Pack ${rkey} exists in MongoDB but needs update`);
                         return { 
                             process: true, 
                             lowPriority: true,
                             reason: 'mongodb_needs_update' 
                         };
                     }
+                } catch (err) {
+                    // Log at debug level since this is expected sometimes
+                    logger.debug(`MongoDB check skipped for pack ${rkey}, falling back to file check`);
                 }
             }
 
-            // If we have an existing pack in local files, check its age
+            // If no MongoDB or MongoDB check failed, fall back to file check
             if (existingPack) {
                 const lastUpdate = new Date(existingPack.updated_at);
                 const daysSinceUpdate = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24);
@@ -4735,10 +4741,10 @@ class TaskManager {
             }
 
             return { process: true };
-            
+                
         } catch (err) {
-            logger.warn(`MongoDB check skipped for pack ${rkey}: ${err.message}`);
-            // If MongoDB check fails, fall back to file-based checks
+            // Log at debug level and fall back to processing
+            logger.debug(`Error in shouldProcessPack for ${rkey}, defaulting to process: ${err.message}`);
             return { process: true };
         }
     }

@@ -4258,6 +4258,7 @@ async function handleMaintenanceCommands(args, processor) {
 
 // Quick process functions
 async function handleQuickProcess(args, processor, startTime) {
+    
     try {
         // Ensure proper MongoDB initialization and session
         if (!processor.dbManager && !processor.noMongoDB) {
@@ -4288,7 +4289,7 @@ async function handleQuickProcess(args, processor, startTime) {
         if (!processor.taskManager) {
             processor.taskManager = new TaskManager(
                 processor.fileHandler, 
-                debug,
+                args.debug,
                 processor.dbManager
             );
             

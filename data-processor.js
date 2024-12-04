@@ -2900,10 +2900,10 @@ class MainProcessor {
                     logger.info(`Cleaned pack_ids: ${JSON.stringify(cleanPackIds)}`);
     
                     // Update the user document
-                    const updateResult = await this.dbManager.safeWrite('users', {
-                        filter: { did: user.did },
-                        update: { $set: { pack_ids: cleanPackIds } }
-                    });
+                    const updateResult = await this.dbManager.db.collection('users').updateOne(
+                        { did: userDid },
+                        { $set: { pack_ids: cleanedPackIds } }
+                      );
     
                     if (updateResult.modifiedCount > 0) {
                         logger.info(`Successfully updated user ${user.did}`);

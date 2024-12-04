@@ -5114,8 +5114,8 @@ class TaskManager {
     calculateTaskPriority(rkey, existingPack, mongoStatus) {
         let priority = 0;
         const now = Date.now();
-        const failure = this.failedPacks.get(rkey);
-
+        const failure = this.failures.get(rkey); 
+    
         // 1. Handle failed packs
         if (failure) {
             const daysSinceLastAttempt = (now - new Date(failure.lastAttempt).getTime()) 
@@ -5123,7 +5123,7 @@ class TaskManager {
             
             // Base priority for failed packs
             priority = -20;
-
+    
             // Recovery factor based on attempts and time
             const recoveryDays = Math.pow(2, failure.attempts);
             if (daysSinceLastAttempt > recoveryDays) {
@@ -5132,13 +5132,10 @@ class TaskManager {
             }
         } else {
             // 2. Base priority from original position (normalized to small number)
-            
-            // Higher position = newer pack = higher priority
             const position = this.originalOrder.get(rkey) || 0;
             const totalPacks = this.originalOrder.size;
-            // Give newer packs (higher position) a higher priority boost
             priority += Math.min(5, Math.floor((position / totalPacks) * 5));
-
+    
             // 3. Pack state priority
             if (existingPack) {
                 // Age-based priority
@@ -5148,18 +5145,18 @@ class TaskManager {
                 if (daysSinceUpdate > 14) priority += 3;
                 else if (daysSinceUpdate > 7) priority += 2;
                 else if (daysSinceUpdate > 2) priority += 1;
-
+    
                 // Size/activity based priority
                 if (existingPack.user_count > 100) priority += 3;
                 else if (existingPack.user_count > 50) priority += 2;
-
+    
                 if (existingPack.weekly_joins > 50) priority += 4;
                 else if (existingPack.weekly_joins > 10) priority += 3;
             } else {
                 // New packs get medium priority
                 priority += 2;
             }
-
+    
             // 4. Pack state adjustments
             const packState = this.packStates.get(rkey);
             if (packState) {
@@ -5176,12 +5173,12 @@ class TaskManager {
                 }
             }
         }
-
+    
         // 5. MongoDB status adjustments
         if (mongoStatus?.lowPriority) {
             priority -= 3;
         }
-
+    
         return priority;
     }
 

@@ -2592,68 +2592,54 @@ class DatabaseManager {
     
         async markPackStatus(rkey, status, reason) {
             const timestamp = new Date().toISOString();
-    
-            // 1. Update our internal state
-            switch(status) {
-                case 'deleted':
-                case 'hidden':
-                case 'inactive':
-                    // Track in failures with status
-                    this.failedPacks.set(rkey, {
-                        status,
-                        reason,
-                        timestamp,
-                        attempts: (this.failedPacks.get(rkey)?.attempts || 0) + 1,
-                        permanent: status === 'deleted'  // Deleted is permanent
-                    });
-                    this.pendingPacks.delete(rkey);
-                    break;
-                case 'completed':
-                    this.completedPacks.add(rkey);
-                    this.pendingPacks.delete(rkey);
-                    this.failedPacks.delete(rkey);
-                    break;
-                case 'failed':
-                    const failure = this.failedPacks.get(rkey) || { attempts: 0 };
-                    failure.attempts++;
-                    failure.timestamp = timestamp;
-                    failure.reason = reason;
-                    failure.permanent = failure.attempts >= 3;
-                    this.failedPacks.set(rkey, failure);
-                    break;
-            }
-    
-            // 2. Update metrics in one place
-            this.metrics.recordPackProcessing(
-                status === 'completed',
-                Date.now() - (this.pendingPacks.get(rkey)?.startTime || Date.now())
-            );
-    
-            // 3. Update MongoDB if needed
-            if (!this.noMongoDB && status === 'deleted') {
-                await this.dbManager.safeWrite('starter_packs', {
+        
+            try {
+                const update = {
+                    status,
+                    status_reason: reason,
+                    status_updated_at: timestamp,
+                    last_updated: timestamp
+                };
+        
+                if (status === 'deleted') {
+                    update.deleted = true;
+                    update.deleted_at = timestamp;
+                    update.deletion_reason = reason;
+                }
+        
+                await this.safeWrite('starter_packs', {
                     filter: { rkey },
-                    update: {
-                        $set: {
-                            deleted: true,
-                            deleted_at: timestamp,
-                            deletion_reason: reason,
-                            last_updated: timestamp
+                    update: { $set: update }
+                });
+        
+                // Handle cascading user updates only for deletion
+                if (status === 'deleted') {
+                    await this.safeBulkWrite('users', [
+                        {
+                            updateMany: {
+                                filter: { pack_ids: rkey },
+                                update: {
+                                    $pull: { pack_ids: rkey },
+                                    $set: { last_updated: timestamp }
+                                }
+                            }
+                        },
+                        {
+                            updateMany: {
+                                filter: { created_packs: rkey },
+                                update: {
+                                    $pull: { created_packs: rkey },
+                                    $set: { last_updated: timestamp }
+                                }
+                            }
                         }
-                    }
-                });
-    
-                // Handle cascading updates in one place
-                await this.dbManager.safeWrite('users', {
-                    filter: { pack_ids: rkey },
-                    update: { 
-                        $pull: { pack_ids: rkey },
-                        $set: { last_updated: timestamp }
-                    }
-                });
+                    ]);
+                }
+        
+            } catch (err) {
+                logger.error(`Failed to mark pack ${rkey} as ${status}:`, err);
+                throw err;
             }
-    
-            this.markDirty();
         }
     
     async markPackDeleted(rkey, reason, skipUserUpdates = false) {
@@ -3155,13 +3141,13 @@ class MainProcessor {
             const pack = await this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri });
 
             if (!pack?.starterPack) {
-                await this.dbManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
+                await this.taskManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
                 return false;
             }
     
             // Check if pack is hidden/deleted
             if (pack.starterPack.record?.hidden) {
-                await this.dbManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
+                await this.taskManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
                 return false;
             }
     
@@ -3257,7 +3243,7 @@ class MainProcessor {
     
             // 7. Update task state and metrics
             await this.taskManager.markTaskCompleted(rkey);
-            await this.dbManager.markPackStatus(rkey, 'completed', null);
+            await this.taskManager.markPackStatus(rkey, 'completed', null);
         
             metrics.recordPackProcessing(true, Date.now() - startTime);
     
@@ -5194,6 +5180,73 @@ class TaskManager {
             this.checkpointDirty = false;
         } catch (err) {
             logger.error('Failed to write checkpoint:', err);
+        }
+    }
+
+    async markPackStatus(rkey, status, reason) {
+        const timestamp = new Date().toISOString();
+    
+        try {
+            // 1. Update internal state
+            switch(status) {
+                case 'deleted':
+                case 'hidden':
+                case 'inactive':
+                    this.failures.set(rkey, {
+                        status,
+                        reason,
+                        timestamp,
+                        attempts: (this.failures.get(rkey)?.attempts || 0) + 1,
+                        permanent: status === 'deleted'
+                    });
+                    this.pendingTasks.delete(rkey);
+                    break;
+    
+                case 'completed':
+                    this.completedTasks.add(rkey);
+                    this.pendingTasks.delete(rkey);
+                    this.failures.delete(rkey);
+                    break;
+    
+                case 'failed':
+                    const failure = this.failures.get(rkey) || { attempts: 0 };
+                    failure.attempts++;
+                    failure.timestamp = timestamp;
+                    failure.reason = reason;
+                    failure.permanent = failure.attempts >= 3;
+                    this.failures.set(rkey, failure);
+                    break;
+            }
+    
+            // 2. Update pack state tracking
+            this.packStates.set(rkey, {
+                status,
+                reason,
+                timestamp
+            });
+    
+            // 3. Record metrics
+            if (this.metrics) {
+                this.metrics.recordPackProcessing(
+                    status === 'completed',
+                    Date.now() - (this.pendingTasks.get(rkey)?.addedAt || Date.now())
+                );
+            }
+    
+            // 4. Update database if needed
+            if (this.dbManager && !this.noMongoDB && !this.dbManager.noDBWrites) {
+                if (status === 'deleted') {
+                    await this.dbManager.markPackDeleted(rkey, reason);
+                } else {
+                    await this.dbManager.markPackStatus(rkey, status, reason);
+                }
+            }
+    
+            this.markDirty();
+    
+        } catch (err) {
+            logger.error(`Error marking pack status ${rkey} -> ${status}:`, err);
+            throw err;
         }
     }
 

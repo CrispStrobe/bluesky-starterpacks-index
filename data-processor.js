@@ -3661,7 +3661,7 @@ class MainProcessor {
             throw new Error(`Invalid starter pack URI: ${uri}`);
         }
         const rkey = match[1];
-        logger.debug('rkey extracted:', rkey)
+        logger.debug(`rkey extracted: ${rkey}.`);
         return rkey;
     }
 
@@ -4517,12 +4517,13 @@ async function quickProcessUser(identifier, options = {}) {
 
         // 3. Process profile
         const result = await processor.processProfile(response.data, {
-            force,
-            processAssociated: true,  // Always process associated to discover packs
+            force: true,
+            processAssociated: true,
             debug,
             isInitialUser: currentDepth === 0,
             source: 'quick_process',
-            parentPack
+            parentPack,
+            forceProcess: true  // ignore if profile is already in mongodb, enforce parsing
         });
 
         // 4. Process discovered packs if we haven't hit depth limit

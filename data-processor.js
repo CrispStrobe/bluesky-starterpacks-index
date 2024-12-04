@@ -4839,6 +4839,7 @@ class TaskManager {
         this.initialTaskCount = 0;
         this.discoveredTaskCount = 0;
         this.completedTaskCount = 0;
+        this.totalTasksToProcess = 0;  // track total tasks for current run
 
         // Discovery tracking
         this.originalOrder = new Map();
@@ -5644,28 +5645,28 @@ class TaskManager {
         }
 
         // Add new task
-        this.pendingTasks.set(rkey, {
-            handle,
-            rkey,
-            priority,
-            source,
-            parentDid,
+        this.pendingTasks.set(taskData.rkey, {
+            handle: taskData.handle,
+            rkey: taskData.rkey,
+            priority: taskData.priority,
+            source: taskData.source,
+            parentDid: taskData.parentDid,
             addedAt: new Date().toISOString(),
             attempts: failure?.attempts || 0
         });
 
-        // Update task counts
-        if (source === 'initial') {
-            this.initialTaskCount++;
-        } else {
-            this.discoveredTaskCount++;
+        // Update total tasks counter
+        if (!this.totalTasksToProcess) {
+            this.totalTasksToProcess = 1;  // Initialize if first task
+        } else if (!this.completedTasks.has(taskData.rkey)) {
+            this.totalTasksToProcess++;  // Only increment if not already completed
         }
 
         this.markDirty();
         await this.maybeWriteCheckpoint();
         
         if (this.debug) {
-            logger.debug(`Added task ${rkey} (${source}), total tasks: ${this.getTotalTasks()}`);
+            logger.debug(`Added task ${taskData.rkey} (${taskData.source}), total tasks: ${this.totalTasksToProcess}`);
         }
         
         return true;
@@ -5740,12 +5741,13 @@ class TaskManager {
                 discoveredAt: new Date().toISOString(),
                 discoveredFrom: parentDid
             });
+            this.totalTasksToProcess++;  // Increment total tasks counter
 
             logger.debug('New pack discovered:', {
                 rkey: packInfo.rkey,
                 from: parentDid,
                 totalDiscovered: this.discoveredTaskCount,
-                totalTasks: this.getTotalTasks()
+                totalTasks: this.totalTasksToProcess
             });
         }
 
@@ -5795,11 +5797,9 @@ class TaskManager {
         try {
             // Log progress
             this.completedTaskCount++;
-            const totalTasks = this.getTotalTasks();
-            const progress = Math.floor((this.completedTaskCount / totalTasks) * 100);
-                
-            logger.info(`Processing pack ${this.completedTaskCount}/${totalTasks} (${progress}%)`);
-    
+            const progress = Math.floor((this.completedTaskCount / this.totalTasksToProcess) * 100);
+            logger.info(`Processing pack ${this.completedTaskCount}/${this.totalTasksToProcess} (${progress}%)`);
+
             // Process the task
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
                 
@@ -5814,24 +5814,6 @@ class TaskManager {
             logger.error(`Error processing task ${task.rkey}:`, err);
             return false;
         }
-    }
-
-    getTotalTasks() {
-        return Math.max(
-            this.initialTaskCount + this.discoveredTaskCount,
-            this.completedTaskCount + this.pendingTasks.size
-        );
-    }
-
-    getProgressStats() {
-        const total = this.getTotalTasks();
-        return {
-            total,
-            completed: this.completedTaskCount,
-            pending: this.pendingTasks.size,
-            discovered: this.discoveredTaskCount,
-            progress: total > 0 ? Math.floor((this.completedTaskCount / total) * 100) : 0
-        };
     }
 
     hasMoreWork() {

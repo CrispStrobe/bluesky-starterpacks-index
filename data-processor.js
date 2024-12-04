@@ -3393,7 +3393,106 @@ class MainProcessor {
             processedDIDs = new Set(),
             currentDepth = 0,
             parentDid = null,
-            parentHandle = null
+            forceProcess = false  // For --adduser context
+        } = options;
+    
+        const results = {
+            discovered: 0,
+            queued: 0,
+            skipped: 0,
+            failed: 0
+        };
+    
+        try {
+            // Skip if we've hit depth limit or already processed this profile
+            if (currentDepth >= maxDepth || processedDIDs.has(profile.did)) {
+                logger.debug(`Skipping ${profile.handle} - depth: ${currentDepth}, processed: ${processedDIDs.has(profile.did)}`);
+                return results;
+            }
+    
+            processedDIDs.add(profile.did);
+    
+            // Get packs for current profile
+            const packs = await this.apiHandler.getActorStarterPacks(profile.did);
+            if (!packs?.starterPacks?.length) {
+                return results;
+            }
+    
+            results.discovered = packs.starterPacks.length;
+            logger.info(`Found ${results.discovered} packs for ${profile.handle}`);
+    
+            // Process each pack
+            for (const pack of packs.starterPacks) {
+                try {
+                    const rkey = await this.extractRkeyFromURI(pack.uri);
+                    
+                    // Add to URLs file for future discovery
+                    await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
+    
+                    // Skip if we shouldn't process this pack
+                    if (!forceProcess) {  // Skip recent checks only if force processing
+                        const shouldProcess = await this.taskManager.shouldProcessPack(rkey, 
+                            await this.fileHandler.getPack(rkey),
+                            this.taskManager.failures.get(rkey)
+                        );
+    
+                        if (!shouldProcess.process) {
+                            results.skipped++;
+                            logger.debug(`Skipping pack ${rkey}: ${shouldProcess.reason}`);
+                            continue;
+                        }
+                    }
+    
+                    // Add to task queue
+                    const added = await this.taskManager.addAssociatedPack({
+                        creator: profile.handle,
+                        rkey,
+                        memberCount: pack.starterPack?.record?.items?.length || 0,
+                        updatedAt: new Date().toISOString(),
+                        discoveryDepth: currentDepth,
+                        forceProcess  // Pass through force flag
+                    }, profile.did);
+    
+                    if (added) {
+                        results.queued++;
+                        // Record relationship for future reference
+                        this.taskManager.recordPackRelationship(rkey, profile.did);
+                        await this.taskManager.maybeWriteCheckpoint();
+                    } else {
+                        results.skipped++;
+                    }
+    
+                    await this.rateLimiter.throttle();
+    
+                } catch (err) {
+                    results.failed++;
+                    logger.error(`Failed to process pack for ${profile.handle}:`, err);
+                }
+            }
+    
+            metrics.recordAssociatedPacksMetrics(results);
+            return results;
+    
+        } catch (err) {
+            logger.error(`Failed to process packs for ${profile.handle}:`, err);
+            metrics.recordAssociatedPacksMetrics({
+                discovered: 0,
+                queued: 0,
+                skipped: 0,
+                failed: 1
+            });
+            throw err;
+        }
+    }
+
+    async processAssociatedPacks_old(profile, options = {}) {
+        const {
+            maxDepth = MAX_PACK_DEPTH,
+            processedDIDs = new Set(),
+            currentDepth = 0,
+            parentDid = null,
+            parentHandle = null,
+            forceProcess = false 
         } = options;
     
         const results = {

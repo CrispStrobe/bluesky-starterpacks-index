@@ -1216,7 +1216,18 @@ class FileHandler {
     }
 
     async validatePackMembership(processor, userDid, packRkey) {
+        // Validate all inputs
+        if (!processor?.dbManager?.db) {
+            logger.error('Invalid processor or missing dbManager');
+            return null;
+        }
+        if (!userDid || !packRkey) {
+            logger.warn(`Invalid parameters - userDid: ${userDid}, packRkey: ${packRkey}`);
+            return null;
+        }
+    
         try {
+            // Get pack data
             const pack = await processor.dbManager.db.collection('starter_packs')
                 .findOne({ rkey: packRkey });
             
@@ -1225,15 +1236,27 @@ class FileHandler {
                 return null;
             }
     
-            const packUri = `at://${pack.creator_did}/app.bsky.graph.starterpack/${packRkey}`;
+            if (!pack.list || !pack.creator_did) {
+                logger.warn(`Pack ${packRkey} missing required fields (list or creator_did)`);
+                return null;
+            }
+    
+            // Use pack.list directly instead of constructing URI
             const listData = await processor.apiHandler.makeApiCall('app.bsky.graph.getList', {
-                list: pack.list // Assuming list URI is stored
+                list: pack.list
             });
     
-            return listData.items.some(member => member.subject.did === userDid);
+            if (!listData?.items) {
+                logger.warn(`No list data returned for pack ${packRkey}`);
+                return false;
+            }
+    
+            return listData.items.some(member => 
+                member?.subject?.did === userDid
+            );
         } catch (err) {
             logger.error(`Error validating membership for ${userDid} in pack ${packRkey}:`, err);
-            return null; // Return null on error to indicate we couldn't verify
+            return null;
         }
     }
 
@@ -1328,6 +1351,9 @@ class FileHandler {
     }
 
     async appendToUrlsFile(handle, rkey) {
+        if (!handle || !rkey) {
+            throw new Error('Invalid parameters: handle and rkey are required');
+        }
         try {
             await this.acquireLock();
             
@@ -1457,6 +1483,10 @@ class FileHandler {
 
     // Cache management
     updateUserCache(user) {
+        if (!user?.did) { 
+            logger.warn("Called updateUserCache withouth user parameter.");
+            return;
+        }
         const existing = this.userCache.get(user.did);
         const lastUpdated = new Date(user.last_updated);
         
@@ -1498,6 +1528,10 @@ class FileHandler {
 
     // Accessors
     getUser(did) {
+        if (!did) {
+            logger.warn('Attempted to get user with undefined DID');
+            return null;
+        }
         return this.userCache.get(did);
     }
 
@@ -2780,7 +2814,7 @@ class MainProcessor {
         this.rateLimiter = new RateLimiter();
         this.fileHandler = new FileHandler();
         
-        this.packTracker = new PackTracker();
+        //this.packTracker = new PackTracker();
         this.validator = new ValidationHelper(VALIDATION_SCHEMAS);
         this.metrics = metrics;
         this.cleanupHandlers = new Set();
@@ -3073,6 +3107,10 @@ class MainProcessor {
     }
 
     async processStarterPack(urlLine) {
+        if (!urlLine || typeof urlLine !== 'string') {
+            throw new Error('Invalid urlLine parameter');
+        }
+
         const [handle, rkey] = urlLine.split('|').map(s => s.trim());
         if (!handle || !rkey) {
             throw new Error('Invalid URL line format');
@@ -3604,6 +3642,9 @@ class MainProcessor {
             
             // 3. Handle non-existent/deleted profiles
             if (!currentProfile) {
+                // Record the missing profile
+                this.taskManager.recordMissingProfile(profile.did);
+                
                 // Try historical handle lookup if we have a handle
                 if (profile.handle) {
                     const historicalUser = await this.fileHandler.getUserByHistoricalHandle(profile.handle);
@@ -3616,8 +3657,23 @@ class MainProcessor {
                     }
                 }
     
-                // Handle genuine deletion
+                // Handle cleanup for genuine deletion
                 if (!this.noMongoDB && !this.noDBWrites) {
+                    // Mark packs as deleted if they were created by this user
+                    const createdPacks = await this.fileHandler.getPacksByCreator(profile.did);
+                    for (const pack of createdPacks) {
+                        await this.dbManager.markPackDeleted(pack.rkey, 'creator_deleted');
+                    }
+
+                    // Cleanup user's memberships
+                    const existingProfile = await this.fileHandler.getUser(profile.did);
+                    if (existingProfile?.pack_ids?.length) {
+                        await this.dbManager.cleanupRemovedUsers(
+                            existingProfile.pack_ids,
+                            [profile.did]
+                        );
+                    }
+
                     // Mark user as deleted
                     await this.dbManager.safeWrite('users', {
                         filter: { did: profile.did },
@@ -3630,29 +3686,15 @@ class MainProcessor {
                             } 
                         }
                     });
-    
-                    // Update affected packs
-                    await this.dbManager.safeWrite('starter_packs', {
-                        filter: { creator_did: profile.did },
-                        update: {
-                            $set: {
-                                deleted: true,
-                                deleted_at: new Date(),
-                                deletion_reason: 'creator_deleted'
-                            }
-                        }
-                    });
-    
-                    // Remove from pack memberships
-                    await this.dbManager.safeWrite('starter_packs', {
-                        filter: { users: profile.did },
-                        update: { $pull: { users: profile.did } }
-                    });
                 }
                 return { success: false, changes, error: 'Profile not found' };
             }
     
             // 4. Get existing profile state from our storage
+            if (!profile?.did) {
+                logger.debug('Profile data problem with:', profile)
+                throw new Error('Invalid profile data: missing DID');
+            }
             const existingProfile = await this.fileHandler.getUser(profile.did);
                 
             // 5. Detect all relevant changes
@@ -3775,6 +3817,11 @@ class MainProcessor {
             // Record metrics
             metrics?.recordUserProcessing(true);
             metrics?.recordProfileProcessing(Date.now() - startTime);
+
+            // If this was part of a task, mark it complete
+            if (options.parentPack) {
+                await this.taskManager.markTaskCompleted(options.parentPack);
+            }
     
             return { success: true, changes };
     

@@ -2379,6 +2379,25 @@ class DatabaseManager {
     }
 
     async safeWrite(collection, operation, options = {}) {
+        // If we're updating pack_ids, ensure we handle them cleanly
+        if (operation.update?.$addToSet?.pack_ids) {
+            // Convert $addToSet with $each to a clean array update
+            const newPackIds = operation.update.$addToSet.pack_ids.$each || 
+                            [operation.update.$addToSet.pack_ids];
+            
+            // Use $set instead with a clean array
+            operation.update.$set = operation.update.$set || {};
+            delete operation.update.$addToSet;
+            
+            // First get current pack_ids
+            const doc = await this.db.collection(collection)
+                .findOne(operation.filter, { projection: { pack_ids: 1 } });
+            
+            // Combine existing and new, ensuring uniqueness
+            const currentPackIds = (doc?.pack_ids || []).filter(id => typeof id === 'string');
+            operation.update.$set.pack_ids = [...new Set([...currentPackIds, ...newPackIds])];
+        }
+
         const maxRetries = 5;
         let lastError = null;
     
@@ -2820,6 +2839,37 @@ class MainProcessor {
 
         this.profileCache = new Map();
         this.profileCacheTTL = 24 * 60 * 60 * 1000;
+    }
+
+    async cleanPackIds() {
+        if (this.noMongoDB || this.noDBWrites) {
+            logger.info('Skipping pack_ids cleanup - MongoDB not enabled');
+            return;
+        }
+    
+        try {
+            logger.info('Starting pack_ids cleanup...');
+            
+            const usersToFix = await this.dbManager.db.collection('users').find({
+                'pack_ids': { $elemMatch: { $type: 'object' } }
+            }).toArray();
+    
+            logger.info(`Found ${usersToFix.length} users with $each operators to clean`);
+    
+            for (const user of usersToFix) {
+                const cleanPackIds = user.pack_ids.filter(id => typeof id === 'string');
+                
+                await this.dbManager.safeWrite('users', {
+                    filter: { did: user.did },
+                    update: { $set: { pack_ids: cleanPackIds } }
+                });
+            }
+    
+            logger.info('Pack_ids cleanup completed successfully');
+        } catch (err) {
+            logger.error('Error during pack_ids cleanup:', err);
+            throw err;
+        }
     }
 
     async handleProfileError(err, context) {
@@ -4236,7 +4286,8 @@ function parseArgs() {
         addUser: args.includes('--adduser') ? args[args.indexOf('--adduser') + 1] : null,
         addPack: args.includes('--addstarterpack') ? args[args.indexOf('--addstarterpack') + 1] : null,
         cleanFiles: args.includes('--cleanfiles'),
-        purge: args.includes('--purge')
+        purge: args.includes('--purge'),
+        cleanpackids: args.includes('--cleanpackids'),
     };
 }
 
@@ -4254,6 +4305,39 @@ function validateEnv(args) {
 }
 
 // Handle cleanup and shutdown
+// One-time cleanup script
+async function cleanupPackIds_old() {
+    const client = new MongoClient(process.env.MONGODB_URI);
+    try {
+        await client.connect();
+        const db = client.db('starterpacks');
+        
+        // Find all users with $each in their pack_ids
+        const usersToFix = await db.collection('users').find({
+            'pack_ids': { $elemMatch: { $type: 'object' } }  // Find arrays containing objects
+        }).toArray();
+
+        console.log(`Found ${usersToFix.length} users with $each operators to clean`);
+
+        for (const user of usersToFix) {
+            // Filter out $each and get only string pack IDs
+            const cleanPackIds = user.pack_ids.filter(id => typeof id === 'string');
+            
+            // Update the user with clean pack_ids
+            await db.collection('users').updateOne(
+                { did: user.did },
+                { $set: { pack_ids: cleanPackIds } }
+            );
+        }
+
+        console.log('Cleanup completed');
+    } catch (err) {
+        console.error('Error during cleanup:', err);
+    } finally {
+        await client.close();
+    }
+}
+
 async function handleShutdown(signal, currentProcessor = null) {
     logger.info(`\nReceived ${signal}. Starting graceful shutdown...`);
     
@@ -5926,6 +6010,19 @@ async function main() {
     
     try {
         metrics.recordStartup();
+
+        if (args.cleanpackids) {
+            // Only initialize what we need for cleanup
+            processor = new MainProcessor({
+                noMongoDB: args.noMongoDB,
+                noDBWrites: args.noDBWrites,
+                debug: args.debug
+            });
+            
+            await processor.initMinimal();
+            await processor.cleanPackIds();
+            return;
+        }
         
         // For quick process, we want minimal initialization
         if (args.addUser || args.addPack) {

@@ -4402,16 +4402,19 @@ async function handleQuickProcess(args, processor, startTime) {
 }
 
 async function quickProcessUser(identifier, options = {}) {
-    const { 
-        processor, 
-        force = false, 
-        debug = false, 
-        processAssociated = true 
+    const {
+        processor,
+        force = false,
+        debug = false,
+        maxDepth = process.env.MAX_PACK_DEPTH || 2,
+        currentDepth = 0,
+        processedDIDs = new Set(),
+        parentPack = null
     } = options;
 
     try {
         if (debug) {
-            logger.debug(`Quick processing user: ${identifier}`);
+            logger.debug(`Quick processing user: ${identifier} (depth: ${currentDepth}/${maxDepth})`);
         }
 
         // 1. Resolve identifier (handle or DID)
@@ -4437,40 +4440,79 @@ async function quickProcessUser(identifier, options = {}) {
             }
         }
 
+        // Skip if we've already processed this profile at this depth or shallower
+        if (processedDIDs.has(did)) {
+            logger.debug(`Skipping already processed profile: ${did}`);
+            return { success: true, skipped: true };
+        }
+
         // 2. Get current profile
         const response = await processor.agent.getProfile({ actor: did });
         if (!response?.data) {
             throw new Error(`Could not find profile for ${did}`);
         }
 
+        // Track that we've processed this profile
+        processedDIDs.add(did);
+
         // 3. Process profile
         const result = await processor.processProfile(response.data, {
             force,
-            processAssociated,
+            processAssociated: true,  // Always process associated to discover packs
             debug,
-            isInitialUser: true,
-            source: 'quick_process'
+            isInitialUser: currentDepth === 0,
+            source: 'quick_process',
+            parentPack
         });
 
-        // 4. Process discovered packs
-        if (processAssociated && processor.taskManager.pendingTasks.size > 0) {
-            logger.debug(`Processing ${processor.taskManager.pendingTasks.size} discovered packs`);
+        // 4. Process discovered packs if we haven't hit depth limit
+        if (currentDepth < maxDepth && processor.taskManager.pendingTasks.size > 0) {
+            logger.debug(`Processing ${processor.taskManager.pendingTasks.size} discovered packs at depth ${currentDepth}`);
             
             while (processor.taskManager.pendingTasks.size > 0) {
-                const success = await processor.taskManager.processNextTask(processor);
+                const task = await processor.taskManager.getNextTask();
+                if (!task) break;
+
+                // Process the pack
+                const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
                 if (success) {
                     result.changes.packs.processed = (result.changes.packs.processed || 0) + 1;
+
+                    // Get pack members and process them recursively
+                    const pack = await processor.fileHandler.getPack(task.rkey);
+                    if (pack?.users?.length) {
+                        for (const memberDid of pack.users) {
+                            // Recursive call for each member
+                            await quickProcessUser(memberDid, {
+                                ...options,
+                                currentDepth: currentDepth + 1,
+                                processedDIDs,
+                                parentPack: task.rkey
+                            });
+                        }
+                    }
                 } else {
                     result.changes.packs.failed = (result.changes.packs.failed || 0) + 1;
                 }
+
+                // Mark task as completed and update checkpoint
+                await processor.taskManager.markTaskCompleted(task.rkey);
                 await processor.taskManager.maybeWriteCheckpoint();
             }
         }
+
+        // Add depth information to result
+        result.depth = {
+            current: currentDepth,
+            max: maxDepth,
+            reachedLimit: currentDepth >= maxDepth
+        };
 
         if (debug) {
             logger.debug('Quick process completed:', {
                 handle: response.data.handle,
                 did: response.data.did,
+                depth: result.depth,
                 changes: result.changes,
                 packsProcessed: result.changes.packs?.processed || 0
             });
@@ -4481,6 +4523,7 @@ async function quickProcessUser(identifier, options = {}) {
     } catch (err) {
         logger.error(`Error in quick process user:`, {
             identifier,
+            depth: currentDepth,
             error: err.message,
             stack: err.stack
         });
@@ -5364,9 +5407,9 @@ class TaskManager {
     }
 
     async getNextTask() {
-        // Convert to array for sorting
-        const tasks = Array.from(this.pendingTasks.values());
-
+        // Convert to array for sorting, using let instead of const
+        let tasks = Array.from(this.pendingTasks.values());
+    
         // Filter out deleted packs unless enough time has passed
         const now = Date.now();
         tasks = tasks.filter(task => {
@@ -5397,7 +5440,7 @@ class TaskManager {
             );
             return priorityB - priorityA;
         });
-
+    
         return tasks[0] || null;
     }
 

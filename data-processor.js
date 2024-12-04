@@ -2852,7 +2852,7 @@ class MainProcessor {
             
             // First, let's get a sample document to understand what we're dealing with
             const sampleUser = await this.dbManager.db.collection('users').findOne({});
-            logger.info('Sample user pack_ids structure:', JSON.stringify(sampleUser.pack_ids));
+            logger.info('Sample user pack_ids structure:', JSON.stringify(sampleUser?.pack_ids));
     
             // Use a raw query to get all documents and filter in application code
             const allUsers = await this.dbManager.db.collection('users').find({}).toArray();
@@ -2901,9 +2901,9 @@ class MainProcessor {
     
                     // Update the user document
                     const updateResult = await this.dbManager.db.collection('users').updateOne(
-                        { did: userDid },
-                        { $set: { pack_ids: cleanedPackIds } }
-                      );
+                        { did: user.did },  // Using user.did instead of userDid
+                        { $set: { pack_ids: cleanPackIds } }  // Using cleanPackIds instead of cleanedPackIds
+                    );
     
                     if (updateResult.modifiedCount > 0) {
                         logger.info(`Successfully updated user ${user.did}`);
@@ -2915,7 +2915,7 @@ class MainProcessor {
     
                     // Verify the update
                     const verifyUser = await this.dbManager.db.collection('users').findOne({ did: user.did });
-                    logger.info(`Verification - Updated pack_ids: ${JSON.stringify(verifyUser.pack_ids)}`);
+                    logger.info(`Verification - Updated pack_ids: ${JSON.stringify(verifyUser?.pack_ids)}`);
     
                 } catch (userError) {
                     logger.error(`Error processing user ${user.did}:`, userError);

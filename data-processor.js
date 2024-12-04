@@ -2555,6 +2555,72 @@ class DatabaseManager {
             }
         }
     
+        async markPackStatus(rkey, status, reason) {
+            const timestamp = new Date().toISOString();
+    
+            // 1. Update our internal state
+            switch(status) {
+                case 'deleted':
+                case 'hidden':
+                case 'inactive':
+                    // Track in failures with status
+                    this.failedPacks.set(rkey, {
+                        status,
+                        reason,
+                        timestamp,
+                        attempts: (this.failedPacks.get(rkey)?.attempts || 0) + 1,
+                        permanent: status === 'deleted'  // Deleted is permanent
+                    });
+                    this.pendingPacks.delete(rkey);
+                    break;
+                case 'completed':
+                    this.completedPacks.add(rkey);
+                    this.pendingPacks.delete(rkey);
+                    this.failedPacks.delete(rkey);
+                    break;
+                case 'failed':
+                    const failure = this.failedPacks.get(rkey) || { attempts: 0 };
+                    failure.attempts++;
+                    failure.timestamp = timestamp;
+                    failure.reason = reason;
+                    failure.permanent = failure.attempts >= 3;
+                    this.failedPacks.set(rkey, failure);
+                    break;
+            }
+    
+            // 2. Update metrics in one place
+            this.metrics.recordPackProcessing(
+                status === 'completed',
+                Date.now() - (this.pendingPacks.get(rkey)?.startTime || Date.now())
+            );
+    
+            // 3. Update MongoDB if needed
+            if (!this.noMongoDB && status === 'deleted') {
+                await this.dbManager.safeWrite('starter_packs', {
+                    filter: { rkey },
+                    update: {
+                        $set: {
+                            deleted: true,
+                            deleted_at: timestamp,
+                            deletion_reason: reason,
+                            last_updated: timestamp
+                        }
+                    }
+                });
+    
+                // Handle cascading updates in one place
+                await this.dbManager.safeWrite('users', {
+                    filter: { pack_ids: rkey },
+                    update: { 
+                        $pull: { pack_ids: rkey },
+                        $set: { last_updated: timestamp }
+                    }
+                });
+            }
+    
+            this.markDirty();
+        }
+    
     async markPackDeleted(rkey, reason, skipUserUpdates = false) {
         logger.debug('markPackDeleted:', { rkey, reason, skipUserUpdates });
         try {
@@ -2693,91 +2759,6 @@ class DatabaseManager {
                 }
             );
         }
-    }
-}
-
-class PackTracker {
-    constructor() {
-        this.knownPacks = new Set();
-        this.unprocessedPacks = new Set();
-        this.missingPacks = new Map();
-        this.completedPacks = new Set();
-        this.maxAttempts = 3;
-        this.retryAfterDays = 7;
-    }
-
-    async loadFromFile(filename) {
-        try {
-            const content = await fs.readFile(filename, 'utf-8');
-            const lines = content.split('\n')
-                .filter(line => line.trim() && line.includes('|'));
-
-            for (const line of lines) {
-                const [_, rkey] = line.split('|').map(s => s.trim());
-                this.knownPacks.add(rkey);
-                if (!this.completedPacks.has(rkey) && !this.missingPacks.has(rkey)) {
-                    this.unprocessedPacks.add(rkey);
-                }
-            }
-        } catch (err) {
-            logger.error(`Error loading known packs: ${err.message}`);
-            throw err;
-        }
-    }
-
-    shouldProcess(rkey) {
-        // Always process if unprocessed
-        if (this.unprocessedPacks.has(rkey)) return true;
-        
-        // Skip if completed
-        if (this.completedPacks.has(rkey)) return false;
-
-        // Check missing pack status
-        if (this.missingPacks.has(rkey)) {
-            const status = this.missingPacks.get(rkey);
-            const daysSinceLastAttempt = 
-                (Date.now() - status.lastAttempt) / (1000 * 60 * 60 * 24);
-            
-            return status.attempts < this.maxAttempts && 
-                   daysSinceLastAttempt >= this.retryAfterDays;
-        }
-
-        return true;
-    }
-
-    recordMissing(rkey, reason = '') {
-        const now = Date.now();
-        const existing = this.missingPacks.get(rkey);
-
-        if (existing) {
-            existing.attempts++;
-            existing.lastAttempt = now;
-            existing.reason = reason || existing.reason;
-        } else {
-            this.missingPacks.set(rkey, {
-                firstAttempt: now,
-                lastAttempt: now,
-                attempts: 1,
-                reason
-            });
-        }
-
-        this.unprocessedPacks.delete(rkey);
-    }
-
-    markCompleted(rkey) {
-        this.completedPacks.add(rkey);
-        this.unprocessedPacks.delete(rkey);
-        this.missingPacks.delete(rkey);
-    }
-
-    getStats() {
-        return {
-            known: this.knownPacks.size,
-            unprocessed: this.unprocessedPacks.size,
-            missing: this.missingPacks.size,
-            completed: this.completedPacks.size
-        };
     }
 }
 
@@ -3133,6 +3114,16 @@ class MainProcessor {
     
             const packUri = `at://${creatorDID}/app.bsky.graph.starterpack/${rkey}`;
             const pack = await this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri });
+
+            if (!pack?.starterPack) {
+                await this.taskManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
+                return false;
+            }
+    
+            if (packState.hidden) {
+                await this.taskManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
+                return false;
+            }
     
             if (!pack?.starterPack?.record?.list) {
                 logger.warn(`Invalid pack structure for ${rkey}`);
@@ -3226,6 +3217,8 @@ class MainProcessor {
     
             // 7. Update task state and metrics
             await this.taskManager.markTaskCompleted(rkey);
+            await this.taskManager.markPackStatus(rkey, 'completed', null);
+        
             metrics.recordPackProcessing(true, Date.now() - startTime);
     
             // Log completion
@@ -3249,8 +3242,10 @@ class MainProcessor {
                 if (existingPack && !this.noMongoDB && !this.noDBWrites) {
                     // No need to cleanup users here as markPackDeleted handles it
                     await this.dbManager.markPackDeleted(rkey, 'pack_not_found');
+                    
                 }
                 this.taskManager.recordFailure(rkey, 'Pack no longer exists', true);
+                this.taskManager.updatePackState(rkey, 'deleted', 'api_404');
                 metrics.recordPackProcessing(false);
                 return false;
             }
@@ -4528,25 +4523,55 @@ class TaskManager {
             throw new Error('Database manager is required when MongoDB is enabled');
         }
 
+        // Core state tracking
+        this.pendingPacks = new Map();  // {rkey: {handle, startTime, priority, source}}
+        this.completedPacks = new Set();
+        this.failedPacks = new Map();   // {rkey: {status, reason, timestamp, attempts, permanent}}
+        this.originalOrder = new Map();  // Track position in URLs file for priority
+
+        // Progress tracking
+        this.totalInitialTasks = 0;
+        this.newlyDiscoveredTasks = 0;
+        this.completedTaskCount = 0;
+
+        // Checkpoint management
+        this.lastCheckpoint = Date.now();
+        this.CHECKPOINT_INTERVAL = 20 * 60 * 1000;
+        this.checkpointDirty = false;
+
+        // For handling associated discoveries
+        this.discoveredPacksMap = new Map();
+        this.processedProfiles = new Set();  // Track which profiles we've checked for packs
+
+        this.metrics = metrics;  // Global metrics reference
+
+        // rest...
         this.pendingTasks = new Map();
         this.completedTasks = new Set();
         this.failures = new Map();
         this.missingProfiles = new Set();
         this.packRelationships = new Map();
         this.startTime = Date.now();
-        this.lastCheckpoint = Date.now();
-        this.CHECKPOINT_INTERVAL = 20 * 60 * 1000;
-        this.checkpointDirty = false;
         this.totalTasks = 0;
-        this.completedTaskCount = 0;
         this.currentPackUsersTotal = 0;
         this.currentPackUsersProcessed = 0;
-        this.newlyDiscoveredTasks = 0;
-        this.totalInitialTasks = 0;
-        this.discoveredPacksMap = new Map();
         this.processingDiscoveredTasks = false;
         this.discoveredTasksQueue = new Set();
-        this.processedProfiles = new Set();  // Track which profiles we've checked for packs
+        this.originalOrder = new Map(); // Track position in URLs file
+        this.packStates = new Map();    // Track pack states like deleted/hidden
+        this.completedPacks = new Set();
+        this.failedPacks = new Map();  // Combines failures and pack states
+        this.pendingPacks = new Map();
+        this.metrics = metrics;        // Reference to global metrics
+    }
+
+    updatePackState(rkey, status, reason) {
+        this.packStates.set(rkey, {
+            status,
+            reason,
+            timestamp: new Date().toISOString()
+        });
+        this.markDirty();
     }
 
     async processBatch(processor, batchSize = 5) {
@@ -4668,10 +4693,12 @@ class TaskManager {
         const urls = new Map();
         try {
             const content = await fs.readFile(FILE_PATHS.urls, 'utf8');
+            let position = 0;
             for (const line of content.split('\n').filter(Boolean)) {
                 const [handle, rkey] = line.split('|').map(s => s.trim());
                 if (handle && rkey) {
                     urls.set(rkey, { handle, rkey });
+                    this.originalOrder.set(rkey, position++);
                 }
             }
             return urls;
@@ -4929,7 +4956,8 @@ class TaskManager {
             this.completedTasks = new Set(checkpoint.completedPacks || []);
             this.missingProfiles = new Set(checkpoint.missingProfiles || []);
             
-            // Initialize failures map
+            // Load failures with their state
+            this.failures.clear();
             if (checkpoint.missingPacks) {
                 for (const {rkey, reason, attempts, timestamp} of checkpoint.missingPacks) {
                     this.failures.set(rkey, {
@@ -4940,6 +4968,12 @@ class TaskManager {
                     });
                 }
             }
+
+            // Load pack states
+            this.packStates = new Map(checkpoint.packStates || []);
+            
+            // Load original order
+            this.originalOrder = new Map(checkpoint.originalOrder || []);
             
             return checkpoint;
         } catch (err) {
@@ -4954,32 +4988,75 @@ class TaskManager {
         }
     }
 
-    calculateTaskPriority(rkey, existingPack, failure, mongoStatus) {
+    calculateTaskPriority(rkey, existingPack, mongoStatus) {
         let priority = 0;
+        const now = Date.now();
+        const failure = this.failedPacks.get(rkey);
 
-        // If MongoDB indicates this is a low priority update, reduce priority significantly
-        if (mongoStatus?.lowPriority) {
-            priority -= 5;
-        }
-
-        // Higher priority for packs we've never processed
-        if (!existingPack && !mongoStatus?.lowPriority) {
-            priority += 3;
-        } else {
-            // Priority based on age of data
-            const daysSinceUpdate = (Date.now() - new Date(existingPack?.updated_at || 0).getTime()) 
-                / (1000 * 60 * 60 * 24);
-            if (daysSinceUpdate > 30) priority += 2;
-            else if (daysSinceUpdate > 7) priority += 1;
-
-            // Priority based on user count (more users = higher priority)
-            if (existingPack?.user_count > 1000) priority += 2;
-            else if (existingPack?.user_count > 100) priority += 1;
-        }
-
-        // Lower priority for previously failed attempts
+        // 1. Handle failed packs
         if (failure) {
-            priority = Math.max(-10, priority - failure.attempts);
+            const daysSinceLastAttempt = (now - new Date(failure.lastAttempt).getTime()) 
+                / (1000 * 60 * 60 * 24);
+            
+            // Base priority for failed packs
+            priority = -20;
+
+            // Recovery factor based on attempts and time
+            const recoveryDays = Math.pow(2, failure.attempts);
+            if (daysSinceLastAttempt > recoveryDays) {
+                const recoveryFactor = Math.floor(daysSinceLastAttempt / recoveryDays);
+                priority += Math.min(recoveryFactor, 10); // Cap recovery
+            }
+        } else {
+            // 2. Base priority from original position (normalized to small number)
+            
+            // Higher position = newer pack = higher priority
+            const position = this.originalOrder.get(rkey) || 0;
+            const totalPacks = this.originalOrder.size;
+            // Give newer packs (higher position) a higher priority boost
+            priority += Math.min(5, Math.floor((position / totalPacks) * 5));
+
+            // 3. Pack state priority
+            if (existingPack) {
+                // Age-based priority
+                const daysSinceUpdate = (now - new Date(existingPack.updated_at).getTime()) 
+                    / (1000 * 60 * 60 * 24);
+                
+                if (daysSinceUpdate > 14) priority += 3;
+                else if (daysSinceUpdate > 7) priority += 2;
+                else if (daysSinceUpdate > 2) priority += 1;
+
+                // Size/activity based priority
+                if (existingPack.user_count > 100) priority += 3;
+                else if (existingPack.user_count > 50) priority += 2;
+
+                if (existingPack.weekly_joins > 50) priority += 4;
+                else if (existingPack.weekly_joins > 10) priority += 3;
+            } else {
+                // New packs get medium priority
+                priority += 2;
+            }
+
+            // 4. Pack state adjustments
+            const packState = this.packStates.get(rkey);
+            if (packState) {
+                switch (packState.status) {
+                    case 'deleted':
+                        priority -= 15;
+                        break;
+                    case 'hidden':
+                        priority -= 10;
+                        break;
+                    case 'inactive':
+                        priority -= 5;
+                        break;
+                }
+            }
+        }
+
+        // 5. MongoDB status adjustments
+        if (mongoStatus?.lowPriority) {
+            priority -= 3;
         }
 
         return priority;
@@ -5105,9 +5182,12 @@ class TaskManager {
                 rkey,
                 reason: data.reason,
                 attempts: data.attempts,
-                timestamp: data.lastAttempt
+                timestamp: data.lastAttempt,
+                priority: this.calculateTaskPriority(rkey, null, data, null)
             })),
             missingProfiles: Array.from(this.missingProfiles),
+            packStates: Array.from(this.packStates.entries()),
+            originalOrder: Array.from(this.originalOrder.entries()),
             progress: {
                 initialTasks: this.totalInitialTasks,
                 discoveredTasks: this.newlyDiscoveredTasks,
@@ -5239,11 +5319,36 @@ class TaskManager {
     async getNextTask() {
         // Convert to array for sorting
         const tasks = Array.from(this.pendingTasks.values());
+
+        // Filter out deleted packs unless enough time has passed
+        const now = Date.now();
+        tasks = tasks.filter(task => {
+            const state = this.packStates.get(task.rkey);
+            if (!state) return true;
+            
+            if (state.status === 'deleted') {
+                const daysSince = (now - new Date(state.timestamp).getTime()) / (1000 * 60 * 60 * 24);
+                return daysSince > 30; // Only recheck deleted packs after 30 days
+            }
+            
+            return true;
+        });
         
-        // Sort by priority (higher first) and attempts (fewer first)
+        // Sort by priority
         tasks.sort((a, b) => {
-            if (a.priority !== b.priority) return b.priority - a.priority;
-            return a.attempts - b.attempts;
+            const priorityA = this.calculateTaskPriority(
+                a.rkey, 
+                this.fileHandler.getPack(a.rkey),
+                this.failures.get(a.rkey),
+                null
+            );
+            const priorityB = this.calculateTaskPriority(
+                b.rkey,
+                this.fileHandler.getPack(b.rkey),
+                this.failures.get(b.rkey),
+                null
+            );
+            return priorityB - priorityA;
         });
 
         return tasks[0] || null;
@@ -5458,6 +5563,19 @@ class TaskManager {
             const [handle, rkey] = line.split('|').map(s => s.trim());
             if (!handle || !rkey) continue;
 
+            // Add position tracking
+            this.originalOrder.set(rkey, this.originalOrder.size);
+
+            // Check pack state
+            const state = this.packStates.get(rkey);
+            if (state?.status === 'deleted') {
+                const daysSince = (Date.now() - new Date(state.timestamp).getTime()) / (1000 * 60 * 60 * 24);
+                if (daysSince < 30) {
+                    skipped.push({ rkey, reason: `deleted_${daysSince.toFixed(1)}_days_ago` });
+                    continue;
+                }
+            }
+
             // Check completed tasks from current run
             if (this.completedTasks.has(rkey)) {
                 skipped.push({ rkey, reason: 'already_completed' });
@@ -5601,7 +5719,7 @@ class TaskManager {
 // main function
 async function main() {
     const args = parseArgs();
-    logger.info('CLI args:', args);
+    logger.debug('CLI args:', args);
     validateEnv(args);
     
     let processor;

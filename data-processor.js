@@ -2848,26 +2848,101 @@ class MainProcessor {
         }
     
         try {
-            logger.info('Starting pack_ids cleanup...');
+            logger.info('Starting comprehensive pack_ids cleanup...');
             
-            const usersToFix = await this.dbManager.db.collection('users').find({
-                'pack_ids': { $elemMatch: { $type: 'object' } }
-            }).toArray();
+            // First, let's get a sample document to understand what we're dealing with
+            const sampleUser = await this.dbManager.db.collection('users').findOne({});
+            logger.info('Sample user pack_ids structure:', JSON.stringify(sampleUser.pack_ids));
     
-            logger.info(`Found ${usersToFix.length} users with $each operators to clean`);
-    
-            for (const user of usersToFix) {
-                const cleanPackIds = user.pack_ids.filter(id => typeof id === 'string');
-                
-                await this.dbManager.safeWrite('users', {
-                    filter: { did: user.did },
-                    update: { $set: { pack_ids: cleanPackIds } }
+            // Use a raw query to get all documents and filter in application code
+            const allUsers = await this.dbManager.db.collection('users').find({}).toArray();
+            
+            // Filter users with $each problems in application code
+            const problematicUsers = allUsers.filter(user => {
+                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
+                    return id && typeof id === 'object' && '$each' in id;
                 });
+            });
+    
+            logger.info(`Found ${problematicUsers.length} users with $each operators in pack_ids`);
+    
+            let successCount = 0;
+            let failCount = 0;
+    
+            for (const user of problematicUsers) {
+                try {
+                    logger.info(`Processing user DID: ${user.did}`);
+                    logger.info(`Original pack_ids: ${JSON.stringify(user.pack_ids)}`);
+    
+                    // Clean pack_ids array
+                    let cleanPackIds = [];
+                    
+                    if (Array.isArray(user.pack_ids)) {
+                        cleanPackIds = user.pack_ids
+                            .reduce((acc, id) => {
+                                if (typeof id === 'string') {
+                                    acc.push(id);
+                                } else if (id && typeof id === 'object' && '$each' in id) {
+                                    logger.info(`Found $each object: ${JSON.stringify(id)} for user ${user.did}`);
+                                    if (Array.isArray(id.$each)) {
+                                        const validStrings = id.$each.filter(item => typeof item === 'string');
+                                        logger.info(`Extracted ${validStrings.length} valid strings from $each array`);
+                                        acc.push(...validStrings);
+                                    }
+                                }
+                                return acc;
+                            }, []);
+    
+                        // Remove duplicates
+                        cleanPackIds = [...new Set(cleanPackIds)];
+                    }
+    
+                    logger.info(`Cleaned pack_ids: ${JSON.stringify(cleanPackIds)}`);
+    
+                    // Update the user document
+                    const updateResult = await this.dbManager.safeWrite('users', {
+                        filter: { did: user.did },
+                        update: { $set: { pack_ids: cleanPackIds } }
+                    });
+    
+                    if (updateResult.modifiedCount > 0) {
+                        logger.info(`Successfully updated user ${user.did}`);
+                        successCount++;
+                    } else {
+                        logger.warn(`No changes made for user ${user.did}`);
+                        failCount++;
+                    }
+    
+                    // Verify the update
+                    const verifyUser = await this.dbManager.db.collection('users').findOne({ did: user.did });
+                    logger.info(`Verification - Updated pack_ids: ${JSON.stringify(verifyUser.pack_ids)}`);
+    
+                } catch (userError) {
+                    logger.error(`Error processing user ${user.did}:`, userError);
+                    failCount++;
+                }
             }
     
-            logger.info('Pack_ids cleanup completed successfully');
+            logger.info('Pack_ids cleanup completed');
+            logger.info(`Successfully processed: ${successCount} users`);
+            logger.info(`Failed to process: ${failCount} users`);
+    
+            // Final verification
+            const allUsersAfter = await this.dbManager.db.collection('users').find({}).toArray();
+            const remainingIssues = allUsersAfter.filter(user => {
+                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
+                    return id && typeof id === 'object' && '$each' in id;
+                });
+            }).length;
+    
+            if (remainingIssues > 0) {
+                logger.warn(`Found ${remainingIssues} users still having $each operators after cleanup`);
+            } else {
+                logger.info('No remaining $each operators found');
+            }
+    
         } catch (err) {
-            logger.error('Error during pack_ids cleanup:', err);
+            logger.error('Fatal error during pack_ids cleanup:', err);
             throw err;
         }
     }
@@ -6012,6 +6087,7 @@ async function main() {
         metrics.recordStartup();
 
         if (args.cleanpackids) {
+
             // Only initialize what we need for cleanup
             processor = new MainProcessor({
                 noMongoDB: args.noMongoDB,

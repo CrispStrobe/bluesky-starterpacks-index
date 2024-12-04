@@ -4681,6 +4681,7 @@ class TaskManager {
         this.completedTasks = new Set();
         this.failures = new Map();
         this.packStates = new Map();
+        this.discoveredTasksQueue = new Set();
 
         // Progress tracking
         this.initialTaskCount = 0;
@@ -4693,6 +4694,7 @@ class TaskManager {
         this.packRelationships = new Map();
         this.missingProfiles = new Set();
         this.processedProfiles = new Set();
+        this.processingDiscoveredTasks = false;
 
         // Checkpoint management
         this.lastCheckpoint = Date.now();
@@ -4834,7 +4836,7 @@ class TaskManager {
         if (forceProcess) {
             return { process: true };
         }
-        
+
         // First check permanent failures
         if (failure?.permanent) {
             return { process: false, reason: 'permanent_failure' };
@@ -5517,18 +5519,17 @@ class TaskManager {
 
         // Only count as newly discovered if we haven't seen it before
         if (!this.discoveredPacksMap.has(packInfo.rkey)) {
-            this.newlyDiscoveredTasks++;
+            this.discoveredTaskCount++;  // Use discoveredTaskCount instead of newlyDiscoveredTasks
             this.discoveredPacksMap.set(packInfo.rkey, {
                 discoveredAt: new Date().toISOString(),
                 discoveredFrom: parentDid
             });
-            this.totalTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
-            
+
             logger.debug('New pack discovered:', {
                 rkey: packInfo.rkey,
                 from: parentDid,
-                totalDiscovered: this.newlyDiscoveredTasks,
-                newTotal: this.totalTasks
+                totalDiscovered: this.discoveredTaskCount,
+                totalTasks: this.getTotalTasks()
             });
         }
 
@@ -5547,6 +5548,9 @@ class TaskManager {
 
         if (added) {
             this.processingDiscoveredTasks = true;
+            if (!this.discoveredTasksQueue) {
+                this.discoveredTasksQueue = new Set();  // Safety check
+            }
             this.discoveredTasksQueue.add(packInfo.rkey);
             this.recordPackRelationship(packInfo.rkey, parentDid);
             await this.maybeWriteCheckpoint();

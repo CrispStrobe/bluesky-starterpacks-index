@@ -3430,11 +3430,13 @@ class MainProcessor {
                     await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
     
                     // Skip if we shouldn't process this pack
+                    logger.debug('checking if we shall skip the pack:', forceProcess);
                     if (!forceProcess) {  // Skip recent checks only if force processing
                         const shouldProcess = await this.taskManager.shouldProcessPack(rkey, 
                             await this.fileHandler.getPack(rkey),
                             this.taskManager.failures.get(rkey)
                         );
+                        logger.debug('shall skip the pack?', shouldProcess);
     
                         if (!shouldProcess.process) {
                             results.skipped++;
@@ -4523,7 +4525,7 @@ async function quickProcessUser(identifier, options = {}) {
             isInitialUser: currentDepth === 0,
             source: 'quick_process',
             parentPack,
-            forceProcess: true  // ignore if profile is already in mongodb, enforce parsing
+            forceProcess: true  // ignore if profile is already in mongodb, enforce
         });
 
         // 4. Process discovered packs if we haven't hit depth limit

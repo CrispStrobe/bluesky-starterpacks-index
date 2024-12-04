@@ -3159,7 +3159,8 @@ class MainProcessor {
                 return false;
             }
     
-            if (packState.hidden) {
+            // Check if pack is hidden/deleted
+            if (pack.starterPack.record?.hidden) {
                 await this.taskManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
                 return false;
             }
@@ -4669,55 +4670,42 @@ async function quickProcessPack(identifier, options = {}) {
 
 class TaskManager {
     constructor(fileHandler, debug = false, dbManager = null, noMongoDB = false) {
+        // Dependencies
         this.fileHandler = fileHandler;
         this.debug = debug;
         this.dbManager = dbManager;
         this.noMongoDB = noMongoDB;
 
-        if (!this.noMongoDB && !dbManager) {
-            throw new Error('Database manager is required when MongoDB is enabled');
-        }
-
-        // Core state tracking
-        this.pendingPacks = new Map();  // {rkey: {handle, startTime, priority, source}}
-        this.completedPacks = new Set();
-        this.failedPacks = new Map();   // {rkey: {status, reason, timestamp, attempts, permanent}}
-        this.originalOrder = new Map();  // Track position in URLs file for priority
+        // Core task tracking
+        this.pendingTasks = new Map();
+        this.completedTasks = new Set();
+        this.failures = new Map();
+        this.packStates = new Map();
 
         // Progress tracking
-        this.totalInitialTasks = 0;
-        this.newlyDiscoveredTasks = 0;
+        this.initialTaskCount = 0;
+        this.discoveredTaskCount = 0;
         this.completedTaskCount = 0;
+
+        // Discovery tracking
+        this.originalOrder = new Map();
+        this.discoveredPacksMap = new Map();
+        this.packRelationships = new Map();
+        this.missingProfiles = new Set();
+        this.processedProfiles = new Set();
 
         // Checkpoint management
         this.lastCheckpoint = Date.now();
         this.CHECKPOINT_INTERVAL = 20 * 60 * 1000;
         this.checkpointDirty = false;
 
-        // For handling associated discoveries
-        this.discoveredPacksMap = new Map();
-        this.processedProfiles = new Set();  // Track which profiles we've checked for packs
+        // Metrics reference
+        this.metrics = metrics;
 
-        this.metrics = metrics;  // Global metrics reference
-
-        // rest...
-        this.pendingTasks = new Map();
-        this.completedTasks = new Set();
-        this.failures = new Map();
-        this.missingProfiles = new Set();
-        this.packRelationships = new Map();
-        this.startTime = Date.now();
-        this.totalTasks = 0;
-        this.currentPackUsersTotal = 0;
-        this.currentPackUsersProcessed = 0;
-        this.processingDiscoveredTasks = false;
-        this.discoveredTasksQueue = new Set();
-        this.originalOrder = new Map(); // Track position in URLs file
-        this.packStates = new Map();    // Track pack states like deleted/hidden
-        this.completedPacks = new Set();
-        this.failedPacks = new Map();  // Combines failures and pack states
-        this.pendingPacks = new Map();
-        this.metrics = metrics;        // Reference to global metrics
+        // Validation
+        if (!this.noMongoDB && !dbManager) {
+            throw new Error('Database manager is required when MongoDB is enabled');
+        }
     }
 
     updatePackState(rkey, status, reason) {
@@ -4727,35 +4715,6 @@ class TaskManager {
             timestamp: new Date().toISOString()
         });
         this.markDirty();
-    }
-
-    async processBatch(processor, batchSize = 5) {
-        const tasks = [];
-        const seenRkeys = new Set();
-        
-        // Get unique tasks
-        while (tasks.length < batchSize && this.pendingTasks.size > 0) {
-            const task = await this.getNextTask();
-            if (task && !seenRkeys.has(task.rkey)) {
-                tasks.push(task);
-                seenRkeys.add(task.rkey);
-            }
-        }
-    
-        if (tasks.length === 0) return null;
-    
-        const results = await Promise.all(
-            tasks.map(task => processor.processStarterPack(`${task.handle}|${task.rkey}`))
-        );
-    
-        for (let i = 0; i < tasks.length; i++) {
-            if (results[i]) {
-                this.completedTasks.add(tasks[i].rkey);
-                this.pendingTasks.delete(tasks[i].rkey);
-            }
-        }
-    
-        return results.some(r => r);
     }
 
     async initializeTaskList() {
@@ -4868,7 +4827,14 @@ class TaskManager {
         }
     }
 
-    async shouldProcessPack(rkey, existingPack, failure) {
+    async shouldProcessPack(rkey, existingPack, failure, options = {}) {
+        const { forceProcess = false } = options;
+
+        // For quick process, bypass recency checks
+        if (forceProcess) {
+            return { process: true };
+        }
+        
         // First check permanent failures
         if (failure?.permanent) {
             return { process: false, reason: 'permanent_failure' };
@@ -5439,23 +5405,27 @@ class TaskManager {
     }
 
     async addTask(taskData) {
-        const { handle, rkey, priority = 0, source = 'direct', parentDid = null } = taskData;
+        const { 
+            handle, 
+            rkey, 
+            priority = 0, 
+            source = 'direct',
+            parentDid = null 
+        } = taskData;
 
+        // Skip if already completed or permanently failed
         if (this.completedTasks.has(rkey)) {
-            if (this.debug) {
-                logger.debug(`Skipping already completed task: ${rkey}`);
-            }
+            if (this.debug) logger.debug(`Skipping already completed task: ${rkey}`);
             return false;
         }
 
         const failure = this.failures.get(rkey);
         if (failure?.permanent) {
-            if (this.debug) {
-                logger.debug(`Skipping permanently failed task: ${rkey}`);
-            }
+            if (this.debug) logger.debug(`Skipping permanently failed task: ${rkey}`);
             return false;
         }
 
+        // Add new task
         this.pendingTasks.set(rkey, {
             handle,
             rkey,
@@ -5465,9 +5435,21 @@ class TaskManager {
             addedAt: new Date().toISOString(),
             attempts: failure?.attempts || 0
         });
-        this.markDirty();
-        await this.maybeWriteCheckpoint(); 
 
+        // Update task counts
+        if (source === 'initial') {
+            this.initialTaskCount++;
+        } else {
+            this.discoveredTaskCount++;
+        }
+
+        this.markDirty();
+        await this.maybeWriteCheckpoint();
+        
+        if (this.debug) {
+            logger.debug(`Added task ${rkey} (${source}), total tasks: ${this.getTotalTasks()}`);
+        }
+        
         return true;
     }
 
@@ -5587,41 +5569,49 @@ class TaskManager {
     }
 
     async processNextTask(processor) {
-        if (this.pendingTasks.size === 0 && this.discoveredTasksQueue.size > 0) {
-            this.processingDiscoveredTasks = true;
-        }
-
         const task = await this.getNextTask();
         if (!task) return null;
-
-        this.completedTaskCount++;
-        const totalTasks = this.totalInitialTasks + this.newlyDiscoveredTasks;
-        const progress = this.processingDiscoveredTasks ? 
-            'Processing discovered packs' :
-            `Processing pack ${this.completedTaskCount}/${this.totalTasks + this.newlyDiscoveredTasks}`;
-        
-        logger.info(`${progress}: ${task.rkey} (${task.handle})`);
-
+    
         try {
+            // Log progress
+            this.completedTaskCount++;
+            const totalTasks = this.getTotalTasks();
+            const progress = Math.floor((this.completedTaskCount / totalTasks) * 100);
+                
+            logger.info(`Processing pack ${this.completedTaskCount}/${totalTasks} (${progress}%)`);
+    
+            // Process the task
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
-            
+                
             if (success) {
                 this.completedTasks.add(task.rkey);
                 this.pendingTasks.delete(task.rkey);
-                this.discoveredTasksQueue.delete(task.rkey);
                 this.markDirty();
-                logger.info(`Pack processing complete (${progress}% overall progress)`, {
-                    totalPacks: totalTasks,
-                    processed: this.completedTaskCount,
-                    discovered: this.newlyDiscoveredTasks
-                });
             }
-
+    
             return success;
         } catch (err) {
             logger.error(`Error processing task ${task.rkey}:`, err);
             return false;
         }
+    }
+
+    getTotalTasks() {
+        return Math.max(
+            this.initialTaskCount + this.discoveredTaskCount,
+            this.completedTaskCount + this.pendingTasks.size
+        );
+    }
+
+    getProgressStats() {
+        const total = this.getTotalTasks();
+        return {
+            total,
+            completed: this.completedTaskCount,
+            pending: this.pendingTasks.size,
+            discovered: this.discoveredTaskCount,
+            progress: total > 0 ? Math.floor((this.completedTaskCount / total) * 100) : 0
+        };
     }
 
     hasMoreWork() {

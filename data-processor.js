@@ -3155,13 +3155,13 @@ class MainProcessor {
             const pack = await this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri });
 
             if (!pack?.starterPack) {
-                await this.taskManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
+                await this.dbManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
                 return false;
             }
     
             // Check if pack is hidden/deleted
             if (pack.starterPack.record?.hidden) {
-                await this.taskManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
+                await this.dbManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
                 return false;
             }
     
@@ -3257,7 +3257,7 @@ class MainProcessor {
     
             // 7. Update task state and metrics
             await this.taskManager.markTaskCompleted(rkey);
-            await this.taskManager.markPackStatus(rkey, 'completed', null);
+            await this.dbManager.markPackStatus(rkey, 'completed', null);
         
             metrics.recordPackProcessing(true, Date.now() - startTime);
     

@@ -1806,7 +1806,7 @@ class FileHandler {
 }
 
 class ApiHandler {
-    constructor(agent, rateLimiter) {
+    constructor(agent, rateLimiter, fileHandler) {
         if (!agent) throw new Error('BskyAgent is required');
         this.agent = agent;
         this.rateLimiter = rateLimiter;

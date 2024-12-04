@@ -345,25 +345,29 @@ function printUserResults(data) {
         }
         console.log(chalk.dim(`DID: ${user.did}`));
 
-        // Get packs this user belongs to
-        const userPacks = packs.filter(pack =>
-            user.pack_ids && user.pack_ids.includes(pack.rkey)
+        // Clean and filter pack_ids before displaying
+        const cleanPackIds = (user.pack_ids || []).filter(id => 
+            typeof id === 'string' && !id.startsWith('$')
         );
 
-        if (userPacks.length > 0) {
-            console.log(chalk.yellow('\nMember of the following packs:'));
-            userPacks.forEach(pack => {
-                console.log(chalk.dim(`- ${pack.name} (${pack.rkey})`));
-                if (pack.description) {
-                    console.log(chalk.dim(`  Description: ${pack.description}`));
-                }
-                console.log(chalk.dim(`  URL: https://bsky.app/profile/${pack.creator}/lists/${pack.rkey}`));
-            });
-        } else if (user.pack_ids && user.pack_ids.length > 0) {
-            console.log(chalk.yellow('\nMember of packs (IDs only):'));
-            user.pack_ids.forEach(packId => {
-                console.log(chalk.dim(`- ${packId}`));
-            });
+        if (cleanPackIds.length > 0) {
+            const userPacks = packs.filter(pack => cleanPackIds.includes(pack.rkey));
+
+            if (userPacks.length > 0) {
+                console.log(chalk.yellow('\nMember of the following packs:'));
+                userPacks.forEach(pack => {
+                    console.log(chalk.dim(`- ${pack.name} (${pack.rkey})`));
+                    if (pack.description) {
+                        console.log(chalk.dim(`  Description: ${pack.description}`));
+                    }
+                    console.log(chalk.dim(`  URL: https://bsky.app/profile/${pack.creator}/lists/${pack.rkey}`));
+                });
+            } else {
+                console.log(chalk.yellow('\nMember of packs (IDs only):'));
+                cleanPackIds.forEach(packId => {
+                    console.log(chalk.dim(`- ${packId}`));
+                });
+            }
         }
     });
 }

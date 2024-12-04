@@ -80,13 +80,22 @@ async function searchMongoDB(searchTerm, isExact, isCaseSensitive) {
         const matchingUsers = await db.collection('users').find(userQuery).toArray();
         console.log(`Found ${matchingUsers.length} matching users`);
 
-        // Get all unique pack IDs from matching users
-        const packIds = [...new Set(matchingUsers.flatMap(user => user.pack_ids || []))];
+        // Clean pack_ids by filtering out $each objects and flattening
+        const packIds = [...new Set(matchingUsers.flatMap(user => 
+            (user.pack_ids || []).filter(id => 
+                typeof id === 'string' && !id.startsWith('$')
+            )
+        ))];
+
         console.log(`Found ${packIds.length} unique pack IDs from users:`, packIds);
 
-        // Get all users from matching packs for accurate user counts
+        // Get all users from matching packs if we have any pack IDs
         const allPackUsers = packIds.length > 0 ?
-            await db.collection('users').find({ pack_ids: { $in: packIds } }).toArray() : [];
+            await db.collection('users').find({ 
+                pack_ids: { 
+                    $in: packIds  // Now packIds only contains valid strings
+                } 
+            }).toArray() : [];
 
         // Group users by pack ID
         const usersByPack = new Map();

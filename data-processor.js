@@ -1810,6 +1810,7 @@ class ApiHandler {
         if (!agent) throw new Error('BskyAgent is required');
         this.agent = agent;
         this.rateLimiter = rateLimiter;
+        this.fileHandler = fileHandler;  // Store fileHandler
         this.publicEndpoint = 'https://public.api.bsky.app';
     }
 
@@ -1974,14 +1975,16 @@ class ApiHandler {
 
                 // Only try fallbacks if public API fails
                 // 1. Check local cache for exact handle match
-                const cachedUser = await this.fileHandler.getUser(sanitized);
-                if (cachedUser?.did) return cachedUser.did;
+                if (this.fileHandler) {  // Check if fileHandler exists
+                    const cachedUser = await this.fileHandler.getUser(sanitized);
+                    if (cachedUser?.did) return cachedUser.did;
 
-                // 2. Check handle history in local cache
-                const historicalUser = await this.fileHandler.getUserByHistoricalHandle(sanitized);
-                if (historicalUser?.did) {
-                    logger.info(`Found user ${sanitized} in handle history, current handle: ${historicalUser.handle}`);
-                    return historicalUser.did;
+                    // 2. Check handle history in local cache
+                    const historicalUser = await this.fileHandler.getUserByHistoricalHandle(sanitized);
+                    if (historicalUser?.did) {
+                        logger.info(`Found user ${sanitized} in handle history, current handle: ${historicalUser.handle}`);
+                        return historicalUser.did;
+                    }
                 }
 
                 // 3. Last resort: try search
@@ -3048,8 +3051,12 @@ class MainProcessor {
                 password: process.env.BSKY_PASSWORD
             });
             
-            // Create API handler after successful authentication
-            this.apiHandler = new ApiHandler(this.agent, this.rateLimiter);
+            // Create API handler after successful authentication, passing fileHandler
+            this.apiHandler = new ApiHandler(
+                this.agent, 
+                this.rateLimiter,
+                this.fileHandler  // Pass fileHandler
+            );
             
             // Initialize verification handler with authenticated API handler
             logger.debug('ErrorVerificationHandler initializing');

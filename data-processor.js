@@ -3719,7 +3719,8 @@ class MainProcessor {
             processingId = `${Date.now()}-${Math.random()}`,
             source = 'direct',
             existingMemberships = [],     
-            existingCreatedPacks = []     
+            existingCreatedPacks = [],
+            forceProcess = false,     
         } = options;
     
         const startTime = Date.now();
@@ -3852,7 +3853,8 @@ class MainProcessor {
                 logger.debug(`Processing ${currentProfile.associated.starterPacks} associated packs.`);
                 const packResults = await this.processAssociatedPacks(currentProfile, {
                     parentDid: currentProfile.did,
-                    processingId
+                    processingId,
+                    forceProcess
                 });
                 changes.packs = packResults;
 

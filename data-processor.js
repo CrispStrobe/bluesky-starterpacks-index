@@ -1815,7 +1815,7 @@ class ApiHandler {
 
     async makePublicApiCall(endpoint, params) {
         try {
-            logger.debug('Public Bluesky API Call initiating:', endpoint, params)
+            logger.debug(`Public Bluesky API Call initiating for ${endpoint}:`, params);
             
             const url = new URL(`/xrpc/${endpoint}`, this.publicEndpoint);
             Object.entries(params).forEach(([key, value]) => {
@@ -1844,6 +1844,7 @@ class ApiHandler {
         let response;
         switch (endpoint) {
             case 'app.bsky.actor.getProfile':
+                logger.debug(`Calling (with Auth) getProfile:`, {params});
                 response = await this.agent.getProfile(params);
                 break;
             case 'app.bsky.graph.getList':
@@ -1866,7 +1867,7 @@ class ApiHandler {
     }
 
     async makeApiCall(endpoint, params, options = {}) {
-        logger.debug(`ApiHandler: makeApiCall:`, endpoint, params, options)
+        logger.debug(`ApiHandler: makeApiCall for ${endpoint}:`, params, options)
         await this.rateLimiter.throttle();
     
         // Try public API first unless auth is required
@@ -3639,6 +3640,7 @@ class MainProcessor {
     
             // 2. Always try to get current profile state from API
             const currentProfile = await this.apiHandler.getProfile(profile.did);
+            logger.debug('getProfile result to process:', currentProfile);
             
             // 3. Handle non-existent/deleted profiles
             if (!currentProfile) {
@@ -3696,6 +3698,7 @@ class MainProcessor {
                 throw new Error('Invalid profile data: missing DID');
             }
             const existingProfile = await this.fileHandler.getUser(profile.did);
+            logger.debug('getUser result to process:', existingProfile);
                 
             // 5. Detect all relevant changes
             const profileState = {
@@ -3708,6 +3711,7 @@ class MainProcessor {
     
             // 6. Early return if no update needed
             if (!force && existingProfile) {
+                logger.debug('No update needed.');
                 const daysSinceUpdate = (Date.now() - new Date(existingProfile.last_updated).getTime()) 
                     / (1000 * 60 * 60 * 24);
                 if (daysSinceUpdate < 7) {
@@ -3743,10 +3747,12 @@ class MainProcessor {
             };
     
             // 8. Update files first (append-only operations)
+            logger.debug('appending user data to files:', userData);
             await this.fileHandler.appendUser(userData);
     
             // 9. Update creator's packs if name changed
             if ((profileState.isRenamed || profileState.hasDisplayNameChange) && profileState.isCreator) {
+                logger.debug('Namechange detected.');
                 const affectedPacks = await this.fileHandler.getPacksByCreator(currentProfile.did);
                 
                 for (const pack of affectedPacks) {
@@ -3790,6 +3796,7 @@ class MainProcessor {
     
             // 11. Process associated packs if needed
             if (processAssociated && currentProfile.associated?.starterPacks > 0) {
+                logger.debug(`commening processing ${currentProfile.associated.starterPacks} associated packs.`);
                 const packResults = await this.processAssociatedPacks(currentProfile, {
                     parentDid: currentProfile.did,
                     processingId
@@ -3799,12 +3806,14 @@ class MainProcessor {
                 // For quick process, handle discovered packs immediately
                 if (source === 'quick_process') {
                     while (this.taskManager.pendingTasks.size > 0) {
+                        logger.debug('processing next task...');
                         await this.taskManager.processNextTask(this);
                     }
                 }
             }
     
             // 12. Record changes
+            logger.debug('recording state changes...');
             if (profileState.isNew) changes.added.push(currentProfile.did);
             if (profileState.isRenamed) changes.renamed.push({
                 did: currentProfile.did,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v010
+// v011
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -2519,7 +2519,7 @@ class DatabaseManager {
                 operation.update.$set.created_packs = operation.update.$set.created_packs || [];
             }
         }
-
+    
         // If creating a new document, ensure arrays are initialized
         if (options.upsert) {
             operation.update.$setOnInsert = operation.update.$setOnInsert || {};
@@ -2530,95 +2530,26 @@ class DatabaseManager {
                 operation.update.$setOnInsert.created_packs = [];
             }
         }
-        
-        // If we're updating pack_ids, ensure we handle them cleanly
-        if (operation.update?.$addToSet?.pack_ids) {
-            // Convert $addToSet with $each to a clean array update
-            const newPackIds = operation.update.$addToSet.pack_ids.$each || 
-                            [operation.update.$addToSet.pack_ids];
-            
-            // Use $set instead with a clean array
-            operation.update.$set = operation.update.$set || {};
-            delete operation.update.$addToSet;
-            
-            // First get current pack_ids
-            const doc = await this.db.collection(collection)
-                .findOne(operation.filter, { projection: { pack_ids: 1 } });
-            
-            // Combine existing and new, ensuring uniqueness
-            const currentPackIds = (doc?.pack_ids || []).filter(id => typeof id === 'string');
-            operation.update.$set.pack_ids = [...new Set([...currentPackIds, ...newPackIds])];
-        }
-
+    
         const maxRetries = 5;
         let lastError = null;
     
-        if (collection === 'users') {
-            // If we're updating a user, ensure we don't overwrite pack_ids with $set
-            if (operation.update.$set && 'pack_ids' in operation.update.$set) {
-                logger.debug(`Updating user, so membership list is safed to be appended only.`)
-                // Move pack_ids to $addToSet if it exists in $set
-                if (!operation.update.$addToSet) {
-                    operation.update.$addToSet = {};
-                }
-                if (Array.isArray(operation.update.$set.pack_ids)) {
-                    operation.update.$addToSet.pack_ids = {
-                        $each: operation.update.$set.pack_ids
-                    };
-                }
-                // Remove pack_ids from $set to prevent overwriting
-                delete operation.update.$set.pack_ids;
-            }
-        }
-        
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 await this.enforceOperationDelay();
-                
-                // Ensure we have an active session
                 await this.ensureSession();
-                
-                // Use the session in the operation
+    
                 const sessionOptions = {
                     ...options,
-                    session: this.session
+                    session: this.session,
+                    upsert: true
                 };
-
-                if (operation.update.$addToSet?.pack_ids) {
-                    const doc = await this.db.collection(collection)
-                        .findOne(operation.filter, { 
-                            projection: { _id: 1, pack_ids: 1 },
-                            session: this.session
-                        });
     
-                    if (!doc) {
-                        await this.db.collection(collection).insertOne({
-                            ...operation.filter,
-                            pack_ids: [operation.update.$addToSet.pack_ids],
-                            ...(operation.update.$set || {})
-                        }, sessionOptions);
-                    } else {
-                        const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
-                        if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
-                            await this.db.collection(collection).updateOne(
-                                operation.filter,
-                                { 
-                                    $set: { 
-                                        pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
-                                        ...(operation.update.$set || {})
-                                    }
-                                },
-                                sessionOptions
-                            );
-                        }
-                    }
-                } else {
-                    await this.db.collection(collection).updateOne(
-                        operation.filter,
-                        operation.update,
-                        { ...sessionOptions, upsert: true }
-                    );
-                }
+                await this.db.collection(collection).updateOne(
+                    operation.filter,
+                    operation.update,
+                    sessionOptions
+                );
     
                 this.consecutiveThrottles = 0;
                 return;

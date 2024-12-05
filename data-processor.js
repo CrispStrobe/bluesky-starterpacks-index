@@ -2146,6 +2146,84 @@ class DatabaseManager {
         this.session = null;
     }
 
+    // Helper function for cleaning pack_ids array
+    sanitizePackIds(packIds) {
+        if (!Array.isArray(packIds)) {
+            return typeof packIds === 'string' ? [packIds] : [];
+        }
+        
+        // Filter and clean array items
+        const cleaned = packIds.reduce((acc, id) => {
+            if (typeof id === 'string') {
+                acc.push(id);
+            } else if (id && typeof id === 'object' && id.$each) {
+                if (Array.isArray(id.$each)) {
+                    acc.push(...id.$each.filter(item => typeof item === 'string'));
+                }
+            }
+            return acc;
+        }, []);
+        
+        // Remove duplicates and empty values
+        return [...new Set(cleaned.filter(Boolean))];
+    }
+
+    async performPackIdsCleanup() {
+        if (this.noMongoDB || this.noDBWrites) {
+            logger.info('Skipping pack_ids cleanup - MongoDB not enabled');
+            return;
+        }
+    
+        try {
+            logger.info('Starting comprehensive pack_ids cleanup operation...');
+            
+            const allUsers = await this.db.collection('users').find({}).toArray();
+            const problematicUsers = allUsers.filter(user => {
+                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => 
+                    id && typeof id === 'object' && '$each' in id
+                );
+            });
+    
+            logger.info(`Found ${problematicUsers.length} users with $each operators`);
+    
+            for (const user of problematicUsers) {
+                try {
+                    const cleanedIds = this.sanitizePackIds(user.pack_ids);
+                    await this.safeWrite('users', {
+                        filter: { did: user.did },
+                        update: { $set: { pack_ids: cleanedIds } }
+                    });
+                    
+                    logger.info(`Cleaned pack_ids for user ${user.did}`);
+                } catch (err) {
+                    logger.error(`Failed to clean pack_ids for user ${user.did}:`, err);
+                }
+            }
+    
+            logger.info('Pack_ids cleanup completed');
+            logger.info(`Successfully processed: ${successCount} users`);
+            logger.info(`Failed to process: ${failCount} users`);
+    
+            // Final verification
+            const allUsersAfter = await this.db.collection('users').find({}).toArray();
+            const remainingIssues = allUsersAfter.filter(user => {
+                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
+                    return id && typeof id === 'object' && '$each' in id;
+                });
+            }).length;
+    
+            if (remainingIssues > 0) {
+                logger.warn(`Found ${remainingIssues} users still having $each operators after cleanup`);
+            } else {
+                logger.info('No remaining $each operators found');
+            }
+    
+        } catch (err) {
+            logger.error('Fatal error during pack_ids cleanup:', err);
+            throw err;
+        }
+    }
+
     async connect(maxRetries = 2) {
         logger.debug('connect');
         for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -2804,84 +2882,6 @@ class MainProcessor {
 
         this.profileCache = new Map();
         this.profileCacheTTL = 24 * 60 * 60 * 1000;
-    }
-
-    // Helper function for cleaning pack_ids array
-    sanitizePackIds(packIds) {
-        if (!Array.isArray(packIds)) {
-            return typeof packIds === 'string' ? [packIds] : [];
-        }
-        
-        // Filter and clean array items
-        const cleaned = packIds.reduce((acc, id) => {
-            if (typeof id === 'string') {
-                acc.push(id);
-            } else if (id && typeof id === 'object' && id.$each) {
-                if (Array.isArray(id.$each)) {
-                    acc.push(...id.$each.filter(item => typeof item === 'string'));
-                }
-            }
-            return acc;
-        }, []);
-        
-        // Remove duplicates and empty values
-        return [...new Set(cleaned.filter(Boolean))];
-    }
-
-    async performPackIdsCleanup() {
-        if (this.noMongoDB || this.noDBWrites) {
-            logger.info('Skipping pack_ids cleanup - MongoDB not enabled');
-            return;
-        }
-    
-        try {
-            logger.info('Starting comprehensive pack_ids cleanup operation...');
-            
-            const allUsers = await this.db.collection('users').find({}).toArray();
-            const problematicUsers = allUsers.filter(user => {
-                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => 
-                    id && typeof id === 'object' && '$each' in id
-                );
-            });
-    
-            logger.info(`Found ${problematicUsers.length} users with $each operators`);
-    
-            for (const user of problematicUsers) {
-                try {
-                    const cleanedIds = this.sanitizePackIds(user.pack_ids);
-                    await this.safeWrite('users', {
-                        filter: { did: user.did },
-                        update: { $set: { pack_ids: cleanedIds } }
-                    });
-                    
-                    logger.info(`Cleaned pack_ids for user ${user.did}`);
-                } catch (err) {
-                    logger.error(`Failed to clean pack_ids for user ${user.did}:`, err);
-                }
-            }
-    
-            logger.info('Pack_ids cleanup completed');
-            logger.info(`Successfully processed: ${successCount} users`);
-            logger.info(`Failed to process: ${failCount} users`);
-    
-            // Final verification
-            const allUsersAfter = await this.dbManager.db.collection('users').find({}).toArray();
-            const remainingIssues = allUsersAfter.filter(user => {
-                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
-                    return id && typeof id === 'object' && '$each' in id;
-                });
-            }).length;
-    
-            if (remainingIssues > 0) {
-                logger.warn(`Found ${remainingIssues} users still having $each operators after cleanup`);
-            } else {
-                logger.info('No remaining $each operators found');
-            }
-    
-        } catch (err) {
-            logger.error('Fatal error during pack_ids cleanup:', err);
-            throw err;
-        }
     }
 
     async handleProfileError(err, context) {
@@ -6059,7 +6059,7 @@ async function main() {
             });
             
             await processor.initMinimal();
-            await processor.performPackIdsCleanup();
+            await processor.dbManager.performPackIdsCleanup();
             return;
         }
         

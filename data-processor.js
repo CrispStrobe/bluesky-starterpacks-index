@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v014
+// v015
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -3546,23 +3546,15 @@ class MainProcessor {
                     const rkey = await this.extractRkeyFromURI(pack.uri);
                     const memberCount = pack.starterPack?.record?.items?.length || 0;
                     
-                    const added = await this.taskManager.addTask({
-                        handle: currentProfile.handle,
+                    // Use taskManager to handle the pack discovery and addition
+                    const added = await this.taskManager.addAssociatedPack({
                         rkey,
-                        source: 'associated',
-                        parentDid: currentProfile.did,
-                        memberCount,
-                        discoveredAt: new Date().toISOString()
-                    });
+                        creator: currentProfile.handle,
+                        memberCount
+                    }, currentProfile.did);
     
                     if (added) {
-                        this.discoveredPacksMap.set(rkey, {
-                            discoveredAt: new Date().toISOString(),
-                            discoveredFrom: currentProfile.did,
-                            memberCount
-                        });
                         results.queued++;
-                        
                         if (options.forceProcess) {
                             await this.processStarterPack(`${currentProfile.handle}|${rkey}`);
                         }

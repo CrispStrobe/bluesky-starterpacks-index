@@ -2457,7 +2457,54 @@ class DatabaseManager {
         throw new Error(`Max retries (${maxRetries}) exceeded for ${name}`);
     }
 
+    async fixNullArrays() {
+        if (this.noMongoDB || this.noDBWrites) {
+            return;
+        }
+    
+        try {
+            // Fix users with null pack_ids
+            await this.db.collection('users').updateMany(
+                { pack_ids: null },
+                { $set: { pack_ids: [] } }
+            );
+    
+            // Fix users with null created_packs
+            await this.db.collection('users').updateMany(
+                { created_packs: null },
+                { $set: { created_packs: [] } }
+            );
+    
+            logger.info('Fixed null arrays in database');
+        } catch (err) {
+            logger.error('Error fixing null arrays:', err);
+            throw err;
+        }
+    }
+
     async safeWrite(collection, operation, options = {}) {
+        // Ensure pack_ids is always an array
+        if (operation.update?.$set) {
+            // Initialize arrays if they're null or undefined
+            if ('pack_ids' in operation.update.$set) {
+                operation.update.$set.pack_ids = operation.update.$set.pack_ids || [];
+            }
+            if ('created_packs' in operation.update.$set) {
+                operation.update.$set.created_packs = operation.update.$set.created_packs || [];
+            }
+        }
+
+        // If creating a new document, ensure arrays are initialized
+        if (options.upsert) {
+            operation.update.$setOnInsert = operation.update.$setOnInsert || {};
+            if (!('pack_ids' in operation.update.$set)) {
+                operation.update.$setOnInsert.pack_ids = [];
+            }
+            if (!('created_packs' in operation.update.$set)) {
+                operation.update.$setOnInsert.created_packs = [];
+            }
+        }
+        
         // If we're updating pack_ids, ensure we handle them cleanly
         if (operation.update?.$addToSet?.pack_ids) {
             // Convert $addToSet with $each to a clean array update
@@ -3924,53 +3971,40 @@ class MainProcessor {
             // 10. Update MongoDB user data if enabled
             if (!this.noMongoDB && !this.noDBWrites) {
                 logger.debug('Writing user data to MongoDB:', userData);
-                
-                // First sanitize the arrays
-                const sanitizedPackIds = userData.pack_ids ? 
-                    this.dbManager.sanitizePackIds(userData.pack_ids) : [];
-                const sanitizedCreatedPacks = userData.created_packs ? 
-                    this.dbManager.sanitizePackIds(userData.created_packs) : [];
-                
-                // Create a clean update operation
+
+                // First get existing data to preserve arrays
+                const existingDoc = await this.dbManager.db.collection('users')
+                    .findOne(
+                        { did: currentProfile.did }, 
+                        { projection: { pack_ids: 1, created_packs: 1 } }
+                    );
+
+                // Prepare arrays with existing data
+                const mergedPackIds = [...new Set([
+                    ...(existingDoc?.pack_ids || []),
+                    ...(userData.pack_ids || []),
+                    ...(rkey ? [rkey] : [])
+                ])].filter(id => typeof id === 'string');
+
+                const mergedCreatedPacks = [...new Set([
+                    ...(existingDoc?.created_packs || []),
+                    ...(userData.created_packs || []),
+                    ...existingCreatedPacks
+                ])].filter(id => typeof id === 'string');
+
+                // Create clean update operation
                 const updateOp = {
                     filter: { did: currentProfile.did },
                     update: {
                         $set: {
                             ...userData,
-                            // Don't include pack_ids and created_packs in $set
-                            pack_ids: undefined,
-                            created_packs: undefined
+                            pack_ids: mergedPackIds,
+                            created_packs: mergedCreatedPacks
                         }
                     }
                 };
 
-                // If we have pack IDs, get current state and merge
-                if (sanitizedPackIds.length > 0) {
-                    const existingDoc = await this.dbManager.db.collection('users')
-                        .findOne({ did: currentProfile.did }, { projection: { pack_ids: 1 } });
-                    
-                    const currentPackIds = existingDoc?.pack_ids || [];
-                    updateOp.update.$set.pack_ids = [
-                        ...new Set([
-                            ...this.dbManager.sanitizePackIds(currentPackIds),
-                            ...sanitizedPackIds
-                        ])
-                    ];
-                }
-
-                // Same for created packs
-                if (sanitizedCreatedPacks.length > 0) {
-                    const existingDoc = await this.dbManager.db.collection('users')
-                        .findOne({ did: currentProfile.did }, { projection: { created_packs: 1 } });
-                    
-                    const currentCreatedPacks = existingDoc?.created_packs || [];
-                    updateOp.update.$set.created_packs = [
-                        ...new Set([
-                            ...this.dbManager.sanitizePackIds(currentCreatedPacks),
-                            ...sanitizedCreatedPacks
-                        ])
-                    ];
-                }
+                logger.debug('MongoDB update operation:', updateOp);
 
                 await this.dbManager.safeWrite('users', updateOp);
             }

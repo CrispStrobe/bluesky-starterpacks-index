@@ -2175,48 +2175,46 @@ class DatabaseManager {
         }
     
         try {
-            logger.info('Starting comprehensive pack_ids cleanup operation...');
+            logger.info('Starting comprehensive pack_ids cleanup...');
             
             const allUsers = await this.db.collection('users').find({}).toArray();
             const problematicUsers = allUsers.filter(user => {
-                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => 
-                    id && typeof id === 'object' && '$each' in id
-                );
+                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
+                    return id && typeof id === 'object' && '$each' in id;
+                });
             });
     
-            logger.info(`Found ${problematicUsers.length} users with $each operators`);
+            logger.info(`Found ${problematicUsers.length} users with $each operators in pack_ids`);
+            let successCount = 0;
+            let failCount = 0;
     
             for (const user of problematicUsers) {
                 try {
-                    const cleanedIds = this.sanitizePackIds(user.pack_ids);
-                    await this.safeWrite('users', {
-                        filter: { did: user.did },
-                        update: { $set: { pack_ids: cleanedIds } }
-                    });
-                    
-                    logger.info(`Cleaned pack_ids for user ${user.did}`);
+                    const cleanPackIds = user.pack_ids
+                        .filter(id => typeof id === 'string')
+                        .filter(Boolean);
+    
+                    const updateResult = await this.db.collection('users').updateOne(
+                        { did: user.did },
+                        { $set: { pack_ids: cleanPackIds } }
+                    );
+    
+                    if (updateResult.modifiedCount > 0) {
+                        successCount++;
+                        logger.info(`Cleaned pack_ids for user ${user.did}`);
+                    } else {
+                        failCount++;
+                        logger.warn(`No changes made for user ${user.did}`);
+                    }
                 } catch (err) {
-                    logger.error(`Failed to clean pack_ids for user ${user.did}:`, err);
+                    failCount++;
+                    logger.error(`Error cleaning pack_ids for user ${user.did}:`, err);
                 }
             }
     
             logger.info('Pack_ids cleanup completed');
             logger.info(`Successfully processed: ${successCount} users`);
             logger.info(`Failed to process: ${failCount} users`);
-    
-            // Final verification
-            const allUsersAfter = await this.db.collection('users').find({}).toArray();
-            const remainingIssues = allUsersAfter.filter(user => {
-                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
-                    return id && typeof id === 'object' && '$each' in id;
-                });
-            }).length;
-    
-            if (remainingIssues > 0) {
-                logger.warn(`Found ${remainingIssues} users still having $each operators after cleanup`);
-            } else {
-                logger.info('No remaining $each operators found');
-            }
     
         } catch (err) {
             logger.error('Fatal error during pack_ids cleanup:', err);
@@ -2460,74 +2458,117 @@ class DatabaseManager {
     }
 
     async safeWrite(collection, operation, options = {}) {
-        const maxRetries = 5;
-        let lastError = null;
-        
-        // Clean pack_ids in advance if present
+        // If we're updating pack_ids, ensure we handle them cleanly
         if (operation.update?.$addToSet?.pack_ids) {
+            // Convert $addToSet with $each to a clean array update
             const newPackIds = operation.update.$addToSet.pack_ids.$each || 
-                             [operation.update.$addToSet.pack_ids];
+                            [operation.update.$addToSet.pack_ids];
             
-            // Get current document state
+            // Use $set instead with a clean array
+            operation.update.$set = operation.update.$set || {};
+            delete operation.update.$addToSet;
+            
+            // First get current pack_ids
             const doc = await this.db.collection(collection)
                 .findOne(operation.filter, { projection: { pack_ids: 1 } });
             
-            // Clean and combine pack_ids
-            const currentPackIds = this.sanitizePackIds(doc?.pack_ids || []);
-            const cleanNewIds = this.sanitizePackIds(newPackIds);
-            
-            // Replace with clean $set operation
-            operation.update.$set = operation.update.$set || {};
-            operation.update.$set.pack_ids = [...new Set([...currentPackIds, ...cleanNewIds])];
-            delete operation.update.$addToSet;
+            // Combine existing and new, ensuring uniqueness
+            const currentPackIds = (doc?.pack_ids || []).filter(id => typeof id === 'string');
+            operation.update.$set.pack_ids = [...new Set([...currentPackIds, ...newPackIds])];
         }
 
-        // Special handling for users collection
-        if (collection === 'users' && operation.update.$set?.pack_ids) {
-            const existingDoc = await this.db.collection(collection)
-                .findOne(operation.filter, { projection: { pack_ids: 1 } });
-            
-            // Preserve existing pack_ids, only add new ones
-            const existingIds = this.sanitizePackIds(existingDoc?.pack_ids || []);
-            const newIds = this.sanitizePackIds(operation.update.$set.pack_ids);
-            operation.update.$set.pack_ids = [...new Set([...existingIds, ...newIds])];
+        const maxRetries = 5;
+        let lastError = null;
+    
+        if (collection === 'users') {
+            // If we're updating a user, ensure we don't overwrite pack_ids with $set
+            if (operation.update.$set && 'pack_ids' in operation.update.$set) {
+                logger.debug(`Updating user, so membership list is safed to be appended only.`)
+                // Move pack_ids to $addToSet if it exists in $set
+                if (!operation.update.$addToSet) {
+                    operation.update.$addToSet = {};
+                }
+                if (Array.isArray(operation.update.$set.pack_ids)) {
+                    operation.update.$addToSet.pack_ids = {
+                        $each: operation.update.$set.pack_ids
+                    };
+                }
+                // Remove pack_ids from $set to prevent overwriting
+                delete operation.update.$set.pack_ids;
+            }
         }
-
-        // Retry loop
+        
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 await this.enforceOperationDelay();
+                
+                // Ensure we have an active session
                 await this.ensureSession();
                 
-                await this.db.collection(collection).updateOne(
-                    operation.filter,
-                    operation.update,
-                    { 
-                        ...options, 
-                        upsert: true, 
-                        session: this.session 
+                // Use the session in the operation
+                const sessionOptions = {
+                    ...options,
+                    session: this.session
+                };
+
+                if (operation.update.$addToSet?.pack_ids) {
+                    const doc = await this.db.collection(collection)
+                        .findOne(operation.filter, { 
+                            projection: { _id: 1, pack_ids: 1 },
+                            session: this.session
+                        });
+    
+                    if (!doc) {
+                        await this.db.collection(collection).insertOne({
+                            ...operation.filter,
+                            pack_ids: [operation.update.$addToSet.pack_ids],
+                            ...(operation.update.$set || {})
+                        }, sessionOptions);
+                    } else {
+                        const currentPackIds = Array.isArray(doc.pack_ids) ? doc.pack_ids : [];
+                        if (!currentPackIds.includes(operation.update.$addToSet.pack_ids)) {
+                            await this.db.collection(collection).updateOne(
+                                operation.filter,
+                                { 
+                                    $set: { 
+                                        pack_ids: [...currentPackIds, operation.update.$addToSet.pack_ids],
+                                        ...(operation.update.$set || {})
+                                    }
+                                },
+                                sessionOptions
+                            );
+                        }
                     }
-                );
-                
+                } else {
+                    await this.db.collection(collection).updateOne(
+                        operation.filter,
+                        operation.update,
+                        { ...sessionOptions, upsert: true }
+                    );
+                }
+    
                 this.consecutiveThrottles = 0;
                 return;
+    
             } catch (err) {
                 lastError = err;
-                
                 if (err.message.includes('session')) {
-                    await this.ensureSession();
-                    continue;
+                    try {
+                        await this.ensureSession();
+                        continue;
+                    } catch (sessionErr) {
+                        logger.error('Failed to create new session:', sessionErr);
+                        throw sessionErr;
+                    }
                 }
-                
                 if (this.isCosmosThrottlingError(err)) {
                     await this.handleThrottlingError(err);
                     continue;
                 }
-                
                 throw err;
             }
         }
-        
+    
         throw lastError;
     }
 
@@ -2536,92 +2577,85 @@ class DatabaseManager {
             logger.debug('No operations to bulk write');
             return;
         }
-
-        // Pre-clean all operations
-        const cleanedOps = operations.map(op => {
-            const cleanOp = { ...op };
-            if (op.updateOne?.update?.$addToSet?.pack_ids || 
-                op.updateOne?.update?.$set?.pack_ids) {
-                
-                const update = { ...op.updateOne.update };
-                if (update.$addToSet?.pack_ids) {
-                    const packIds = this.sanitizePackIds(
-                        update.$addToSet.pack_ids.$each || [update.$addToSet.pack_ids]
-                    );
-                    update.$set = update.$set || {};
-                    update.$set.pack_ids = packIds;
-                    delete update.$addToSet;
-                } else if (update.$set?.pack_ids) {
-                    update.$set.pack_ids = this.sanitizePackIds(update.$set.pack_ids);
-                }
-                
-                cleanOp.updateOne = {
-                    ...op.updateOne,
-                    update
+    
+        const formattedOps = operations.map(op => {
+            if (!op.updateOne && !op.insertOne && !op.deleteOne) {
+                return {
+                    updateOne: {
+                        filter: op.filter,
+                        update: op.update,
+                        upsert: true
+                    }
                 };
             }
-            return cleanOp;
+            return op;
         });
-
-        // Handle different DB types
+    
         if (this.isCosmosDb) {
-            // Sequential processing for Cosmos DB
+            // Use defined Cosmos DB batch size
             const batchSize = BATCH_SIZES[this.dbType] || BATCH_SIZES.mongodb;
-            for (let i = 0; i < cleanedOps.length; i += batchSize) {
-                const batch = cleanedOps.slice(i, i + batchSize);
+            for (let i = 0; i < operations.length; i += batchSize) {
+                const batch = operations.slice(i, i + batchSize);
                 for (const op of batch) {
                     await this.safeWrite(collection, {
-                        filter: op.updateOne?.filter || op.filter,
-                        update: op.updateOne?.update || op.update
+                        filter: op.filter || op.updateOne.filter,
+                        update: op.update || op.updateOne.update,
+                        upsert: true
                     }, options);
                 }
-                
                 if ((i + batchSize) % 10 === 0) {
-                    const progress = ((i + batch.length) / cleanedOps.length * 100).toFixed(1);
-                    logger.info(`Processed ${i + batch.length}/${cleanedOps.length} operations (${progress}%)`);
+                    const progress = ((i + batch.length) / operations.length * 100).toFixed(1);
+                    this.logger?.info(`Processed ${i + batch.length}/${operations.length} operations (${progress}%)`);
                 }
             }
         } else {
-            // Parallel processing for MongoDB
+            // Use defined MongoDB batch size
             const batchSize = BATCH_SIZES.mongodb;
-            const concurrencyLimit = 3;
             const batches = [];
             
-            for (let i = 0; i < cleanedOps.length; i += batchSize) {
-                batches.push(cleanedOps.slice(i, i + batchSize));
+            // Split into batches
+            for (let i = 0; i < formattedOps.length; i += batchSize) {
+                batches.push(formattedOps.slice(i, i + batchSize));
             }
-
-            for (let i = 0; i < batches.length; i += concurrencyLimit) {
-                const currentBatches = batches.slice(i, i + concurrencyLimit);
-                await Promise.all(currentBatches.map(async batch => {
-                    try {
-                        await this.db.collection(collection).bulkWrite(batch, {
-                            ordered: false,
-                            ...options,
-                            session: this.session
-                        });
-                    } catch (err) {
-                        if (err.code === 11000) {
-                            // Handle duplicates one by one
-                            for (const op of batch) {
-                                try {
-                                    await this.safeWrite(collection, {
-                                        filter: op.updateOne.filter,
-                                        update: op.updateOne.update
-                                    });
-                                } catch (innerErr) {
-                                    if (innerErr.code !== 11000) throw innerErr;
+    
+            try {
+                // Process batches in parallel with a concurrency limit
+                const concurrencyLimit = 3;
+                for (let i = 0; i < batches.length; i += concurrencyLimit) {
+                    const currentBatches = batches.slice(i, i + concurrencyLimit);
+                    await Promise.all(currentBatches.map(async batch => {
+                        try {
+                            await this.db.collection(collection).bulkWrite(batch, {
+                                ordered: false,
+                                ...options,
+                                session: this.session
+                            });
+                        } catch (err) {
+                            if (err.code === 11000) {
+                                logger.warn(`Handling duplicates in batch of ${batch.length} operations`);
+                                for (const op of batch) {
+                                    try {
+                                        await this.safeWrite(collection, {
+                                            filter: op.updateOne.filter,
+                                            update: op.updateOne.update
+                                        });
+                                    } catch (innerErr) {
+                                        if (innerErr.code !== 11000) throw innerErr;
+                                    }
                                 }
+                            } else {
+                                throw err;
                             }
-                        } else {
-                            throw err;
                         }
-                    }
-                }));
-
-                const processedOps = Math.min((i + concurrencyLimit) * batchSize, cleanedOps.length);
-                const progress = (processedOps / cleanedOps.length * 100).toFixed(1);
-                logger.info(`Processed ${processedOps}/${cleanedOps.length} operations (${progress}%)`);
+                    }));
+    
+                    const processedOps = Math.min((i + concurrencyLimit) * batchSize, formattedOps.length);
+                    const progress = (processedOps / formattedOps.length * 100).toFixed(1);
+                    logger.info(`Processed ${processedOps}/${formattedOps.length} operations (${progress}%)`);
+                }
+            } catch (err) {
+                logger.error('Bulk write error:', err);
+                throw err;
             }
         }
     }

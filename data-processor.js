@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v015
+// v016
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -3284,7 +3284,9 @@ class MainProcessor {
         }
 
         logger.info(`Processing pack: ${handle}|${rkey}`);
-        logger.info(`Progress: ${this.taskManager.completedTaskCount}/${this.taskManager.totalTasks} packs`);
+        //logger.info(`Progress: ${this.taskManager.completedTaskCount}/${this.taskManager.totalTasks} packs`);
+        logger.info(`Progress: ${this.taskManager.completedTasks.size}/${this.taskManager.pendingTasks.size + this.taskManager.completedTasks.size} packs`);
+
         logger.debug(`Pack info: ${urlLine}`, {
             taskType: taskInfo?.source || 'direct',
             priority: taskInfo?.priority || 0,
@@ -5247,24 +5249,24 @@ class TaskManager {
         try {
             const checkpointData = await fs.readFile(FILE_PATHS.checkpoints, 'utf8');
             const checkpoint = JSON.parse(checkpointData);
-
+            
             // Clear existing state
             this.pendingTasks.clear();
             this.completedTasks.clear();
             this.failures.clear();
-            this.missingProfiles.clear();
-            this.packRelationships.clear();
-
-            // Rebuild completed tasks
-            if (checkpoint.completedPacks) {
-                for (const rkey of checkpoint.completedPacks) {
+            this.discoveredPacksMap.clear();
+            this.totalTaskCount = 0;  // Add total counter
+    
+            // Restore completed tasks
+            if (checkpoint.completed) {
+                for (const rkey of checkpoint.completed) {
                     this.completedTasks.add(rkey);
                 }
             }
-
-            // Rebuild failures
-            if (checkpoint.missingPacks) {
-                for (const {rkey, reason, attempts, timestamp} of checkpoint.missingPacks) {
+    
+            // Restore failures with their state
+            if (checkpoint.failures) {
+                for (const {rkey, reason, attempts, timestamp} of checkpoint.failures) {
                     this.failures.set(rkey, {
                         reason,
                         attempts: attempts || 1,
@@ -5273,46 +5275,67 @@ class TaskManager {
                     });
                 }
             }
-
-            // Rebuild missing profiles
-            if (checkpoint.missingProfiles) {
-                for (const did of checkpoint.missingProfiles) {
-                    this.missingProfiles.add(did);
+    
+            // Restore discovered packs with their metadata
+            if (checkpoint.discovered) {
+                for (const [rkey, data] of checkpoint.discovered) {
+                    this.discoveredPacksMap.set(rkey, {
+                        ...data,
+                        discoveredAt: data.discoveredAt || data.timestamp || new Date().toISOString(),
+                        priority: data.priority || 10  // Default high priority for discovered
+                    });
                 }
             }
-
-            // Validate against files
-            await this.validateAgainstFiles();
-
-            if (this.debug) {
-                logger.debug('Initialized from checkpoint:', {
-                    completed: this.completedTasks.size,
-                    failures: this.failures.size,
-                    missingProfiles: this.missingProfiles.size
-                });
+    
+            // Restore progress counters if available
+            if (checkpoint.progress) {
+                this.totalTaskCount = 
+                    (checkpoint.progress.total || 0) + 
+                    (checkpoint.progress.discovered || 0);
             }
+    
+            // Log restored state
+            logger.info('Restored processing state:', {
+                completed: this.completedTasks.size,
+                failed: this.failures.size,
+                discovered: this.discoveredPacksMap.size,
+                total: this.totalTaskCount,
+                progress: `${this.completedTasks.size}/${this.totalTaskCount} (${
+                    ((this.completedTasks.size / this.totalTaskCount) * 100).toFixed(1)
+                }%)`
+            });
+    
         } catch (err) {
             if (err.code !== 'ENOENT') {
                 logger.warn('Error loading checkpoint, starting fresh:', err);
             }
-            // Start with clean state if no checkpoint exists
             await this.createInitialCheckpoint();
         }
     }
 
     async createInitialCheckpoint() {
-        const checkpoint = {
+        const initialState = {
             version: "1.0",
             timestamp: new Date().toISOString(),
-            completedPacks: [],
-            missingPacks: [],
-            missingProfiles: []
+            completed: [],
+            failures: [],
+            discovered: [],
+            progress: {
+                total: 0,
+                completed: 0,
+                discovered: 0
+            }
         };
-
-        await this.writeCheckpoint(checkpoint);
+        
+        await this.writeCheckpoint(initialState);
+        this.totalTaskCount = 0;
     }
 
-    async writeCheckpoint() {
+    async writeCheckpoint(forceWrite = false) {
+        if (!forceWrite && !this.checkpointDirty) {
+            return;
+        }
+    
         const checkpoint = {
             version: "1.0",
             timestamp: new Date().toISOString(),
@@ -5323,14 +5346,12 @@ class TaskManager {
                 attempts: data.attempts,
                 timestamp: data.lastAttempt
             })),
-            discovered: Array.from(this.discoveredPacksMap.entries()).map(([rkey, data]) => ({
-                rkey,
-                ...data
-            })),
+            discovered: Array.from(this.discoveredPacksMap.entries()),
             progress: {
-                pending: this.pendingTasks.size,
+                total: this.totalTaskCount,
                 completed: this.completedTasks.size,
-                discovered: this.discoveredPacksMap.size
+                discovered: this.discoveredPacksMap.size,
+                remaining: this.pendingTasks.size
             }
         };
     
@@ -5338,7 +5359,13 @@ class TaskManager {
         try {
             await fs.writeFile(tempPath, JSON.stringify(checkpoint, null, 2));
             await fs.rename(tempPath, FILE_PATHS.checkpoints);
-            logger.info('Checkpoint written:', checkpoint.progress);
+            this.checkpointDirty = false;
+    
+            logger.debug('Checkpoint written:', {
+                completed: checkpoint.progress.completed,
+                total: checkpoint.progress.total,
+                discovered: checkpoint.progress.discovered
+            });
         } catch (err) {
             logger.error('Failed to write checkpoint:', err);
             throw err;
@@ -5457,6 +5484,11 @@ class TaskManager {
             addedAt: new Date().toISOString(),
             attempts: failure?.attempts || 0
         });
+
+        // Update total count for new tasks
+        if (source === 'initial' || !this.totalTaskCount) {
+            this.totalTaskCount++;
+        }
     
         logger.debug(`Added task ${rkey}:`, {
             source,
@@ -5494,6 +5526,7 @@ class TaskManager {
     
             if (added) {
                 this.recordPackRelationship(rkey, parentDid);
+                this.totalTaskCount++;
                 this.markDirty();
                 
                 logger.debug(`Added associated pack ${rkey}:`, {

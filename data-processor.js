@@ -2509,12 +2509,20 @@ class DatabaseManager {
     }
 
     async safeWrite(collection, operation, options = {}) {
+        // Function to clean circular references for logging
+        const cleanForLogging = (obj) => {
+            const cleaned = { ...obj };
+            delete cleaned.session;
+            delete cleaned.sessionPool;
+            delete cleaned.client;
+            return cleaned;
+        };
+    
         logger.info(`MongoDB write operation on ${collection}`);
         logger.debug(`for:`, {
-            operation, options
-            //filter: operation.filter,
-            // updateType: operation.update.$set ? '$set' : Object.keys(operation.update)[0]
+            operation: cleanForLogging(operation)
         });
+    
         // Ensure pack_ids is always an array
         if (operation.update?.$set) {
             // Initialize arrays if they're null or undefined
@@ -2551,21 +2559,39 @@ class DatabaseManager {
                     upsert: true
                 };
     
-                logger.debug('updating Mongodb:', operation.filter, operation.update, sessionOptions)
+                logger.debug('updating MongoDB:', {
+                    filter: operation.filter,
+                    update: cleanForLogging(operation.update),
+                    options: cleanForLogging(sessionOptions)
+                });
+    
                 const result = await this.db.collection(collection).updateOne(
                     operation.filter,
                     operation.update,
                     sessionOptions
                 );
-                logger.info(`MongoDB write completed on ${collection}: matched ${result.matchedCount}, modified ${result.modifiedCount}, upserted ${result.upsertedCount},`);
-
-                const finalDoc = await this.db.collection(collection).findOne(operation.filter);
-                logger.info(`Final document state: ${finalDoc}.`);
+    
+                logger.info(`MongoDB write completed on ${collection}: matched ${result.matchedCount}, modified ${result.modifiedCount}, upserted ${result.upsertedCount}`);
+    
+                // Verify final state
+                try {
+                    const finalDoc = await this.db.collection(collection).findOne(operation.filter);
+                    logger.info('Final document state:', {
+                        exists: !!finalDoc,
+                        hasPackIds: Array.isArray(finalDoc?.pack_ids),
+                        packIdsCount: finalDoc?.pack_ids?.length || 0,
+                        hasCreatedPacks: Array.isArray(finalDoc?.created_packs),
+                        createdPacksCount: finalDoc?.created_packs?.length || 0
+                    });
+                } catch (verifyErr) {
+                    logger.warn('Could not verify final document state:', verifyErr.message);
+                }
     
                 this.consecutiveThrottles = 0;
                 return;
     
             } catch (err) {
+                lastError = err;
                 logger.error(`MongoDB write failed (attempt ${attempt + 1}/${maxRetries}):`, {
                     collection,
                     error: err.message,
@@ -2576,7 +2602,6 @@ class DatabaseManager {
                     }
                 });
     
-                lastError = err;
                 if (err.message.includes('session')) {
                     try {
                         await this.ensureSession();

@@ -2176,45 +2176,107 @@ class DatabaseManager {
     
         try {
             logger.info('Starting comprehensive pack_ids cleanup...');
-            
-            const allUsers = await this.db.collection('users').find({}).toArray();
-            const problematicUsers = allUsers.filter(user => {
-                return Array.isArray(user.pack_ids) && user.pack_ids.some(id => {
-                    return id && typeof id === 'object' && '$each' in id;
-                });
-            });
     
-            logger.info(`Found ${problematicUsers.length} users with $each operators in pack_ids`);
+            // Step 1: Find problematic documents with $each
+            const problematicDocs = await this.db.collection('users').find({
+                $or: [
+                    { 'pack_ids.$each': { $exists: true } },
+                    { pack_ids: { $elemMatch: { $each: { $exists: true } } } },
+                    { pack_ids: null },  // Also fix null arrays
+                    { created_packs: null }
+                ]
+            }).toArray();
+    
+            logger.info(`Found ${problematicDocs.length} users with problematic pack_ids`);
             let successCount = 0;
             let failCount = 0;
     
-            for (const user of problematicUsers) {
+            // Step 2: Process each problematic document
+            for (const user of problematicDocs) {
                 try {
-                    const cleanPackIds = user.pack_ids
-                        .filter(id => typeof id === 'string')
-                        .filter(Boolean);
+                    logger.debug(`Processing user ${user.did}:`, {
+                        originalPackIds: user.pack_ids,
+                        originalCreatedPacks: user.created_packs
+                    });
     
+                    // Clean both arrays
+                    const cleanPackIds = Array.isArray(user.pack_ids) ?
+                        user.pack_ids
+                            .filter(id => typeof id === 'string')
+                            .filter(Boolean) : [];
+    
+                    const cleanCreatedPacks = Array.isArray(user.created_packs) ?
+                        user.created_packs
+                            .filter(id => typeof id === 'string')
+                            .filter(Boolean) : [];
+    
+                    // Update with clean arrays
                     const updateResult = await this.db.collection('users').updateOne(
                         { did: user.did },
-                        { $set: { pack_ids: cleanPackIds } }
+                        { 
+                            $set: { 
+                                pack_ids: cleanPackIds,
+                                created_packs: cleanCreatedPacks,
+                                last_updated: new Date().toISOString()
+                            }
+                        }
                     );
     
                     if (updateResult.modifiedCount > 0) {
                         successCount++;
-                        logger.info(`Cleaned pack_ids for user ${user.did}`);
+                        logger.info(`Cleaned arrays for user ${user.did}`, {
+                            packIds: cleanPackIds.length,
+                            createdPacks: cleanCreatedPacks.length
+                        });
                     } else {
                         failCount++;
                         logger.warn(`No changes made for user ${user.did}`);
                     }
+    
+                    // Verify the cleanup
+                    const verifyDoc = await this.db.collection('users').findOne(
+                        { did: user.did },
+                        { projection: { pack_ids: 1, created_packs: 1 } }
+                    );
+    
+                    if (verifyDoc?.pack_ids?.some(id => typeof id === 'object')) {
+                        logger.warn(`Verification failed for ${user.did} - still has object in pack_ids`);
+                        failCount++;
+                    }
+    
                 } catch (err) {
                     failCount++;
-                    logger.error(`Error cleaning pack_ids for user ${user.did}:`, err);
+                    logger.error(`Error cleaning arrays for user ${user.did}:`, err);
                 }
             }
     
-            logger.info('Pack_ids cleanup completed');
-            logger.info(`Successfully processed: ${successCount} users`);
-            logger.info(`Failed to process: ${failCount} users`);
+            // Step 3: Final verification
+            const remainingIssues = await this.db.collection('users').countDocuments({
+                $or: [
+                    { 'pack_ids.$each': { $exists: true } },
+                    { pack_ids: { $elemMatch: { $each: { $exists: true } } } },
+                    { pack_ids: null },
+                    { created_packs: null }
+                ]
+            });
+    
+            logger.info('Pack_ids cleanup completed:', {
+                totalProcessed: problematicDocs.length,
+                successCount,
+                failCount,
+                remainingIssues
+            });
+    
+            if (remainingIssues > 0) {
+                logger.warn(`${remainingIssues} documents still have issues after cleanup`);
+            }
+    
+            return {
+                processed: problematicDocs.length,
+                success: successCount,
+                failed: failCount,
+                remaining: remainingIssues
+            };
     
         } catch (err) {
             logger.error('Fatal error during pack_ids cleanup:', err);
@@ -3972,25 +4034,24 @@ class MainProcessor {
             if (!this.noMongoDB && !this.noDBWrites) {
                 logger.debug('Writing user data to MongoDB:', userData);
 
-                // First get existing data to preserve arrays
+                // First cleanup any $each artifacts
+                await this.dbManager.db.collection('users').updateOne(
+                    { did: currentProfile.did },
+                    { $set: { pack_ids: [], created_packs: [] } }
+                );
+
+                // Then get existing data
                 const existingDoc = await this.dbManager.db.collection('users')
                     .findOne(
                         { did: currentProfile.did }, 
                         { projection: { pack_ids: 1, created_packs: 1 } }
                     );
 
-                // Prepare arrays with existing data
-                const mergedPackIds = [...new Set([
-                    ...(existingDoc?.pack_ids || []),
-                    ...(userData.pack_ids || []),
-                    ...(rkey ? [rkey] : [])
-                ])].filter(id => typeof id === 'string');
-
-                const mergedCreatedPacks = [...new Set([
-                    ...(existingDoc?.created_packs || []),
-                    ...(userData.created_packs || []),
-                    ...existingCreatedPacks
-                ])].filter(id => typeof id === 'string');
+                // Clean and merge arrays
+                const cleanPackIds = Array.isArray(existingDoc?.pack_ids) ? 
+                    existingDoc.pack_ids.filter(id => typeof id === 'string') : [];
+                const cleanCreatedPacks = Array.isArray(existingDoc?.created_packs) ?
+                    existingDoc.created_packs.filter(id => typeof id === 'string') : [];
 
                 // Create clean update operation
                 const updateOp = {
@@ -3998,13 +4059,27 @@ class MainProcessor {
                     update: {
                         $set: {
                             ...userData,
-                            pack_ids: mergedPackIds,
-                            created_packs: mergedCreatedPacks
+                            pack_ids: [...new Set([
+                                ...cleanPackIds,
+                                ...(userData.pack_ids || []),
+                                ...(rkey ? [rkey] : [])
+                            ])].filter(id => typeof id === 'string'),
+                            created_packs: [...new Set([
+                                ...cleanCreatedPacks,
+                                ...(userData.created_packs || []),
+                                ...existingCreatedPacks
+                            ])].filter(id => typeof id === 'string')
                         }
                     }
                 };
 
-                logger.debug('MongoDB update operation:', updateOp);
+                logger.debug('MongoDB update operation:', {
+                    filter: updateOp.filter,
+                    arrays: {
+                        pack_ids: updateOp.update.$set.pack_ids,
+                        created_packs: updateOp.update.$set.created_packs
+                    }
+                });
 
                 await this.dbManager.safeWrite('users', updateOp);
             }

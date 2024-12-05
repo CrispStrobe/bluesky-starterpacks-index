@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v011
+// v012
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -2509,6 +2509,12 @@ class DatabaseManager {
     }
 
     async safeWrite(collection, operation, options = {}) {
+        logger.info(`MongoDB write operation on ${collection}`);
+        logger.debug(`for:`, {
+            operation, options
+            //filter: operation.filter,
+            // updateType: operation.update.$set ? '$set' : Object.keys(operation.update)[0]
+        });
         // Ensure pack_ids is always an array
         if (operation.update?.$set) {
             // Initialize arrays if they're null or undefined
@@ -2545,16 +2551,31 @@ class DatabaseManager {
                     upsert: true
                 };
     
-                await this.db.collection(collection).updateOne(
+                logger.debug('updating Mongodb:', operation.filter, operation.update, sessionOptions)
+                const result = await this.db.collection(collection).updateOne(
                     operation.filter,
                     operation.update,
                     sessionOptions
                 );
+                logger.info(`MongoDB write completed on ${collection}: matched ${result.matchedCount}, modified ${result.modifiedCount}, upserted ${result.upsertedCount},`);
+
+                const finalDoc = await this.db.collection(collection).findOne(operation.filter);
+                logger.info(`Final document state: ${finalDoc}.`);
     
                 this.consecutiveThrottles = 0;
                 return;
     
             } catch (err) {
+                logger.error(`MongoDB write failed (attempt ${attempt + 1}/${maxRetries}):`, {
+                    collection,
+                    error: err.message,
+                    errorCode: err.code,
+                    operation: {
+                        filter: operation.filter,
+                        updateType: operation.update.$set ? '$set' : Object.keys(operation.update)[0]
+                    }
+                });
+    
                 lastError = err;
                 if (err.message.includes('session')) {
                     try {
@@ -2581,7 +2602,20 @@ class DatabaseManager {
             logger.debug('No operations to bulk write');
             return;
         }
-    
+
+        logger.debug(`Starting bulk write to ${collection}:`);
+        logger.debug(`for:`, {
+            totalOperations: operations.length,
+            operationTypes: operations.map(op => 
+                op.updateOne ? 'updateOne' : 
+                op.insertOne ? 'insertOne' : 
+                op.deleteOne ? 'deleteOne' : 'unknown'
+            ).reduce((acc, type) => {
+                acc[type] = (acc[type] || 0) + 1;
+                return acc;
+            }, {})
+        });
+
         const formattedOps = operations.map(op => {
             if (!op.updateOne && !op.insertOne && !op.deleteOne) {
                 return {
@@ -2621,6 +2655,7 @@ class DatabaseManager {
             for (let i = 0; i < formattedOps.length; i += batchSize) {
                 batches.push(formattedOps.slice(i, i + batchSize));
             }
+            logger.info(`Prepared ${batches.length} batches of size ${batchSize}`);
     
             try {
                 // Process batches in parallel with a concurrency limit
@@ -2655,10 +2690,15 @@ class DatabaseManager {
     
                     const processedOps = Math.min((i + concurrencyLimit) * batchSize, formattedOps.length);
                     const progress = (processedOps / formattedOps.length * 100).toFixed(1);
-                    logger.info(`Processed ${processedOps}/${formattedOps.length} operations (${progress}%)`);
+                    logger.info(`Processed ${processedOps}/${formattedOps.length} bulk write operations (${progress}%)`);
                 }
             } catch (err) {
-                logger.error('Bulk write error:', err);
+                logger.error('Bulk write failed:', {
+                    collection,
+                    error: err.message,
+                    code: err.code,
+                    totalOps: formattedOps.length
+                });
                 throw err;
             }
         }

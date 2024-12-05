@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v013
+// v014
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -3241,14 +3241,15 @@ class MainProcessor {
         if (!urlLine || typeof urlLine !== 'string') {
             throw new Error('Invalid urlLine parameter');
         }
-
+    
         const [handle, rkey] = urlLine.split('|').map(s => s.trim());
         if (!handle || !rkey) {
             throw new Error('Invalid URL line format');
         }
-
-        // Get task information if available
-        const taskInfo = this.pendingTasks.get(rkey);
+    
+        // Get task information if available from taskManager
+        const taskInfo = this.taskManager?.pendingTasks?.get(rkey);
+        logger.debug("taskinfo:", taskInfo);
 
         // check for permanently failed packs
         const failure = this.taskManager.failures.get(rkey);

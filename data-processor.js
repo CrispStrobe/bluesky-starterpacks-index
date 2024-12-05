@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v012
+// v013
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -3247,6 +3247,9 @@ class MainProcessor {
             throw new Error('Invalid URL line format');
         }
 
+        // Get task information if available
+        const taskInfo = this.pendingTasks.get(rkey);
+
         // check for permanently failed packs
         const failure = this.taskManager.failures.get(rkey);
         if (failure?.permanent) {
@@ -3256,6 +3259,11 @@ class MainProcessor {
 
         logger.info(`Processing pack: ${handle}|${rkey}`);
         logger.info(`Progress: ${this.taskManager.completedTaskCount}/${this.taskManager.totalTasks} packs`);
+        logger.debug(`Pack info: ${urlLine}`, {
+            taskType: taskInfo?.source || 'direct',
+            priority: taskInfo?.priority || 0,
+            discoveredFrom: taskInfo?.parentDid || null
+        });
     
         try {
             const startTime = Date.now();
@@ -3518,272 +3526,58 @@ class MainProcessor {
         }
     }
 
-    async processAssociatedPacks(profile, options = {}) {
-        const {
-            maxDepth = MAX_PACK_DEPTH,
-            processedDIDs = new Set(),
-            currentDepth = 0,
-            parentDid = null,
-            forceProcess = false  // For --adduser context
-        } = options;
-    
-        const results = {
-            discovered: 0,
-            queued: 0,
-            skipped: 0,
-            failed: 0
-        };
-    
+    async processAssociatedPacks(currentProfile, options = {}) {
         try {
-            // Skip if we've hit depth limit or already processed this profile
-            if (currentDepth >= maxDepth || processedDIDs.has(profile.did)) {
-                logger.debug(`Skipping ${profile.handle} - depth: ${currentDepth}, processed: ${processedDIDs.has(profile.did)}`);
-                return results;
-            }
-    
-            processedDIDs.add(profile.did);
-    
-            // Get packs for current profile
-            const packs = await this.apiHandler.getActorStarterPacks(profile.did);
+            const packs = await this.apiHandler.getActorStarterPacks(currentProfile.did);
             if (!packs?.starterPacks?.length) {
-                return results;
+                return { discovered: 0, queued: 0, skipped: 0, failed: 0 };
             }
     
-            results.discovered = packs.starterPacks.length;
-            logger.info(`Found ${results.discovered} packs for ${profile.handle}`);
-    
-            // Process each pack
-            for (const pack of packs.starterPacks) {
-                try {
-                    const rkey = await this.extractRkeyFromURI(pack.uri);
-                    
-                    // Add to URLs file for future discovery
-                    await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
-    
-                    // Skip if we shouldn't process this pack
-                    logger.debug('checking if we shall skip the pack:', forceProcess);
-                    if (!forceProcess) {  // Skip recent checks only if force processing
-                        const shouldProcess = await this.taskManager.shouldProcessPack(rkey, 
-                            await this.fileHandler.getPack(rkey),
-                            this.taskManager.failures.get(rkey)
-                        );
-                        logger.debug('shall skip the pack?', shouldProcess);
-    
-                        if (!shouldProcess.process) {
-                            results.skipped++;
-                            logger.debug(`Skipping pack ${rkey}: ${shouldProcess.reason}`);
-                            continue;
-                        }
-                    }
-    
-                    // Add to task queue
-                    const added = await this.taskManager.addAssociatedPack({
-                        creator: profile.handle,
-                        rkey,
-                        memberCount: pack.starterPack?.record?.items?.length || 0,
-                        updatedAt: new Date().toISOString(),
-                        discoveryDepth: currentDepth,
-                        forceProcess  // Pass through force flag
-                    }, profile.did);
-    
-                    if (added) {
-                        results.queued++;
-                        // Record relationship for future reference
-                        this.taskManager.recordPackRelationship(rkey, profile.did);
-                        await this.taskManager.maybeWriteCheckpoint();
-                    } else {
-                        results.skipped++;
-                    }
-    
-                    await this.rateLimiter.throttle();
-    
-                } catch (err) {
-                    results.failed++;
-                    logger.error(`Failed to process pack for ${profile.handle}:`, err);
-                }
-            }
-    
-            metrics.recordAssociatedPacksMetrics(results);
-            return results;
-    
-        } catch (err) {
-            logger.error(`Failed to process packs for ${profile.handle}:`, err);
-            metrics.recordAssociatedPacksMetrics({
-                discovered: 0,
+            const results = {
+                discovered: packs.starterPacks.length,
                 queued: 0,
                 skipped: 0,
-                failed: 1
-            });
-            throw err;
-        }
-    }
-
-    async processAssociatedPacks_old(profile, options = {}) {
-        const {
-            maxDepth = MAX_PACK_DEPTH,
-            processedDIDs = new Set(),
-            currentDepth = 0,
-            parentDid = null,
-            parentHandle = null,
-            forceProcess = false 
-        } = options;
+                failed: 0
+            };
     
-        const results = {
-            discovered: 0,
-            queued: 0,
-            skipped: 0,
-            failed: 0
-        };
-    
-        // First check depth and DID processing status
-        if (currentDepth >= maxDepth) {
-            logger.debug(`Max depth reached for ${profile.handle} (depth: ${currentDepth})`);
-            return results;
-        }
-    
-        // Skip if we've already processed this profile at this depth or shallower
-        if (processedDIDs.has(profile.did)) {
-            logger.debug(`Already processed packs for ${profile.handle}`);
-            return results;
-        }
-    
-        processedDIDs.add(profile.did);
-        this.processedProfiles = this.processedProfiles || new Set();
-        this.processedProfiles.add(profile.did);
-    
-        try {
-            // Get packs for current profile
-            logger.debug(`Fetching packs for ${profile.handle} (depth: ${currentDepth})`);
-            const packs = await this.apiHandler.getActorStarterPacks(profile.did);
-            
-            if (!packs?.starterPacks?.length) {
-                return results;
-            }
-    
-            results.discovered = packs.starterPacks.length;
-            const uniquePacks = new Set(); // Track unique packs in this discovery
-            const createdPacks = []; // which packs has this user created?
-            
-            // First pass: collect unique packs
             for (const pack of packs.starterPacks) {
                 try {
                     const rkey = await this.extractRkeyFromURI(pack.uri);
-                    if (!uniquePacks.has(rkey)) {
-                        uniquePacks.add(rkey);
-                        createdPacks.push(rkey);
-                    }
-                } catch (err) {
-                    results.failed++;
-                    logger.error(`Failed to extract rkey from pack ${pack.uri}:`, err);
-                }
-            }
-
-            // Add created_packs to MongoDB record
-            if (!this.noMongoDB) { 
-                // Update user's created_packs atomically
-                if (createdPacks.length > 0) {
-                    await this.dbManager.safeWrite('users', {
-                        filter: { did: profile.did },
-                        update: {
-                            $addToSet: {
-                                created_packs: { $each: createdPacks }
-                            }
-                        }
+                    const memberCount = pack.starterPack?.record?.items?.length || 0;
+                    
+                    const added = await this.taskManager.addTask({
+                        handle: currentProfile.handle,
+                        rkey,
+                        source: 'associated',
+                        parentDid: currentProfile.did,
+                        memberCount,
+                        discoveredAt: new Date().toISOString()
                     });
-                }
-            }
-
-            // Update file handler
-            const existingUser = await this.fileHandler.getUser(profile.did);
-            if (existingUser) {
-                await this.fileHandler.appendUser({
-                    ...existingUser,
-                    created_packs: [...new Set([
-                        ...(existingUser.created_packs || []),
-                        ...createdPacks
-                    ])],
-                    last_updated: new Date().toISOString()
-                });
-            }
-    
-            if (uniquePacks.size > 0) {
-                logger.info(`Found ${uniquePacks.size} unique associated packs for ${profile.handle}`);
-            }
-    
-            // Second pass: process unique packs
-            for (const rkey of uniquePacks) {
-                try {
-                    // Add to URLs file first
-                    await this.fileHandler.appendToUrlsFile(profile.handle, rkey);
-                    
-                    // Check if we should process this pack
-                    const shouldProcess = await this.taskManager.shouldProcessPack(
-                        rkey,
-                        await this.fileHandler.getPack(rkey),
-                        this.taskManager.failures.get(rkey)
-                    );
-    
-                    if (!shouldProcess.process) {
-                        results.skipped++;
-                        logger.debug(`Skipping pack ${rkey}: ${shouldProcess.reason}`);
-                        continue;
-                    }
-    
-                    // Check if pack is already being processed
-                    if (this.taskManager.pendingTasks.has(rkey) || 
-                        this.taskManager.completedTasks.has(rkey)) {
-                        results.skipped++;
-                        continue;
-                    }
-    
-                    // Add to task queue
-                    const added = await this.taskManager.addAssociatedPack({
-                        creator: profile.handle,
-                        rkey,
-                        memberCount: packs.starterPacks.find(p => p.uri.includes(rkey))?.starterPack?.record?.items?.length || 0,
-                        updatedAt: new Date().toISOString(),
-                        discoveryDepth: currentDepth
-                    }, profile.did);
     
                     if (added) {
+                        this.discoveredPacksMap.set(rkey, {
+                            discoveredAt: new Date().toISOString(),
+                            discoveredFrom: currentProfile.did,
+                            memberCount
+                        });
                         results.queued++;
-                        this.taskManager.markDirty();
-                        this.taskManager.recordPackRelationship(rkey, profile.did);
-                        await this.taskManager.maybeWriteCheckpoint();
-                        logger.info(`Queued new associated pack ${rkey} from ${profile.handle} (depth: ${currentDepth})`);
+                        
+                        if (options.forceProcess) {
+                            await this.processStarterPack(`${currentProfile.handle}|${rkey}`);
+                        }
                     } else {
                         results.skipped++;
                     }
     
                 } catch (err) {
                     results.failed++;
-                    logger.error(`Failed to process associated pack ${rkey}:`, err);
+                    logger.error(`Failed to process pack from ${currentProfile.handle}:`, err);
                 }
-    
-                await this.rateLimiter.throttle();
-            }
-    
-            metrics.recordAssociatedPacksMetrics(results);
-    
-            if (this.debug) {
-                logger.debug('Associated packs processing complete', {
-                    profile: profile.handle,
-                    results,
-                    depth: currentDepth,
-                    uniquePacks: uniquePacks.size
-                });
             }
     
             return results;
-    
         } catch (err) {
-            logger.error(`Failed to process associated packs for ${profile.did}:`, err);
-            metrics.recordAssociatedPacksMetrics({
-                discovered: 0,
-                queued: 0,
-                skipped: 0,
-                failed: 1
-            });
+            logger.error(`Failed to process packs for ${currentProfile.handle}:`, err);
             throw err;
         }
     }
@@ -4438,40 +4232,6 @@ function validateEnv(args) {
     }
 }
 
-// Handle cleanup and shutdown
-// One-time cleanup script
-async function cleanupPackIds_old() {
-    const client = new MongoClient(process.env.MONGODB_URI);
-    try {
-        await client.connect();
-        const db = client.db('starterpacks');
-        
-        // Find all users with $each in their pack_ids
-        const usersToFix = await db.collection('users').find({
-            'pack_ids': { $elemMatch: { $type: 'object' } }  // Find arrays containing objects
-        }).toArray();
-
-        console.log(`Found ${usersToFix.length} users with $each operators to clean`);
-
-        for (const user of usersToFix) {
-            // Filter out $each and get only string pack IDs
-            const cleanPackIds = user.pack_ids.filter(id => typeof id === 'string');
-            
-            // Update the user with clean pack_ids
-            await db.collection('users').updateOne(
-                { did: user.did },
-                { $set: { pack_ids: cleanPackIds } }
-            );
-        }
-
-        console.log('Cleanup completed');
-    } catch (err) {
-        console.error('Error during cleanup:', err);
-    } finally {
-        await client.close();
-    }
-}
-
 async function handleShutdown(signal, currentProcessor = null) {
     logger.info(`\nReceived ${signal}. Starting graceful shutdown...`);
     
@@ -4880,33 +4640,24 @@ class TaskManager {
         this.dbManager = dbManager;
         this.noMongoDB = noMongoDB;
 
-        // Core task tracking
+        // Core task tracking - using Maps/Sets for easy size tracking
         this.pendingTasks = new Map();
         this.completedTasks = new Set();
         this.failures = new Map();
         this.packStates = new Map();
-        this.discoveredTasksQueue = new Set();
-
-        // Progress tracking
-        this.initialTaskCount = 0;
-        this.discoveredTaskCount = 0;
-        this.completedTaskCount = 0;
-        this.totalTasksToProcess = 0;  // track total tasks for current run
-
-        // Discovery tracking
-        this.originalOrder = new Map();
         this.discoveredPacksMap = new Map();
         this.packRelationships = new Map();
         this.missingProfiles = new Set();
-        this.processedProfiles = new Set();
+
+        // Discovery tracking (only discovery-specific flags)
         this.processingDiscoveredTasks = false;
+        this.discoveryDepth = 0;
 
         // Checkpoint management
         this.lastCheckpoint = Date.now();
         this.CHECKPOINT_INTERVAL = 20 * 60 * 1000;
         this.checkpointDirty = false;
 
-        // Metrics reference
         this.metrics = metrics;
 
         // Validation
@@ -5316,74 +5067,52 @@ class TaskManager {
         }
     }
 
-    calculateTaskPriority(rkey, existingPack, mongoStatus) {
+    calculateTaskPriority(rkey, options = {}) {
+        const {
+            source = 'initial',
+            isNewlyDiscovered = false,
+            memberCount = 0,
+            existingPack = null,
+            failure = null
+        } = options;
+
         let priority = 0;
-        const now = Date.now();
-        const failure = this.failures.get(rkey); 
-    
-        // 1. Handle failed packs
-        if (failure) {
-            const daysSinceLastAttempt = (now - new Date(failure.lastAttempt).getTime()) 
+
+        // Base priority by source
+        switch (source) {
+            case 'associated':
+            case 'discovered':
+                priority += 10;  // High priority for discovered packs
+                break;
+            case 'initial':
+                priority += 1;   // Lower priority for initial tasks
+                break;
+            default:
+                priority += 5;   // Medium priority for others
+        }
+
+        // Adjust for pack state
+        if (existingPack) {
+            // Age-based adjustment
+            const daysSinceUpdate = (Date.now() - new Date(existingPack.updated_at).getTime()) 
                 / (1000 * 60 * 60 * 24);
+            if (daysSinceUpdate > 14) priority += 3;
+            else if (daysSinceUpdate > 7) priority += 2;
             
-            // Base priority for failed packs
-            priority = -20;
-    
-            // Recovery factor based on attempts and time
-            const recoveryDays = Math.pow(2, failure.attempts);
-            if (daysSinceLastAttempt > recoveryDays) {
-                const recoveryFactor = Math.floor(daysSinceLastAttempt / recoveryDays);
-                priority += Math.min(recoveryFactor, 10); // Cap recovery
-            }
-        } else {
-            // 2. Base priority from original position (normalized to small number)
-            const position = this.originalOrder.get(rkey) || 0;
-            const totalPacks = this.originalOrder.size;
-            priority += Math.min(5, Math.floor((position / totalPacks) * 5));
-    
-            // 3. Pack state priority
-            if (existingPack) {
-                // Age-based priority
-                const daysSinceUpdate = (now - new Date(existingPack.updated_at).getTime()) 
-                    / (1000 * 60 * 60 * 24);
-                
-                if (daysSinceUpdate > 14) priority += 3;
-                else if (daysSinceUpdate > 7) priority += 2;
-                else if (daysSinceUpdate > 2) priority += 1;
-    
-                // Size/activity based priority
-                if (existingPack.user_count > 100) priority += 3;
-                else if (existingPack.user_count > 50) priority += 2;
-    
-                if (existingPack.weekly_joins > 50) priority += 4;
-                else if (existingPack.weekly_joins > 10) priority += 3;
-            } else {
-                // New packs get medium priority
-                priority += 2;
-            }
-    
-            // 4. Pack state adjustments
-            const packState = this.packStates.get(rkey);
-            if (packState) {
-                switch (packState.status) {
-                    case 'deleted':
-                        priority -= 15;
-                        break;
-                    case 'hidden':
-                        priority -= 10;
-                        break;
-                    case 'inactive':
-                        priority -= 5;
-                        break;
-                }
-            }
+            // Size-based adjustment
+            if (memberCount > 100 || existingPack.user_count > 100) priority += 2;
         }
-    
-        // 5. MongoDB status adjustments
-        if (mongoStatus?.lowPriority) {
-            priority -= 3;
+
+        // Penalty for failures
+        if (failure) {
+            priority -= Math.min(failure.attempts * 2, 8); // Max penalty of 8
         }
-    
+
+        // Boost for newly discovered
+        if (isNewlyDiscovered) {
+            priority += 5;
+        }
+
         return priority;
     }
 
@@ -5569,22 +5298,21 @@ class TaskManager {
         const checkpoint = {
             version: "1.0",
             timestamp: new Date().toISOString(),
-            completedPacks: Array.from(this.completedTasks),
-            missingPacks: Array.from(this.failures.entries()).map(([rkey, data]) => ({
+            completed: Array.from(this.completedTasks),
+            failures: Array.from(this.failures.entries()).map(([rkey, data]) => ({
                 rkey,
                 reason: data.reason,
                 attempts: data.attempts,
-                timestamp: data.lastAttempt,
-                priority: this.calculateTaskPriority(rkey, null, data, null)
+                timestamp: data.lastAttempt
             })),
-            missingProfiles: Array.from(this.missingProfiles),
-            packStates: Array.from(this.packStates.entries()),
-            originalOrder: Array.from(this.originalOrder.entries()),
+            discovered: Array.from(this.discoveredPacksMap.entries()).map(([rkey, data]) => ({
+                rkey,
+                ...data
+            })),
             progress: {
-                initialTasks: this.totalInitialTasks,
-                discoveredTasks: this.newlyDiscoveredTasks,
-                discoveredPacks: Array.from(this.discoveredPacksMap.entries()),
-                completedTasks: this.completedTaskCount
+                pending: this.pendingTasks.size,
+                completed: this.completedTasks.size,
+                discovered: this.discoveredPacksMap.size
             }
         };
     
@@ -5592,13 +5320,9 @@ class TaskManager {
         try {
             await fs.writeFile(tempPath, JSON.stringify(checkpoint, null, 2));
             await fs.rename(tempPath, FILE_PATHS.checkpoints);
+            logger.info('Checkpoint written:', checkpoint.progress);
         } catch (err) {
             logger.error('Failed to write checkpoint:', err);
-            try {
-                await fs.unlink(tempPath);
-            } catch (e) {
-                // Ignore error if temp file doesn't exist
-            }
             throw err;
         }
     }
@@ -5675,159 +5399,214 @@ class TaskManager {
         };
     }
 
-    async addTask(taskData) {
-        const { 
-            handle, 
-            rkey, 
-            priority = 0, 
-            source = 'direct',
-            parentDid = null 
-        } = taskData;
-
+    async addTask({ 
+        handle, 
+        rkey, 
+        source = 'initial', 
+        parentDid = null, 
+        memberCount = 0,
+        discoveredAt = null 
+    }) {
         // Skip if already completed or permanently failed
         if (this.completedTasks.has(rkey)) {
-            if (this.debug) logger.debug(`Skipping already completed task: ${rkey}`);
+            logger.debug(`Skipping already completed task: ${rkey}`);
             return false;
         }
-
+        
         const failure = this.failures.get(rkey);
         if (failure?.permanent) {
-            if (this.debug) logger.debug(`Skipping permanently failed task: ${rkey}`);
+            logger.debug(`Skipping permanently failed task: ${rkey}`);
             return false;
         }
-
-        // Add new task
-        this.pendingTasks.set(taskData.rkey, {
-            handle: taskData.handle,
-            rkey: taskData.rkey,
-            priority: taskData.priority,
-            source: taskData.source,
-            parentDid: taskData.parentDid,
+    
+        const existingPack = await this.fileHandler.getPack(rkey);
+        const priority = this.calculateTaskPriority(rkey, {
+            source,
+            isNewlyDiscovered: !!discoveredAt,
+            memberCount,
+            existingPack,
+            failure
+        });
+    
+        this.pendingTasks.set(rkey, {
+            handle,
+            rkey,
+            priority,
+            source,
+            parentDid,
+            memberCount,
+            discoveredAt: discoveredAt || new Date().toISOString(),
             addedAt: new Date().toISOString(),
             attempts: failure?.attempts || 0
         });
-
-        // Update total tasks counter
-        if (!this.totalTasksToProcess) {
-            this.totalTasksToProcess = 1;  // Initialize if first task
-        } else if (!this.completedTasks.has(taskData.rkey)) {
-            this.totalTasksToProcess++;  // Only increment if not already completed
-        }
-
+    
+        logger.debug(`Added task ${rkey}:`, {
+            source,
+            priority,
+            pending: this.pendingTasks.size,
+            completed: this.completedTasks.size,
+            discovered: this.discoveredPacksMap.size
+        });
+    
         this.markDirty();
-        await this.maybeWriteCheckpoint();
-        
-        if (this.debug) {
-            logger.debug(`Added task ${taskData.rkey} (${taskData.source}), total tasks: ${this.totalTasksToProcess}`);
-        }
-        
         return true;
+    }
+    
+    async addAssociatedPack(packInfo, parentDid) {
+        const { rkey, creator: handle, memberCount } = packInfo;
+        
+        // Only process if not already discovered
+        if (!this.discoveredPacksMap.has(rkey)) {
+            // Add to discovered map first
+            this.discoveredPacksMap.set(rkey, {
+                discoveredAt: new Date().toISOString(),
+                discoveredFrom: parentDid,
+                memberCount
+            });
+    
+            // Add to tasks
+            const added = await this.addTask({
+                handle,
+                rkey,
+                source: 'associated',
+                parentDid,
+                memberCount,
+                discoveredAt: new Date().toISOString()
+            });
+    
+            if (added) {
+                this.recordPackRelationship(rkey, parentDid);
+                this.markDirty();
+                
+                logger.debug(`Added associated pack ${rkey}:`, {
+                    from: parentDid,
+                    pending: this.pendingTasks.size,
+                    discovered: this.discoveredPacksMap.size
+                });
+                
+                return true;
+            }
+        }
+    
+        return false;
     }
 
     async getNextTask() {
-        // Convert to array for sorting, using let instead of const
         let tasks = Array.from(this.pendingTasks.values());
-    
-        // Filter out deleted packs unless enough time has passed
-        const now = Date.now();
-        tasks = tasks.filter(task => {
-            const state = this.packStates.get(task.rkey);
-            if (!state) return true;
-            
-            if (state.status === 'deleted') {
-                const daysSince = (now - new Date(state.timestamp).getTime()) / (1000 * 60 * 60 * 24);
-                return daysSince > 30; // Only recheck deleted packs after 30 days
-            }
-            
-            return true;
-        });
-        
-        // Sort by priority
         tasks.sort((a, b) => {
-            const priorityA = this.calculateTaskPriority(
-                a.rkey, 
-                this.fileHandler.getPack(a.rkey),
-                this.failures.get(a.rkey),
-                null
-            );
-            const priorityB = this.calculateTaskPriority(
-                b.rkey,
-                this.fileHandler.getPack(b.rkey),
-                this.failures.get(b.rkey),
-                null
-            );
+            // Recalculate current priorities
+            const priorityA = this.calculateTaskPriority(a.rkey, {
+                source: a.source,
+                isNewlyDiscovered: this.discoveredPacksMap.has(a.rkey),
+                memberCount: a.memberCount,
+                existingPack: this.fileHandler.getPack(a.rkey),
+                failure: this.failures.get(a.rkey)
+            });
+
+            const priorityB = this.calculateTaskPriority(b.rkey, {
+                source: b.source,
+                isNewlyDiscovered: this.discoveredPacksMap.has(b.rkey),
+                memberCount: b.memberCount,
+                existingPack: this.fileHandler.getPack(b.rkey),
+                failure: this.failures.get(b.rkey)
+            });
+
             return priorityB - priorityA;
         });
-    
-        return tasks[0] || null;
+
+        return tasks[0];
     }
 
-    calculateDynamicPriority(packInfo) {
-        let priority = 1; // Base priority for associated packs
-
-        // Increase priority for packs with more members
-        if (packInfo.memberCount > 100) priority += 1;
-        if (packInfo.memberCount > 1000) priority += 1;
-
-        // Increase priority for packs that were recently updated
-        const daysSinceUpdate = (Date.now() - new Date(packInfo.updatedAt).getTime()) / (1000 * 60 * 60 * 24);
-        if (daysSinceUpdate < 1) priority += 2;
-        else if (daysSinceUpdate < 7) priority += 1;
-
-        // Reduce priority for previously failed attempts
-        const failure = this.failures.get(packInfo.rkey);
-        if (failure) {
-            priority = Math.max(0, priority - failure.attempts);
+    async addTask({ 
+        handle, 
+        rkey, 
+        source = 'initial', 
+        parentDid = null, 
+        memberCount = 0,
+        discoveredAt = null 
+    }) {
+        // Skip if already completed or permanently failed
+        if (this.completedTasks.has(rkey)) {
+            logger.debug(`Skipping already completed task: ${rkey}`);
+            return false;
         }
-
-        return priority;
-    }
-
-    async addAssociatedPack(packInfo, parentDid) {
-        const priority = this.calculateDynamicPriority(packInfo);
-
-        // Only count as newly discovered if we haven't seen it before
-        if (!this.discoveredPacksMap.has(packInfo.rkey)) {
-            this.discoveredTaskCount++;  // Use discoveredTaskCount instead of newlyDiscoveredTasks
-            this.discoveredPacksMap.set(packInfo.rkey, {
-                discoveredAt: new Date().toISOString(),
-                discoveredFrom: parentDid
-            });
-            this.totalTasksToProcess++;  // Increment total tasks counter
-
-            logger.debug('New pack discovered:', {
-                rkey: packInfo.rkey,
-                from: parentDid,
-                totalDiscovered: this.discoveredTaskCount,
-                totalTasks: this.totalTasksToProcess
-            });
-        }
-
-        // Add to URLs file first
-        await this.fileHandler.appendToUrlsFile(packInfo.creator, packInfo.rkey);
         
-        const added = await this.addTask({
-            handle: packInfo.creator,
-            rkey: packInfo.rkey,
-            priority,
-            source: 'associated',
-            parentDid,
-            discoveredAt: new Date().toISOString(),
-            memberCount: packInfo.memberCount
-        });
-
-        if (added) {
-            this.processingDiscoveredTasks = true;
-            if (!this.discoveredTasksQueue) {
-                this.discoveredTasksQueue = new Set();  // Safety check
-            }
-            this.discoveredTasksQueue.add(packInfo.rkey);
-            this.recordPackRelationship(packInfo.rkey, parentDid);
-            await this.maybeWriteCheckpoint();
-            logger.info(`Queued associated pack ${packInfo.rkey} from ${parentDid}`);
+        const failure = this.failures.get(rkey);
+        if (failure?.permanent) {
+            logger.debug(`Skipping permanently failed task: ${rkey}`);
+            return false;
         }
-
-        return added;
+    
+        const existingPack = await this.fileHandler.getPack(rkey);
+        const priority = this.calculateTaskPriority(rkey, {
+            source,
+            isNewlyDiscovered: !!discoveredAt,
+            memberCount,
+            existingPack,
+            failure
+        });
+    
+        this.pendingTasks.set(rkey, {
+            handle,
+            rkey,
+            priority,
+            source,
+            parentDid,
+            memberCount,
+            discoveredAt: discoveredAt || new Date().toISOString(),
+            addedAt: new Date().toISOString(),
+            attempts: failure?.attempts || 0
+        });
+    
+        logger.debug(`Added task ${rkey}:`, {
+            source,
+            priority,
+            pending: this.pendingTasks.size,
+            completed: this.completedTasks.size,
+            discovered: this.discoveredPacksMap.size
+        });
+    
+        this.markDirty();
+        return true;
+    }
+    
+    async addAssociatedPack(packInfo, parentDid) {
+        const { rkey, creator: handle, memberCount } = packInfo;
+        
+        // Only process if not already discovered
+        if (!this.discoveredPacksMap.has(rkey)) {
+            // Add to discovered map first
+            this.discoveredPacksMap.set(rkey, {
+                discoveredAt: new Date().toISOString(),
+                discoveredFrom: parentDid,
+                memberCount
+            });
+    
+            // Add to tasks
+            const added = await this.addTask({
+                handle,
+                rkey,
+                source: 'associated',
+                parentDid,
+                memberCount,
+                discoveredAt: new Date().toISOString()
+            });
+    
+            if (added) {
+                this.recordPackRelationship(rkey, parentDid);
+                this.markDirty();
+                
+                logger.debug(`Added associated pack ${rkey}:`, {
+                    from: parentDid,
+                    pending: this.pendingTasks.size,
+                    discovered: this.discoveredPacksMap.size
+                });
+                
+                return true;
+            }
+        }
+    
+        return false;
     }
 
     // Track relationships between packs and their discoverers
@@ -5847,18 +5626,27 @@ class TaskManager {
         if (!task) return null;
     
         try {
-            // Log progress
-            this.completedTaskCount++;
-            const progress = Math.floor((this.completedTaskCount / this.totalTasksToProcess) * 100);
-            logger.info(`Processing pack ${this.completedTaskCount}/${this.totalTasksToProcess} (${progress}%)`);
-
-            // Process the task
+            const currentAttempts = this.failures.get(task.rkey)?.attempts || 0;
+            
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
-                
+            
             if (success) {
                 this.completedTasks.add(task.rkey);
                 this.pendingTasks.delete(task.rkey);
+                this.failures.delete(task.rkey);
                 this.markDirty();
+            } else {
+                // Record failure using consistent attempt tracking
+                const newFailure = {
+                    attempts: currentAttempts + 1,
+                    lastAttempt: new Date().toISOString(),
+                    permanent: currentAttempts + 1 >= 3
+                };
+                this.failures.set(task.rkey, newFailure);
+                
+                if (newFailure.permanent) {
+                    this.pendingTasks.delete(task.rkey);
+                }
             }
     
             return success;
@@ -6030,60 +5818,37 @@ class TaskManager {
 
     async buildConsolidatedTaskList(urlPacks, existingPacks, checkpoint) {
         try {
-            // If using MongoDB, ensure session is valid before starting
-            if (this.dbManager && !this.dbManager.noDBWrites) {
-                await this.dbManager.ensureSession();
-            }
-
-            // Initialize with empty data if any is undefined
+            // Initialize with empty data if needed
             urlPacks = urlPacks || new Map();
             existingPacks = existingPacks || new Map();
-            checkpoint = checkpoint || {
-                completedPacks: [],
-                missingPacks: [],
-                missingProfiles: []
-            };
-        
+            
             this.pendingTasks.clear();
-            const skipped = new Map();
-            this.totalTasks = urlPacks.size;
-            this.totalInitialTasks = urlPacks.size;  // Store initial count
-        
-            // Process URLs if we have any
+    
+            // Process URLs with consistent priority calculation
             for (const [rkey, urlData] of urlPacks) {
                 const existingPack = existingPacks.get(rkey);
                 const failure = this.failures.get(rkey);
-        
-                const { process, reason } = this.shouldProcessPack(rkey, existingPack, failure);
-        
+    
+                const { process } = await this.shouldProcessPack(rkey, existingPack, failure);
+    
                 if (process) {
-                    const priority = this.calculateTaskPriority(rkey, existingPack, failure);
-                    
                     await this.addTask({
                         handle: urlData.handle,
                         rkey,
-                        priority,
                         source: 'initial',
                         existingData: existingPack || null,
-                        previousAttempts: failure?.attempts || 0
+                        memberCount: existingPack?.user_count || 0
                     });
-                } else {
-                    skipped.set(rkey, reason);
                 }
             }
-        
-            if (this.debug) {
-                logger.debug('Task list built:', {
-                    total: this.totalTasks,
-                    pending: this.pendingTasks.size,
-                    skipped: skipped.size,
-                    new: Array.from(this.pendingTasks.values()).filter(t => !t.existingData).length,
-                    updates: Array.from(this.pendingTasks.values()).filter(t => t.existingData).length,
-                    failureRetries: Array.from(this.pendingTasks.values()).filter(t => t.previousAttempts > 0).length
-                });
-            }
+    
+            logger.debug('Task list initialized:', {
+                pending: this.pendingTasks.size,
+                completed: this.completedTasks.size,
+                failed: this.failures.size
+            });
         } catch (err) {
-            logger.error('Error building consolidated task list:', err);
+            logger.error('Error building task list:', err);
             throw err;
         }
     }

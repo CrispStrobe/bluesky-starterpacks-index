@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// v016
+// v023
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -7,6 +7,7 @@ import fs from 'fs/promises';
 import winston from 'winston';
 import yaml from 'js-yaml';
 import path from 'path';
+import { createReadStream, createWriteStream } from 'fs';
 
 // Load environment variables
 dotenv.config();
@@ -106,6 +107,18 @@ const VALIDATION_SCHEMAS = {
     }
 };
 
+// Export constants and logger
+export {
+    DB_CONFIG,
+    BATCH_SIZE,
+    API_CONFIG,
+    CACHE_CONFIG,
+    FILE_PATHS,
+    ERROR_TYPES,
+    VALIDATION_SCHEMAS,
+    logger
+};
+
 // Initialize global logger
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -150,17 +163,6 @@ const logger = winston.createLogger({
     ]
 });
 
-// Export constants and logger
-export {
-    DB_CONFIG,
-    BATCH_SIZE,
-    API_CONFIG,
-    CACHE_CONFIG,
-    FILE_PATHS,
-    ERROR_TYPES,
-    VALIDATION_SCHEMAS,
-    logger
-};
 
 class MetricsCollector {
     constructor() {
@@ -252,6 +254,56 @@ class MetricsCollector {
         const endpointStats = this.metrics.api.byEndpoint.get(endpoint);
         if (endpointStats) {
             endpointStats.rateLimits = (endpointStats.rateLimits || 0) + 1;
+        }
+    }
+
+    recordPackStats(stats) {
+        if (!this.metrics.packStats) {
+            this.metrics.packStats = new Map();
+        }
+    
+        const {rkey, ...packStats} = stats;
+        this.metrics.packStats.set(rkey, {
+            timestamp: new Date().toISOString(),
+            ...packStats
+        });
+    
+        // Update summary metrics
+        if (!this.metrics.summary) {
+            this.metrics.summary = {
+                totalUsersProcessed: 0,
+                totalNewUsers: 0,
+                totalUpdatedUsers: 0,
+                totalRemovedUsers: 0,
+                totalAssociatedPacks: {
+                    discovered: 0,
+                    queued: 0,
+                    skipped: 0
+                }
+            };
+        }
+    
+        this.metrics.summary.totalUsersProcessed += stats.userStats?.processed || 0;
+        this.metrics.summary.totalNewUsers += stats.userStats?.newToMongoDB || 0;
+        this.metrics.summary.totalUpdatedUsers += stats.userStats?.updated || 0;
+        this.metrics.summary.totalRemovedUsers += stats.userStats?.removed || 0;
+    
+        if (stats.associatedPacks) {
+            this.metrics.summary.totalAssociatedPacks.discovered += stats.associatedPacks.discovered || 0;
+            this.metrics.summary.totalAssociatedPacks.queued += stats.associatedPacks.queued || 0;
+            this.metrics.summary.totalAssociatedPacks.skipped += stats.associatedPacks.skipped || 0;
+        }
+    
+        // Log summary every 10 packs
+        if (this.metrics.packStats.size % 10 === 0) {
+            logger.info('Processing summary:', {
+                packsProcessed: this.metrics.packStats.size,
+                usersProcessed: this.metrics.summary.totalUsersProcessed,
+                newUsers: this.metrics.summary.totalNewUsers,
+                updatedUsers: this.metrics.summary.totalUpdatedUsers,
+                removedUsers: this.metrics.summary.totalRemovedUsers,
+                associatedPacks: this.metrics.summary.totalAssociatedPacks
+            });
         }
     }
 
@@ -780,6 +832,11 @@ class ErrorVerificationHandler {
             repaired: [],
             failed: []
         };
+
+        if (this.skipVerification) {
+            logger.debug('Skipping files verification in purgefiles mode');
+            return results;
+        }
     
         for (const [key, path] of Object.entries(FILE_PATHS)) {
             try {
@@ -1584,6 +1641,7 @@ class FileHandler {
     }
 
     async verifyFileIntegrity() {
+        
         logger.debug(`Verifying files ...`);
         
         const files = [
@@ -1599,6 +1657,11 @@ class FileHandler {
             failed: [],
             repaired: []
         };
+
+        if (this.skipVerification) {
+            logger.info('Skipping integrity verification in purgefiles mode');
+            return results;
+        }
     
         for (const file of files) {
             try {
@@ -1947,69 +2010,285 @@ class ApiHandler {
         return packs;
     }
 
-    async resolveHandle(handle) {
+    async resolveHandle(rawHandle, opts = {}) {
+        const {
+            retries = 0,
+            maxRetries = 3,
+            method = null
+        } = opts;
+    
+        const RETRY_DELAY = 2000;
+        const allErrors = [];
+    
         try {
-            if (!handle) {
+            if (!rawHandle) {
                 throw new Error('No handle provided');
             }
+    
             // If it's already a DID, return it
-            if (handle.startsWith('did:')) {
-                return handle;
+            if (rawHandle.startsWith('did:')) {
+                return rawHandle;
             }
-
-            // Sanitize the handle
-            const sanitized = handle.trim().toLowerCase();
-            logger.info(`Attempting to resolve sanitized handle: ${sanitized}`);
-
-            // Try public API first
-            try {
-                const publicData = await this.makePublicApiCall(
-                    'com.atproto.identity.resolveHandle',
-                    { handle: sanitized }
-                );
-                if (publicData?.did) return publicData.did;
-            } catch (err) {
-                if (err.status !== 404) {
-                    logger.warn(`Public API handle resolution failed: ${err.message}`);
-                }
-
-                // Only try fallbacks if public API fails
-                // 1. Check local cache for exact handle match
-                if (this.fileHandler) {  // Check if fileHandler exists
-                    const cachedUser = await this.fileHandler.getUser(sanitized);
-                    if (cachedUser?.did) return cachedUser.did;
-
-                    // 2. Check handle history in local cache
-                    const historicalUser = await this.fileHandler.getUserByHistoricalHandle(sanitized);
-                    if (historicalUser?.did) {
-                        logger.info(`Found user ${sanitized} in handle history, current handle: ${historicalUser.handle}`);
-                        return historicalUser.did;
-                    }
-                }
-
-                // 3. Last resort: try search
-                if (err.status === 400) {
-                    try {
-                        const searchResult = await this.apiHandler.makeApiCall(
-                            'app.bsky.actor.searchActors',
-                            { q: sanitized, limit: 1 }
-                        );
-
-                        if (searchResult?.actors?.[0]?.did) {
-                            logger.info(`Found user ${sanitized} via search: ${searchResult.actors[0].did}`);
-                            return searchResult.actors[0].did;
+    
+            // Clean the handle
+            const handle = this.sanitizeHandle(rawHandle);
+            logger.debug(`Resolving handle attempt ${retries + 1}/${maxRetries}: ${handle} (method: ${method || 'all'})`);
+    
+            // Track what methods we've tried
+            const methodsTried = new Set();
+    
+            // First check cache (no API call)
+            const cacheResult = await this.checkCache(handle);
+            if (cacheResult) {
+                logger.debug(`Found ${handle} in cache: ${cacheResult}`);
+                return cacheResult;
+            }
+    
+            // Try each method in sequence
+            const methods = [
+                {
+                    name: 'public',
+                    fn: async () => {
+                        try {
+                            await this.rateLimiter.throttle();
+                            const result = await this.makePublicApiCall(
+                                'com.atproto.identity.resolveHandle',
+                                { handle }
+                            );
+                            if (result?.did) return result.did;
+                        } catch (err) {
+                            logger.debug(`Public API failed for ${handle}:`, {
+                                error: err.message,
+                                status: err.status,
+                                type: err.error
+                            });
+                            allErrors.push({ method: 'public', error: err });
+                            
+                            if (err.status === 429) {
+                                await this.rateLimiter.handleResponse(err);
+                            }
+                            return null;
                         }
-                    } catch (searchErr) {
-                        logger.warn(`Search fallback failed for handle ${sanitized}:`, searchErr);
+                    }
+                },
+                {
+                    name: 'getProfile',
+                    fn: async () => {
+                        try {
+                            await this.rateLimiter.throttle();
+                            const profile = await this.makePublicApiCall(
+                                'app.bsky.actor.getProfile',
+                                { actor: handle }
+                            );
+                            if (profile?.did) return profile.did;
+                        } catch (err) {
+                            logger.debug(`GetProfile failed for ${handle}:`, {
+                                error: err.message,
+                                status: err.status,
+                                type: err.error
+                            });
+                            allErrors.push({ method: 'getProfile', error: err });
+                            
+                            if (err.status === 429) {
+                                await this.rateLimiter.handleResponse(err);
+                            }
+                            return null;
+                        }
+                    }
+                },
+                {
+                    name: 'search',
+                    fn: async () => {
+                        try {
+                            await this.rateLimiter.throttle();
+                            const searchResult = await this.makePublicApiCall(
+                                'app.bsky.actor.searchActors',
+                                { 
+                                    q: handle,
+                                    limit: 1
+                                }
+                            );
+    
+                            if (searchResult?.actors?.[0]) {
+                                const actor = searchResult.actors[0];
+                                // Verify exact match
+                                if (this.sanitizeHandle(actor.handle) === handle) {
+                                    logger.debug(`Found ${handle} via search as ${actor.did}`);
+                                    return actor.did;
+                                }
+                            }
+                        } catch (err) {
+                            logger.debug(`Search failed for ${handle}:`, {
+                                error: err.message,
+                                status: err.status,
+                                type: err.error
+                            });
+                            allErrors.push({ method: 'search', error: err });
+                            
+                            if (err.status === 429) {
+                                await this.rateLimiter.handleResponse(err);
+                            }
+                            return null;
+                        }
+                    }
+                },
+                {
+                    name: 'auth',
+                    fn: async () => {
+                        try {
+                            await this.refreshTokenIfNeeded();
+                            await this.rateLimiter.throttle();
+                            const response = await this.agent.resolveHandle({ handle });
+                            if (response?.data?.did) return response.data.did;
+                        } catch (err) {
+                            logger.debug(`Auth API failed for ${handle}:`, {
+                                error: err.message,
+                                status: err.status,
+                                type: err.error
+                            });
+                            allErrors.push({ method: 'auth', error: err });
+    
+                            if (err.status === 401) {
+                                await this.refreshTokenIfNeeded(true);
+                            }
+                            if (err.status === 429) {
+                                await this.rateLimiter.handleResponse(err);
+                            }
+                            return null;
+                        }
                     }
                 }
-                throw err;
+                
+            ];
+    
+            // Try each method (or specific method if specified)
+            for (const m of methods) {
+                if (method && m.name !== method) continue;
+                if (methodsTried.has(m.name)) continue;
+    
+                methodsTried.add(m.name);
+                const result = await m.fn();
+                if (result) return result;
+    
+                // Add delay between methods
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
+    
+            // If we still have retries left, try again
+            if (retries < maxRetries - 1) {
+                const delay = RETRY_DELAY * Math.pow(2, retries);
+                logger.debug(`All methods failed for ${handle}, retrying in ${delay}ms...`);
+                
+                // Log detailed errors if in debug mode
+                logger.debug('Resolution attempts failed:', {
+                    handle,
+                    attempt: retries + 1,
+                    errors: allErrors.map(e => ({
+                        method: e.method,
+                        message: e.error.message,
+                        status: e.error.status,
+                        type: e.error.error
+                    }))
+                });
+    
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.resolveHandle(rawHandle, {
+                    retries: retries + 1,
+                    maxRetries
+                });
+            }
+    
+            throw new Error(`Could not resolve handle after ${maxRetries} attempts: ${rawHandle}`);
+    
         } catch (err) {
-            logger.error(`Failed to resolve handle ${handle}:`, err);
+            // Log comprehensive error info
+            logger.error(`Handle resolution failed for ${rawHandle}:`, {
+                attempt: retries + 1,
+                method: method || 'all',
+                error: {
+                    message: err.message,
+                    status: err.status,
+                    type: err.error
+                },
+                previousErrors: allErrors.map(e => ({
+                    method: e.method,
+                    message: e.error.message,
+                    status: e.error.status,
+                    type: e.error.error
+                }))
+            });
+    
             throw err;
         }
     }
+
+    sanitizeHandle(handle) {
+        if (!handle) return '';
+        
+        // Remove invisible characters and extra spaces
+        let cleaned = handle
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')  // Remove zero-width chars
+            .replace(/\s+/g, '')                     // Remove all whitespace
+            .trim();
+        
+        // Remove URL parts if present
+        cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?/, '');
+        
+        // Normalize domain
+        cleaned = cleaned.replace(/\.bsky\.social$/, '');
+        cleaned = cleaned.toLowerCase();
+        
+        // Add domain if missing
+        if (!cleaned.includes('.')) {
+            cleaned = `${cleaned}.bsky.social`;
+        }
+        
+        return cleaned;
+    }
+    
+    async checkCache(handle) {
+        if (!this.fileHandler) return null;
+    
+        try {
+            // Check direct cache
+            const cachedUser = await this.fileHandler.getUser(handle);
+            if (cachedUser?.did) return cachedUser.did;
+    
+            // Check handle history
+            const historicalUser = await this.fileHandler.getUserByHistoricalHandle(handle);
+            if (historicalUser?.did) {
+                logger.info(`Found ${handle} in history as ${historicalUser.handle}`);
+                return historicalUser.did;
+            }
+        } catch (err) {
+            logger.debug(`Cache check failed for ${handle}: ${err.message}`);
+        }
+        return null;
+    }
+    
+    async refreshTokenIfNeeded(force = false) {
+        if (!this.agent) {
+            throw new Error('No agent initialized');
+        }
+
+        try {
+            const shouldRefresh = force || !this._lastTokenRefresh || 
+                (Date.now() - this._lastTokenRefresh) > 45 * 60 * 1000; // 45 minutes
+
+            if (shouldRefresh) {
+                await this.agent.login({
+                    identifier: process.env.BSKY_USERNAME,
+                    password: process.env.BSKY_PASSWORD
+                });
+                this._lastTokenRefresh = Date.now();
+                logger.debug('Successfully refreshed auth token');
+            }
+        } catch (err) {
+            logger.error('Failed to refresh token:', err);
+            throw err;
+        }
+    }
+    
 }
 
 class MockDatabaseManager {
@@ -2130,6 +2409,26 @@ class MockDatabaseManager {
     }
 }
 
+function normalizeHandle(handle) {
+    if (!handle) return '';
+    
+    // Remove any protocol/URL parts
+    let normalized = handle.replace(/^(http[s]?:\/\/)?(www\.)?/, '');
+    
+    // Remove bsky.social suffix if present
+    normalized = normalized.replace(/\.bsky\.social$/, '');
+    
+    // Convert to lowercase
+    normalized = normalized.toLowerCase();
+    
+    // Add .bsky.social if not present
+    if (!normalized.includes('.')) {
+        normalized = `${normalized}.bsky.social`;
+    }
+    
+    return normalized;
+}
+
 class DatabaseManager {
     constructor(mongoClient, dbType, logger, dbName = 'starterpacks') {
         this.client = mongoClient;
@@ -2139,7 +2438,7 @@ class DatabaseManager {
         this.db = null;
         this.isCosmosDb = DB_INFO[dbType]?.isCosmosDb || false;
         this.lastOperation = Date.now();
-        this.operationDelay = 1000; // Base delay between operations
+        this.operationDelay = 1000;         // Base delay between operations
         this.consecutiveThrottles = 0;
         this.maxConsecutiveThrottles = 5;
         this.baseBackoffDelay = 1000;
@@ -2166,6 +2465,46 @@ class DatabaseManager {
         
         // Remove duplicates and empty values
         return [...new Set(cleaned.filter(Boolean))];
+    }
+
+    async getKnownStarterPackRkeys() {
+        try {
+            // Only get rkeys in one efficient query
+            const cursor = this.db.collection('starter_packs')
+                .find({}, { projection: { rkey: 1, _id: 0 } })
+                .batchSize(10000);  // Adjust batch size for memory efficiency
+    
+            const knownRkeys = new Set();
+            await cursor.forEach(doc => {
+                if (doc.rkey) knownRkeys.add(doc.rkey);
+            });
+    
+            logger.info(`Retrieved ${knownRkeys.size} known starter pack rkeys from MongoDB`);
+            return knownRkeys;
+        } catch (err) {
+            logger.error('Error fetching known starter pack rkeys:', err);
+            throw err;
+        }
+    }
+
+    async getKnownUserDIDs() {
+        try {
+            // Only get DIDs in one efficient query
+            const cursor = this.db.collection('users')
+                .find({}, { projection: { did: 1, _id: 0 } })
+                .batchSize(10000);
+
+            const knownDIDs = new Set();
+            await cursor.forEach(doc => {
+                if (doc.did) knownDIDs.add(doc.did);
+            });
+
+            logger.info(`Retrieved ${knownDIDs.size} known user DIDs from MongoDB`);
+            return knownDIDs;
+        } catch (err) {
+            logger.error('Error fetching known user DIDs:', err);
+            throw err;
+        }
     }
 
     async performPackIdsCleanup() {
@@ -2509,223 +2848,467 @@ class DatabaseManager {
     }
 
     async safeWrite(collection, operation, options = {}) {
-        // Function to clean circular references for logging
+        const operationId = `${collection}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const startTime = Date.now();
+        const stats = { retries: 0, delays: 0 };
+    
         const cleanForLogging = (obj) => {
-            const cleaned = { ...obj };
+            if (!obj) return null;
+            const cleaned = JSON.parse(JSON.stringify(obj));
             delete cleaned.session;
             delete cleaned.sessionPool;
             delete cleaned.client;
             return cleaned;
         };
     
-        logger.info(`MongoDB write operation on ${collection}`);
-        logger.debug(`for:`, {
-            operation: cleanForLogging(operation)
+        // Initial debug log
+        logger.debug(`MongoDB write operation details:`, {
+            operationId,
+            collection,
+            operation: {
+                filter: cleanForLogging(operation.filter),
+                update: cleanForLogging(operation.update)
+            },
+            options: cleanForLogging(options)
         });
     
-        // Ensure pack_ids is always an array
-        if (operation.update?.$set) {
-            // Initialize arrays if they're null or undefined
-            if ('pack_ids' in operation.update.$set) {
-                operation.update.$set.pack_ids = operation.update.$set.pack_ids || [];
+        try {
+            // Validation
+            if (!operation.filter || !operation.update) {
+                throw new Error(`Invalid operation parameters for ${collection}`);
             }
-            if ('created_packs' in operation.update.$set) {
-                operation.update.$set.created_packs = operation.update.$set.created_packs || [];
-            }
-        }
     
-        // If creating a new document, ensure arrays are initialized
-        if (options.upsert) {
-            operation.update.$setOnInsert = operation.update.$setOnInsert || {};
-            if (!('pack_ids' in operation.update.$set)) {
-                operation.update.$setOnInsert.pack_ids = [];
-            }
-            if (!('created_packs' in operation.update.$set)) {
-                operation.update.$setOnInsert.created_packs = [];
-            }
-        }
-    
-        const maxRetries = 5;
-        let lastError = null;
-    
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-                await this.enforceOperationDelay();
-                await this.ensureSession();
-    
-                const sessionOptions = {
-                    ...options,
-                    session: this.session,
-                    upsert: true
-                };
-    
-                logger.debug('updating MongoDB:', {
-                    filter: operation.filter,
-                    update: cleanForLogging(operation.update),
-                    options: cleanForLogging(sessionOptions)
+            // Special handling for created_at conflicts
+            if (options.upsert && operation.update.$set?.created_at && operation.update.$setOnInsert?.created_at) {
+                logger.debug(`Detected created_at conflict, reorganizing update operation`, {
+                    operationId,
+                    collection
                 });
+                
+                // Check if document exists
+                const existing = await this.db.collection(collection)
+                    .findOne(operation.filter, { projection: { _id: 1, created_at: 1 } });
     
-                const result = await this.db.collection(collection).updateOne(
-                    operation.filter,
-                    operation.update,
-                    sessionOptions
-                );
-    
-                logger.info(`MongoDB write completed on ${collection}: matched ${result.matchedCount}, modified ${result.modifiedCount}, upserted ${result.upsertedCount}`);
-    
-                // Verify final state
-                try {
-                    const finalDoc = await this.db.collection(collection).findOne(operation.filter);
-                    logger.info('Final document state:', {
-                        exists: !!finalDoc,
-                        hasPackIds: Array.isArray(finalDoc?.pack_ids),
-                        packIdsCount: finalDoc?.pack_ids?.length || 0,
-                        hasCreatedPacks: Array.isArray(finalDoc?.created_packs),
-                        createdPacksCount: finalDoc?.created_packs?.length || 0
-                    });
-                } catch (verifyErr) {
-                    logger.warn('Could not verify final document state:', verifyErr.message);
+                if (existing) {
+                    // Use existing created_at
+                    delete operation.update.$setOnInsert.created_at;
+                    operation.update.$set.created_at = existing.created_at;
+                } else {
+                    // Document doesn't exist - move created_at to $setOnInsert only
+                    const createdAt = operation.update.$set.created_at || operation.update.$setOnInsert.created_at;
+                    delete operation.update.$set.created_at;
+                    operation.update.$setOnInsert.created_at = createdAt;
                 }
+            }
     
-                this.consecutiveThrottles = 0;
-                return;
+            // Execute write with retries
+            const maxRetries = 5;
+            let lastError = null;
     
-            } catch (err) {
-                lastError = err;
-                logger.error(`MongoDB write failed (attempt ${attempt + 1}/${maxRetries}):`, {
-                    collection,
-                    error: err.message,
-                    errorCode: err.code,
-                    operation: {
-                        filter: operation.filter,
-                        updateType: operation.update.$set ? '$set' : Object.keys(operation.update)[0]
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    await this.ensureSession();
+                    await this.enforceOperationDelay();
+    
+                    const writeOptions = {
+                        ...options,
+                        session: this.session
+                    };
+    
+                    const result = await this.db.collection(collection)
+                        .updateOne(
+                            operation.filter,
+                            operation.update,
+                            writeOptions
+                        );
+    
+                    // Verify write if requested
+                    if (options._requiresAck) {
+                        const verifiedDoc = await this.db.collection(collection)
+                            .findOne(operation.filter, { session: this.session });
+    
+                        if (!verifiedDoc) {
+                            throw new Error('Write verification failed');
+                        }
+    
+                        logger.debug(`Write verified:`, {
+                            operationId,
+                            collection,
+                            exists: true,
+                            document: cleanForLogging(verifiedDoc)
+                        });
                     }
-                });
     
-                if (err.message.includes('session')) {
-                    try {
+                    // Log success with details
+                    logger.info(`Write operation successful:`, {
+                        operationId,
+                        collection,
+                        duration: Date.now() - startTime,
+                        stats: {
+                            matchedCount: result.matchedCount,
+                            modifiedCount: result.modifiedCount,
+                            upsertedCount: result.upsertedCount,
+                            retries: stats.retries,
+                            delays: stats.delays
+                        }
+                    });
+    
+                    return result;
+    
+                } catch (err) {
+                    lastError = err;
+                    stats.retries++;
+    
+                    // Handle specific error types
+                    if (err.code === 40 && err.message.includes('created_at')) {
+                        // This is our conflict error - try to fix it
+                        logger.warn(`created_at conflict detected, retrying with fixed operation`, {
+                            operationId,
+                            attempt: attempt + 1
+                        });
+                        // Remove created_at from $set if it exists in both
+                        if (operation.update.$set?.created_at && operation.update.$setOnInsert?.created_at) {
+                            delete operation.update.$set.created_at;
+                        }
+                        continue;
+                    }
+                    
+                    if (err.code === 11000) { // Duplicate key
+                        if (collection === 'users') {
+                            logger.warn(`Duplicate key detected, retrying without upsert:`, {
+                                operationId,
+                                attempt: attempt + 1,
+                                error: err.message
+                            });
+                            options.upsert = false;
+                            continue;
+                        }
+                        throw err; // For non-users collections, fail fast on duplicates
+                    }
+    
+                    if (this.isCosmosThrottlingError(err)) {
+                        stats.delays++;
+                        await this.handleThrottlingError(err);
+                        continue;
+                    }
+    
+                    if (err.message.includes('session')) {
+                        logger.warn(`Session error, recreating:`, {
+                            operationId,
+                            attempt: attempt + 1,
+                            error: err.message
+                        });
                         await this.ensureSession();
                         continue;
-                    } catch (sessionErr) {
-                        logger.error('Failed to create new session:', sessionErr);
-                        throw sessionErr;
                     }
-                }
-                if (this.isCosmosThrottlingError(err)) {
-                    await this.handleThrottlingError(err);
-                    continue;
-                }
-                throw err;
-            }
-        }
     
-        throw lastError;
+                    // Log failure details
+                    logger.error(`Write attempt failed:`, {
+                        operationId,
+                        collection,
+                        attempt: attempt + 1,
+                        error: {
+                            message: err.message,
+                            code: err.code,
+                            stack: err.stack
+                        }
+                    });
+    
+                    // If not retryable, stop immediately
+                    if (!this.isRetryableError(err)) {
+                        throw err;
+                    }
+    
+                    // Apply exponential backoff
+                    const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000);
+                    stats.delays++;
+                    await new Promise(resolve => setTimeout(resolve, backoffMs));
+                }
+            }
+    
+            throw lastError || new Error(`Write failed after ${maxRetries} attempts`);
+    
+        } catch (err) {
+            // Log comprehensive error information
+            logger.error(`Write operation failed:`, {
+                operationId,
+                collection,
+                duration: Date.now() - startTime,
+                stats,
+                error: {
+                    message: err.message,
+                    code: err.code,
+                    stack: err.stack
+                },
+                operation: {
+                    filter: cleanForLogging(operation.filter),
+                    update: cleanForLogging(operation.update)
+                }
+            });
+            throw err;
+        }
+    }
+    
+    // Helper method to determine if error is retryable
+    isRetryableError(err) {
+        return (
+            err.code === 11000 || // Duplicate key
+            this.isCosmosThrottlingError(err) ||
+            err.message.includes('session') ||
+            err.message.includes('connection') ||
+            err.code === 'ETIMEDOUT' ||
+            err.name === 'MongoNetworkError' ||
+            (err.code >= 500 && err.code < 600) // Server errors
+        );
     }
 
     async safeBulkWrite(collection, operations, options = {}) {
+        const operationId = `bulk-${collection}-${Date.now()}`;
+        const stats = {
+            startTime: Date.now(),
+            processed: 0,
+            successful: 0,
+            failed: 0,
+            retried: 0,
+            duplicates: 0,
+            batches: 0,
+            errors: []
+        };
+    
+        // Early validation
         if (!Array.isArray(operations) || operations.length === 0) {
             logger.debug('No operations to bulk write');
-            return;
+            return { acknowledged: true, stats };
         }
-
-        logger.debug(`Starting bulk write to ${collection}:`);
-        logger.debug(`for:`, {
-            totalOperations: operations.length,
-            operationTypes: operations.map(op => 
-                op.updateOne ? 'updateOne' : 
-                op.insertOne ? 'insertOne' : 
-                op.deleteOne ? 'deleteOne' : 'unknown'
-            ).reduce((acc, type) => {
-                acc[type] = (acc[type] || 0) + 1;
-                return acc;
-            }, {})
-        });
-
-        const formattedOps = operations.map(op => {
+    
+        // Operation analysis and preparation
+        const normalizedOps = operations.map(op => {
             if (!op.updateOne && !op.insertOne && !op.deleteOne) {
                 return {
                     updateOne: {
                         filter: op.filter,
                         update: op.update,
-                        upsert: true
+                        upsert: op.upsert ?? true
                     }
                 };
             }
             return op;
         });
     
-        if (this.isCosmosDb) {
-            // Use defined Cosmos DB batch size
-            const batchSize = BATCH_SIZES[this.dbType] || BATCH_SIZES.mongodb;
-            for (let i = 0; i < operations.length; i += batchSize) {
-                const batch = operations.slice(i, i + batchSize);
-                for (const op of batch) {
-                    await this.safeWrite(collection, {
-                        filter: op.filter || op.updateOne.filter,
-                        update: op.update || op.updateOne.update,
-                        upsert: true
-                    }, options);
-                }
-                if ((i + batchSize) % 10 === 0) {
-                    const progress = ((i + batch.length) / operations.length * 100).toFixed(1);
-                    this.logger?.info(`Processed ${i + batch.length}/${operations.length} operations (${progress}%)`);
-                }
-            }
-        } else {
-            // Use defined MongoDB batch size
-            const batchSize = BATCH_SIZES.mongodb;
-            const batches = [];
-            
-            // Split into batches
-            for (let i = 0; i < formattedOps.length; i += batchSize) {
-                batches.push(formattedOps.slice(i, i + batchSize));
-            }
-            logger.info(`Prepared ${batches.length} batches of size ${batchSize}`);
+        // Calculate optimal batch size
+        const calculateBatchSize = (ops) => {
+            const baseSize = this.isCosmosDb ? 
+                BATCH_SIZES[this.dbType] : 
+                BATCH_SIZES.mongodb;
     
+            // Reduce batch size if operations are complex
+            const complexOps = ops.filter(op => 
+                (op.updateOne?.update.$set && 
+                 Object.keys(op.updateOne.update.$set).length > 10) ||
+                op.updateOne?.arrayFilters?.length > 0
+            ).length;
+    
+            return Math.max(1, Math.floor(baseSize * (1 - (complexOps / ops.length) * 0.5)));
+        };
+    
+        const batchSize = calculateBatchSize(normalizedOps);
+    
+        logger.info(`Starting bulk write operation`, {
+            operationId,
+            collection,
+            totalOperations: normalizedOps.length,
+            batchSize,
+            operationTypes: normalizedOps.reduce((acc, op) => {
+                const type = Object.keys(op)[0];
+                acc[type] = (acc[type] || 0) + 1;
+                return acc;
+            }, {})
+        });
+    
+        // Split into batches
+        const batches = [];
+        for (let i = 0; i < normalizedOps.length; i += batchSize) {
+            batches.push(normalizedOps.slice(i, i + batchSize));
+        }
+    
+        const processBatch = async (batch, batchIndex) => {
+            const batchStart = Date.now();
+            const batchId = `${operationId}-batch-${batchIndex}`;
+            
             try {
-                // Process batches in parallel with a concurrency limit
-                const concurrencyLimit = 3;
-                for (let i = 0; i < batches.length; i += concurrencyLimit) {
-                    const currentBatches = batches.slice(i, i + concurrencyLimit);
-                    await Promise.all(currentBatches.map(async batch => {
+                if (this.isCosmosDb) {
+                    // Process sequentially for Cosmos DB
+                    for (const op of batch) {
                         try {
-                            await this.db.collection(collection).bulkWrite(batch, {
+                            await this.safeWrite(collection, {
+                                filter: op.updateOne?.filter || op.filter,
+                                update: op.updateOne?.update || op.update
+                            }, {
+                                ...options,
+                                upsert: op.updateOne?.upsert ?? true
+                            });
+                            stats.successful++;
+                        } catch (err) {
+                            if (err.code === 11000) {
+                                stats.duplicates++;
+                                // Retry without upsert
+                                try {
+                                    await this.safeWrite(collection, {
+                                        filter: op.updateOne?.filter || op.filter,
+                                        update: op.updateOne?.update || op.update
+                                    }, {
+                                        ...options,
+                                        upsert: false
+                                    });
+                                    stats.retried++;
+                                    stats.successful++;
+                                } catch (retryErr) {
+                                    stats.failed++;
+                                    stats.errors.push({
+                                        batchId,
+                                        error: retryErr.message,
+                                        code: retryErr.code,
+                                        operation: op
+                                    });
+                                }
+                            } else {
+                                stats.failed++;
+                                stats.errors.push({
+                                    batchId,
+                                    error: err.message,
+                                    code: err.code,
+                                    operation: op
+                                });
+                            }
+                        }
+                        stats.processed++;
+                    }
+                } else {
+                    // Bulk write for MongoDB
+                    try {
+                        const result = await this.db.collection(collection)
+                            .bulkWrite(batch, {
                                 ordered: false,
                                 ...options,
                                 session: this.session
                             });
-                        } catch (err) {
-                            if (err.code === 11000) {
-                                logger.warn(`Handling duplicates in batch of ${batch.length} operations`);
-                                for (const op of batch) {
-                                    try {
-                                        await this.safeWrite(collection, {
-                                            filter: op.updateOne.filter,
-                                            update: op.updateOne.update
+                        
+                        stats.successful += result.modifiedCount + result.upsertedCount;
+                        stats.processed += batch.length;
+                    } catch (err) {
+                        if (err.code === 11000) {
+                            // Handle duplicates by retrying each operation
+                            logger.warn(`Handling duplicates in batch ${batchId}`);
+                            for (const op of batch) {
+                                try {
+                                    await this.safeWrite(collection, {
+                                        filter: op.updateOne?.filter || op.filter,
+                                        update: op.updateOne?.update || op.update
+                                    }, {
+                                        ...options,
+                                        upsert: false
+                                    });
+                                    stats.successful++;
+                                    stats.duplicates++;
+                                    stats.retried++;
+                                } catch (retryErr) {
+                                    if (retryErr.code !== 11000) {
+                                        stats.failed++;
+                                        stats.errors.push({
+                                            batchId,
+                                            error: retryErr.message,
+                                            code: retryErr.code,
+                                            operation: op
                                         });
-                                    } catch (innerErr) {
-                                        if (innerErr.code !== 11000) throw innerErr;
                                     }
                                 }
-                            } else {
-                                throw err;
                             }
+                            stats.processed += batch.length;
+                        } else {
+                            throw err;
                         }
-                    }));
-    
-                    const processedOps = Math.min((i + concurrencyLimit) * batchSize, formattedOps.length);
-                    const progress = (processedOps / formattedOps.length * 100).toFixed(1);
-                    logger.info(`Processed ${processedOps}/${formattedOps.length} bulk write operations (${progress}%)`);
+                    }
                 }
+    
+                stats.batches++;
+                const batchDuration = Date.now() - batchStart;
+                
+                // Log progress
+                if (stats.batches % 5 === 0 || stats.processed === normalizedOps.length) {
+                    const progress = (stats.processed / normalizedOps.length * 100).toFixed(1);
+                    const opsPerSecond = (stats.processed / ((Date.now() - stats.startTime) / 1000)).toFixed(1);
+                    
+                    logger.info(`Bulk write progress`, {
+                        operationId,
+                        progress: `${progress}%`,
+                        processed: stats.processed,
+                        successful: stats.successful,
+                        failed: stats.failed,
+                        duplicates: stats.duplicates,
+                        retried: stats.retried,
+                        opsPerSecond,
+                        lastBatchDuration: batchDuration
+                    });
+                }
+    
             } catch (err) {
-                logger.error('Bulk write failed:', {
-                    collection,
+                logger.error(`Batch processing failed`, {
+                    operationId,
+                    batchId,
                     error: err.message,
                     code: err.code,
-                    totalOps: formattedOps.length
+                    batchSize: batch.length
                 });
                 throw err;
             }
+        };
+    
+        try {
+            // Process batches with controlled concurrency
+            const concurrencyLimit = this.isCosmosDb ? 1 : 3;
+            
+            for (let i = 0; i < batches.length; i += concurrencyLimit) {
+                const currentBatches = batches.slice(i, Math.min(i + concurrencyLimit, batches.length));
+                await Promise.all(
+                    currentBatches.map((batch, index) => 
+                        processBatch(batch, i + index)
+                    )
+                );
+    
+                // Throttle between batch groups
+                if (i + concurrencyLimit < batches.length) {
+                    await this.enforceOperationDelay();
+                }
+            }
+    
+            // Final statistics
+            const duration = Date.now() - stats.startTime;
+            logger.info(`Bulk write operation completed`, {
+                operationId,
+                duration: `${(duration / 1000).toFixed(1)}s`,
+                totalOperations: normalizedOps.length,
+                successful: stats.successful,
+                failed: stats.failed,
+                duplicates: stats.duplicates,
+                retried: stats.retried,
+                opsPerSecond: (stats.processed / (duration / 1000)).toFixed(1),
+                errorRate: `${((stats.failed / stats.processed) * 100).toFixed(1)}%`
+            });
+    
+            return {
+                acknowledged: true,
+                ...stats,
+                duration
+            };
+    
+        } catch (err) {
+            logger.error(`Bulk write operation failed`, {
+                operationId,
+                error: err.message,
+                code: err.code,
+                stats
+            });
+            throw err;
         }
     }
 
@@ -2879,42 +3462,57 @@ class DatabaseManager {
     async cleanupRemovedUsers(rkey, removedDids) {
         logger.debug('cleanupRemovedUsers:', { rkey, removedDids });
         try {
-            // Update users that were removed from the pack
-            const bulkOps = removedDids.map(did => ({
-                updateOne: {
-                    filter: { 
-                        did,
-                        deleted: { $ne: true }  // Only update non-deleted users
-                    },
-                    update: {
-                        $pull: { pack_ids: rkey },
-                        $set: { last_updated: new Date() }
+            // First find all affected users
+            const existingUsers = await this.db.collection('users')
+                .find({ did: { $in: removedDids } })
+                .toArray();
+
+            const existingDids = new Set(existingUsers.map(u => u.did));
+
+            // Only process existing users
+            const bulkOps = removedDids
+                .filter(did => existingDids.has(did))
+                .map(did => ({
+                    updateOne: {
+                        filter: { 
+                            did,
+                            deleted: { $ne: true }
+                        },
+                        update: {
+                            $pull: { pack_ids: rkey },
+                            $set: { 
+                                last_updated: new Date().toISOString()
+                            }
+                        },
+                        upsert: false
                     }
+                }));
+
+            if (bulkOps.length > 0) {
+                await this.safeBulkWrite('users', bulkOps);
+            }
+
+            // Update deletion status for users with no packs
+            for (const did of existingDids) {
+                const user = await this.db.collection('users').findOne({ did });
+                if (user && (!user.pack_ids || user.pack_ids.length === 0)) {
+                    await this.safeWrite('users', {
+                        filter: { did },
+                        update: {
+                            $set: { 
+                                deleted: true, 
+                                deleted_at: new Date().toISOString(),
+                                deletion_reason: 'no_remaining_packs'
+                            }
+                        }
+                    }, { upsert: false });
                 }
-            }));
-    
-            await this.safeBulkWrite('users', bulkOps);
-    
-            // Mark users with no packs as deleted only if they're not already deleted
-            await this.safeWrite('users', {
-                filter: {
-                    did: { $in: removedDids },
-                    deleted: { $ne: true },
-                    $or: [
-                        { pack_ids: { $size: 0 } },
-                        { pack_ids: { $exists: false } }
-                    ]
-                },
-                update: {
-                    $set: { 
-                        deleted: true, 
-                        deleted_at: new Date(),
-                        deletion_reason: 'no_remaining_packs'
-                    }
-                }
+            }
+
+            logger.info(`Cleaned up ${removedDids.length} removed users for pack ${rkey}`, {
+                existing: existingDids.size,
+                processed: bulkOps.length
             });
-    
-            logger.info(`Cleaned up ${removedDids.length} removed users for pack ${rkey}`);
         } catch (err) {
             logger.error(`Failed to cleanup removed users for pack ${rkey}:`, err);
             throw err;
@@ -2954,37 +3552,237 @@ class MainProcessor {
             noMongoDB = false,
             noDBWrites = false,
             fromApi = false,
-            debug = false
+            debug = false,
+            mode = 'normal'  // 'normal', 'quick', 'purge', 'cleanup', 'maintenance'
         } = options;
 
-        this.noMongoDB = noMongoDB;
-        this.noDBWrites = noDBWrites; 
-        this.fromApi = fromApi;
-        this.debug = debug;
+        // Store configuration
+        this.config = {
+            noMongoDB,
+            noDBWrites,
+            fromApi,
+            debug,
+            mode
+        };
 
-        // Initialize basic components first
+        // initialization tracking
+        this.initialized = {
+            api: false,
+            db: false,
+            files: false,
+            taskManager: false
+        };
+
+        // Only create core components (don't initialize)
         this.rateLimiter = new RateLimiter();
-        this.fileHandler = new FileHandler();
-        
-        //this.packTracker = new PackTracker();
-        this.validator = new ValidationHelper(VALIDATION_SCHEMAS);
         this.metrics = metrics;
-        this.cleanupHandlers = new Set();
-        this.debugManager = new DebugManager({ debug: options.debug });
-
-        // Handle DB initialization based on flags
-        if (!noMongoDB) {
-            if (noDBWrites) {
-                this.dbManager = new MockDatabaseManager();
-            } else {
-                const isCosmosDb = process.env.DB_TYPE === 'cosmos';
-                this.mongoClient = new MongoClient(process.env.MONGODB_URI);
-                this.dbManager = new DatabaseManager(this.mongoClient, isCosmosDb);
-            }
-        }
+        this.validator = new ValidationHelper(VALIDATION_SCHEMAS);
+        this.fileHandler = new FileHandler();
+        // Don't create TaskManager yet
+        this.taskManager = null;  // Will be created after DB init
+        
+        // Initialize status tracking
+        this.initialized = {
+            api: false,
+            db: false,
+            files: false,
+            taskManager: false
+        };
 
         this.profileCache = new Map();
-        this.profileCacheTTL = 24 * 60 * 60 * 1000;
+        this.profileCacheTTL = CACHE_CONFIG.profileCacheTTL;
+    }
+
+    // Replace with consolidated mode-specific methods:
+    async initializeComponents(mode = 'normal') {
+        switch (mode) {
+            case 'api_only':
+                await this.initializeApi();
+                break;
+                
+            case 'db_only':
+                await this.initializeDb();
+                break;
+                
+            case 'minimal':
+                await this.initializeApi();
+                await this.initializeDb();
+                break;
+                
+            case 'normal':
+                await this.initializeApi();
+                await this.initializeDb();
+                // Don't auto-initialize files - let main control this
+                break;
+        }
+    }
+
+    // Core initialization methods
+    async initializeApi() {
+        if (this.initialized.api) return;
+
+        logger.debug('Initializing API components...');
+        this.agent = new BskyAgent({
+            service: API_CONFIG.baseURLs.primary
+        });
+
+        try {
+            await this.agent.login({
+                identifier: process.env.BSKY_USERNAME,
+                password: process.env.BSKY_PASSWORD
+            });
+            
+            this.apiHandler = new ApiHandler(
+                this.agent, 
+                this.rateLimiter,
+                this.fileHandler
+            );
+
+            this.verificationHandler = new ErrorVerificationHandler({
+                debugManager: this.debugManager,
+                metrics: this.metrics,
+                fileHandler: this.fileHandler,
+                dbManager: this.dbManager,
+                apiHandler: this.apiHandler
+            });
+
+            this.initialized.api = true;
+            logger.debug('API components initialized');
+        } catch (err) {
+            logger.error('API initialization failed:', err);
+            throw err;
+        }
+    }
+
+    async initializeDb() {
+        if (this.initialized.db || this.config.noMongoDB) return;
+
+        logger.debug('Initializing database...');
+        try {
+            if (this.config.noDBWrites) {
+                this.dbManager = new MockDatabaseManager();
+            } else {
+                const dbType = process.env.DB_TYPE || 'cosmos';
+                const dbConfig = {
+                    ...DB_CONFIGS[dbType],
+                    maxPoolSize: this.config.mode === 'quick' ? 50 : 10,
+                    minPoolSize: this.config.mode === 'quick' ? 10 : 5,
+                    waitQueueTimeoutMS: 30000,
+                    serverSelectionTimeoutMS: 30000
+                };
+
+                this.mongoClient = new MongoClient(process.env.MONGODB_URI, dbConfig);
+                this.dbManager = new DatabaseManager(
+                    this.mongoClient,
+                    dbType,
+                    this.logger,
+                    'starterpacks'
+                );
+            }
+            
+            await this.dbManager.init();
+            await this.dbManager.ensureSession();
+            
+            // Create TaskManager after DB is initialized
+            this.taskManager = new TaskManager(
+                this.fileHandler, 
+                this.config.debug, 
+                this.dbManager, 
+                this.config.noMongoDB
+            );
+            
+            this.initialized.db = true;
+            logger.debug('Database initialized');
+        } catch (err) {
+            logger.error('Database initialization failed:', err);
+            throw err;
+        }
+    }
+
+    async initializeFiles() {
+        if (this.initialized.files) return;
+
+        logger.debug('Initializing file handler...');
+        try {
+            await this.fileHandler.init();
+            this.initialized.files = true;
+            logger.debug('File handler initialized');
+        } catch (err) {
+            logger.error('File handler initialization failed:', err);
+            throw err;
+        }
+    }
+
+    // Factory method for creating processor instances
+    static async create(options) {
+        const processor = new MainProcessor(options);
+        
+        // Do base initialization based on mode
+        switch(options.mode) {
+            case 'purge':
+                // Nothing to initialize
+                break;
+                
+            case 'cleanup':
+                await processor.initializeDb();
+                break;
+                
+            case 'quick':
+                await processor.initializeApi();
+                await processor.initializeDb();
+                await processor.initializeFiles();
+                break;
+
+            case 'maintenance':
+                await processor.initializeDb();
+                await processor.initializeFiles();
+                break;
+                
+            case 'normal':
+                await processor.initializeApi();
+                await processor.initializeDb();
+                break;
+        }
+        
+        return processor;
+    }
+
+    // Processing methods
+    async processTasks(tasks) {
+        let processedCount = 0;
+        let failedCount = 0;
+    
+        for (const task of tasks) {
+            try {
+                // Add each task to pendingTasks first
+                this.taskManager.pendingTasks.set(task.rkey, task);
+                
+                const success = await this.taskManager.processNextTask(this);
+                
+                if (success) {
+                    processedCount++;
+                    if (processedCount % 10 === 0) {
+                        await this.taskManager.maybeWriteCheckpoint();
+                    }
+                } else {
+                    failedCount++;
+                }
+    
+                if ((processedCount + failedCount) % 100 === 0) {
+                    logger.info('Processing status:', {
+                        remaining: tasks.length - (processedCount + failedCount),
+                        processed: processedCount,
+                        failed: failedCount,
+                        successRate: `${((processedCount / (processedCount + failedCount)) * 100).toFixed(1)}%`
+                    });
+                }
+            } catch (err) {
+                logger.error(`Failed to process task ${task.rkey}:`, err);
+                failedCount++;
+            }
+        }
+    
+        return { processedCount, failedCount };
     }
 
     async handleProfileError(err, context) {
@@ -3012,29 +3810,30 @@ class MainProcessor {
         
         return { retry: this.isRetryableError(err) };
     }
+    
     async handleError(err, context) {
         const { operation, data } = context;
-        
         metrics.recordError(operation, err);
         
-        if (this.verificationHandler) {
-            // Log for verification history
-            const errorEntry = {
-                timestamp: new Date().toISOString(),
-                operation,
-                error: err.message,
-                context: data
-            };
-            this.verificationHandler.verificationResults.set(
-                `${operation}-${Date.now()}`, 
-                errorEntry
-            );
-        }
-    
+        // Rate limit handling
         if (this.isRateLimitError(err)) {
             await this.rateLimiter.handleResponse(err);
             return { retry: true };
         }
+    
+        // Not found handling
+        if (this.isNotFoundError(err)) {
+            return { retry: false };
+        }
+    
+        // Log error with context
+        logger.error(`Operation error: ${operation}`, {
+            error: err.message,
+            status: err.status,
+            operation,
+            data,
+            stack: err.stack
+        });
     
         return { retry: this.isRetryableError(err) };
     }
@@ -3113,7 +3912,7 @@ class MainProcessor {
         }
     }
 
-    async initMinimal() {
+    async initMinimal_old() {
         logger.debug('Minimal initialization for quick process');
         
         // Initialize API components
@@ -3150,68 +3949,6 @@ class MainProcessor {
         }
         
         logger.debug('Minimal initialization complete');
-    }
-
-    async init() {
-        try {
-            // Step 0: Initialize Bluesky API components
-            logger.debug('Initialize Bluesky API components');
-            await this.initializeApiComponents();
-            
-            // Step 1: Initialize file handler first
-            logger.debug('Initialize file handler');
-            await this.fileHandler.init();
-
-            // Step 2: Initialize database if needed
-            logger.debug('Setting up handling of Mongo-DB', this.noDBWrites)
-            if (!this.noMongoDB) {
-                if (this.noDBWrites) {
-                    logger.info('Running in no-(Mongo-)DB-writes mode - operations will be logged only');
-                    this.dbManager = new MockDatabaseManager();
-                    await this.dbManager.init();
-                } else {
-                    const dbType = process.env.DB_TYPE || 'cosmos';
-                    const dbConfig = {
-                        ...DB_CONFIGS[dbType],
-                        maxPoolSize: 10,
-                        minPoolSize: 5,
-                        waitQueueTimeoutMS: 30000,
-                        serverSelectionTimeoutMS: 30000
-                    };
-
-                    this.mongoClient = new MongoClient(process.env.MONGODB_URI, dbConfig);
-                    this.dbManager = new DatabaseManager(
-                        this.mongoClient,
-                        dbType,  // Pass dbType instead of isCosmosDb
-                        this.logger,
-                        'starterpacks',
-                        // BATCH_SIZES[dbType] || BATCH_SIZES.cosmos
-                    );
-                    await this.dbManager.init();
-                }
-            }
-    
-            // Step 3: Create TaskManager after DB is initialized
-            logger.debug('Create TaskManager');
-            this.taskManager = new TaskManager(this.fileHandler, this.debug, this.dbManager, this.noMongoDB);
-            
-            // Step 4: Load tasks and data
-            logger.debug('Load tasks and data');
-            await this.taskManager.initializeTaskList();            
-    
-            // Step 5: Verify system state
-            logger.debug('Verify system state');
-            const verificationResults = await this.verificationHandler.verifySystemState();
-            
-            if (this.debug) {
-                logger.debug('System verification results:', verificationResults);
-            }
-    
-            logger.info('Initialization complete');
-        } catch (err) {
-            logger.error(`Initialization failed: ${err.message}`);
-            throw err;
-        }
     }
 
     async removeMembershipWithProof(processor, userDid, packRkey, proof) {
@@ -3262,55 +3999,107 @@ class MainProcessor {
         }
     }
 
+    async retryWithBackoff(operation, operationName, maxRetries = 3) {
+        let lastError;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                return await operation();
+            } catch (err) {
+                lastError = err;
+                if (err.status === 429) {
+                    await this.rateLimiter.handleResponse(err);
+                } else {
+                    await new Promise(resolve => 
+                        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+                    );
+                }
+            }
+        }
+        throw lastError;
+    }
+
     async processStarterPack(urlLine) {
-        if (!urlLine || typeof urlLine !== 'string') {
-            throw new Error('Invalid urlLine parameter');
-        }
+        const stats = {
+            startTime: Date.now(),
+            stages: {},
+            memoryUsage: {},
+            userStats: {
+                processed: 0,
+                newToMongoDB: 0,
+                updated: 0,
+                removed: 0,
+                failed: 0
+            },
+            associatedPacks: {
+                discovered: 0,
+                queued: 0
+            }
+        };
     
-        const [handle, rkey] = urlLine.split('|').map(s => s.trim());
-        if (!handle || !rkey) {
-            throw new Error('Invalid URL line format');
-        }
+        const recordStageTime = (stage) => {
+            stats.stages[stage] = {
+                endTime: Date.now(),
+                duration: Date.now() - (stats.stages[stage]?.startTime || stats.startTime)
+            };
+            stats.memoryUsage[stage] = process.memoryUsage();
+        };
     
-        // Get task information if available from taskManager
-        const taskInfo = this.taskManager?.pendingTasks?.get(rkey);
-        logger.debug("taskinfo:", taskInfo);
-
-        // check for permanently failed packs
-        const failure = this.taskManager.failures.get(rkey);
-        if (failure?.permanent) {
-            logger.info(`Skipping permanently failed pack ${rkey}`);
-            return false;
-        }
-
-        logger.info(`Processing pack: ${handle}|${rkey}`);
-        //logger.info(`Progress: ${this.taskManager.completedTaskCount}/${this.taskManager.totalTasks} packs`);
-        logger.info(`Progress: ${this.taskManager.completedTasks.size}/${this.taskManager.pendingTasks.size + this.taskManager.completedTasks.size} packs`);
-
-        logger.debug(`Pack info: ${urlLine}`, {
-            taskType: taskInfo?.source || 'direct',
-            priority: taskInfo?.priority || 0,
-            discoveredFrom: taskInfo?.parentDid || null
-        });
+        const startStage = (stage) => {
+            stats.stages[stage] = { startTime: Date.now() };
+            logger.debug(`Starting stage: ${stage}`);
+        };
     
         try {
-            const startTime = Date.now();
-            
-            // 1. Initial checks and state loading 
+            // Input validation
+            if (!urlLine?.includes('|')) {
+                throw new Error('Invalid urlLine format');
+            }
+    
+            const [handle, rkey] = urlLine.split('|').map(s => s.trim());
+            if (!handle || !rkey) {
+                throw new Error('Invalid pack identifier format');
+            }
+    
+            startStage('initialization');
+            const taskInfo = this.taskManager?.pendingTasks?.get(rkey);
+            const failure = this.taskManager.failures.get(rkey);
+    
+            // Early exits
+            if (failure?.permanent) {
+                logger.info(`Skipping permanently failed pack ${rkey}`);
+                return false;
+            }
+    
             if (this.taskManager.completedTasks.has(rkey)) {
                 logger.debug(`Skipping already processed pack: ${rkey}`);
                 return true;
             }
     
-            // Load existing pack state for comparison
+            logger.info(`Processing pack: ${handle}|${rkey}`, {
+                taskType: taskInfo?.source || 'direct',
+                priority: taskInfo?.priority || 0,
+                discoveredFrom: taskInfo?.parentDid || null,
+                progress: `${this.taskManager.completedTasks.size}/${this.taskManager.pendingTasks.size + this.taskManager.completedTasks.size}`
+            });
+            recordStageTime('initialization');
+    
+            // Load existing state
+            startStage('loadExisting');
             const existingPack = await this.fileHandler.getPack(rkey);
             const existingUsers = existingPack ? new Set(existingPack.users) : new Set();
+            recordStageTime('loadExisting');
     
-            // 2. Resolve creator and fetch pack
-            const creatorDID = await this.apiHandler.resolveHandle(handle);
-            if (!creatorDID) {
+            // Creator resolution and pack fetching (with retries)
+            startStage('fetchPack');
+            let creatorDID;
+            try {
+                creatorDID = await this.retryWithBackoff(
+                    () => this.apiHandler.resolveHandle(handle),
+                    'resolve_handle'
+                );
+            } catch (err) {
                 logger.warn(`Creator not found for pack ${rkey}`);
-                if (existingPack && !this.noMongoDB && !this.noDBWrites) {
+                if (existingPack) {
                     await this.dbManager.markPackDeleted(rkey, 'creator_not_found');
                 }
                 this.taskManager.recordFailure(rkey, 'creator_not_found');
@@ -3318,72 +4107,66 @@ class MainProcessor {
             }
     
             const packUri = `at://${creatorDID}/app.bsky.graph.starterpack/${rkey}`;
-            const pack = await this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri });
-
-            if (!pack?.starterPack) {
-                await this.taskManager.markPackStatus(rkey, 'deleted', 'pack_not_found');
+            const pack = await this.retryWithBackoff(
+                () => this.apiHandler.makeAuthApiCall('app.bsky.graph.getStarterPack', { starterPack: packUri }),
+                'fetch_pack'
+            );
+            recordStageTime('fetchPack');
+    
+            // Validate pack state
+            startStage('validation');
+            if (!pack?.starterPack || pack.starterPack.record?.hidden || !pack.starterPack.record?.list) {
+                const reason = !pack?.starterPack ? 'pack_not_found' : 
+                              pack.starterPack.record?.hidden ? 'hidden' : 
+                              'invalid_structure';
+                await this.taskManager.markPackStatus(rkey, reason === 'hidden' ? 'hidden' : 'deleted', reason);
                 return false;
             }
+            recordStageTime('validation');
     
-            // Check if pack is hidden/deleted
-            if (pack.starterPack.record?.hidden) {
-                await this.taskManager.markPackStatus(rkey, 'hidden', 'marked_as_hidden');
-                return false;
-            }
+            // Process members
+            startStage('processMembers');
+            const listMembers = await this.retryWithBackoff(
+                () => this.apiHandler.makeApiCall('app.bsky.graph.getList', { 
+                    list: pack.starterPack.record.list 
+                }),
+                'fetch_list'
+            );
     
-            if (!pack?.starterPack?.record?.list) {
-                logger.warn(`Invalid pack structure for ${rkey}`);
-                if (existingPack && !this.noMongoDB && !this.noDBWrites) {
-                    await this.dbManager.markPackDeleted(rkey, 'invalid_pack_structure');
-                }
-                this.taskManager.recordFailure(rkey, 'invalid_pack_structure');
-                return false;
-            }
-    
-            // 3. Get and process list members
-            logger.debug(`Getting list ${pack.starterPack.record.list}`);
-            const listMembers = await this.apiHandler.makeApiCall('app.bsky.graph.getList', { list: pack.starterPack.record.list });
-            
             if (!listMembers?.items?.length) {
-                logger.warn(`Empty list for pack ${rkey}`);
-                if (existingPack && !this.noMongoDB && !this.noDBWrites) {
-                    await this.dbManager.markPackDeleted(rkey, 'empty_list');
-                }
-                this.taskManager.recordFailure(rkey, 'empty_list');
+                await this.taskManager.markPackStatus(rkey, 'deleted', 'empty_list');
                 return false;
             }
     
-            const processedUsers = await this.processListMembers(listMembers, rkey);
-
-            const currentMembers = new Set(listMembers.items.map(member => member.subject.did));
-
-            // For each existing member in our database that's not in the current list:
-            if (existingPack?.users) {
-                for (const existingMemberDid of existingPack.users) {
-                    if (!currentMembers.has(existingMemberDid)) {
-                        await this.removeMembershipWithProof(this, existingMemberDid, rkey, {
-                            type: 'list_absence',
-                            packRkey: rkey,
-                            listUri: listMembers.uri,
-                            verifiedAt: new Date().toISOString(),
-                            currentMemberCount: currentMembers.size
-                        });
-                    }
-                }
-            }
+            // Process in batches
+            const BATCH_SIZE = 50;
+            const processedUsers = [];
+            for (let i = 0; i < listMembers.items.length; i += BATCH_SIZE) {
+                const batch = listMembers.items.slice(i, i + BATCH_SIZE);
+                const batchResults = await Promise.all(
+                    batch.map(member => this.processPackMember(member, rkey))
+                );
+                processedUsers.push(...batchResults.filter(Boolean));
     
-            // 4. Handle removed users BEFORE saving new state
+                logger.debug(`Processed member batch ${i + 1}-${i + batch.length}/${listMembers.items.length}`);
+            }
+            stats.userStats.processed = processedUsers.length;
+            recordStageTime('processMembers');
+    
+            // Handle membership changes
+            startStage('membershipChanges');
             const currentUsers = new Set(processedUsers.map(u => u.did));
+            
+            // Handle removed users
             const removedDids = Array.from(existingUsers).filter(did => !currentUsers.has(did));
-    
             if (removedDids.length > 0) {
-                logger.info(`${removedDids.length} users removed from pack ${rkey}`);
-                if (!this.noMongoDB && !this.noDBWrites) {
-                    await this.dbManager.cleanupRemovedUsers(rkey, removedDids);
-                }
+                await this.dbManager.cleanupRemovedUsers(rkey, removedDids);
+                stats.userStats.removed = removedDids.length;
             }
+            recordStageTime('membershipChanges');
     
-            // 5. Prepare and validate pack data
+            // Prepare pack data
+            startStage('savePack');
             const packData = {
                 rkey,
                 name: pack.starterPack.record.name,
@@ -3400,78 +4183,98 @@ class MainProcessor {
                 previous_update: existingPack?.updated_at || null
             };
     
-            // 6. Save data with proper ordering
-            // First save to file system
+            // Save data with proper ordering and atomic updates
             await this.fileHandler.appendPack(packData);
-            for (const user of processedUsers) {
-                await this.fileHandler.appendUser(user);
+            
+            // Save users in batches
+            for (let i = 0; i < processedUsers.length; i += BATCH_SIZE) {
+                const batch = processedUsers.slice(i, i + BATCH_SIZE);
+                await Promise.all(batch.map(user => this.fileHandler.appendUser(user)));
             }
+            recordStageTime('savePack');
     
-            // Then save to MongoDB if enabled
-            if (!this.noMongoDB) {
-                await this.saveToDB(packData, processedUsers);
+            // MongoDB updates
+            startStage('mongodb');
+            if (!this.noMongoDB && !this.noDBWrites) {
+                const writeResults = await this.saveToDB(packData, processedUsers);
+                stats.userStats.newToMongoDB = writeResults.newUsers;
+                stats.userStats.updated = writeResults.updatedUsers;
             }
-
-            if (this.debug) {
-                const dbCounts = await this.dbManager.getCollectionCounts();
-                logger.debug('Current database status:', {
-                    collections: dbCounts,
-                    pendingTasks: this.taskManager.pendingTasks.size,
-                    completedTasks: this.taskManager.completedTasks.size
-                });
-            }
+            recordStageTime('mongodb');
     
-            // 7. Update task state and metrics
+            // Process associated packs
+            startStage('associatedPacks');
+            const packCreator = { 
+                did: creatorDID, 
+                handle 
+            };
+            const associatedResults = await this.processAssociatedPacks(packCreator, {
+                forceProcess: false,
+                parentPack: rkey
+            });
+            stats.associatedPacks = associatedResults;
+            recordStageTime('associatedPacks');
+    
+            // Finalize
+            startStage('finalization');
             await this.taskManager.markTaskCompleted(rkey);
             await this.taskManager.markPackStatus(rkey, 'completed', null);
-        
-            metrics.recordPackProcessing(true, Date.now() - startTime);
+            
+            // Record metrics
+            metrics.recordPackProcessing(true, Date.now() - stats.startTime);
+            metrics.recordPackStats({
+                rkey,
+                ...stats
+            });
     
             // Log completion
-            if (this.debug) {
-                const duration = Date.now() - startTime;
-                logger.debug('Pack processing completed', {
-                    rkey,
-                    duration,
-                    userCount: processedUsers.length,
-                    usersProcessed: processedUsers.length,
-                    usersRemoved: removedDids.length
-                });
-            }
+            logger.info(`Pack ${rkey} processing complete:`, {
+                duration: `${((Date.now() - stats.startTime) / 1000).toFixed(1)}s`,
+                stages: Object.entries(stats.stages).reduce((acc, [stage, timing]) => {
+                    acc[stage] = `${(timing.duration / 1000).toFixed(1)}s`;
+                    return acc;
+                }, {}),
+                userStats: stats.userStats,
+                associatedPacks: stats.associatedPacks,
+                memoryPeak: Math.max(...Object.values(stats.memoryUsage)
+                    .map(m => m.heapUsed)) / 1024 / 1024
+            });
+            recordStageTime('finalization');
     
             return true;
     
         } catch (err) {
-            // 8. Error handling with proper cleanup
-            if (err.status === 404) {
-                // Pack no longer exists at Bluesky
-                if (existingPack && !this.noMongoDB && !this.noDBWrites) {
-                    // No need to cleanup users here as markPackDeleted handles it
-                    await this.dbManager.markPackDeleted(rkey, 'pack_not_found');
-                    
+            // Comprehensive error handling
+            const errorContext = {
+                rkey: urlLine?.split('|')[1],
+                stage: Object.keys(stats.stages).pop(),
+                duration: Date.now() - stats.startTime,
+                processedStats: stats,
+                error: {
+                    message: err.message,
+                    status: err.status,
+                    stack: err.stack
                 }
-                this.taskManager.recordFailure(rkey, 'Pack no longer exists', true);
-                this.taskManager.updatePackState(rkey, 'deleted', 'api_404');
-                metrics.recordPackProcessing(false);
-                return false;
-            }
-            
-            if (err.status === 429) {
+            };
+    
+            if (err.status === 404) {
+                await this.handlePackNotFound(errorContext);
+            } else if (err.status === 429) {
                 await this.rateLimiter.handleResponse(err);
+                logger.warn('Rate limit hit, will retry', errorContext);
                 return false;
+            } else {
+                logger.error('Pack processing failed:', errorContext);
+                await this.taskManager.recordFailure(
+                    errorContext.rkey, 
+                    err.message,
+                    err.status === 404
+                );
             }
     
-            // Log error with context
-            logger.error(`Error processing pack ${rkey}:`, {
-                error: err.message,
-                status: err.status,
-                stack: err.stack,
-                handle,
-                rkey
-            });
-    
-            this.taskManager.recordFailure(rkey, err.message, err.status === 404);
             metrics.recordPackProcessing(false);
+            metrics.recordError('process_pack', err);
+            
             return false;
         }
     }
@@ -3556,8 +4359,11 @@ class MainProcessor {
 
     async processAssociatedPacks(currentProfile, options = {}) {
         try {
+            logger.info(`Processing associated packs for ${currentProfile.handle} (${currentProfile.did})`);
             const packs = await this.apiHandler.getActorStarterPacks(currentProfile.did);
+            
             if (!packs?.starterPacks?.length) {
+                logger.debug(`No associated packs found for ${currentProfile.handle}`);
                 return { discovered: 0, queued: 0, skipped: 0, failed: 0 };
             }
     
@@ -3568,25 +4374,50 @@ class MainProcessor {
                 failed: 0
             };
     
+            logger.info(`Found ${results.discovered} associated packs for ${currentProfile.handle}`);
+    
             for (const pack of packs.starterPacks) {
                 try {
                     const rkey = await this.extractRkeyFromURI(pack.uri);
-                    const memberCount = pack.starterPack?.record?.items?.length || 0;
                     
-                    // Use taskManager to handle the pack discovery and addition
-                    const added = await this.taskManager.addAssociatedPack({
-                        rkey,
-                        creator: currentProfile.handle,
-                        memberCount
-                    }, currentProfile.did);
+                    // Get member count properly from the list data
+                    let memberCount = 0;
+                    try {
+                        if (pack.record?.list) {
+                            const listData = await this.apiHandler.makeApiCall(
+                                'app.bsky.graph.getList',
+                                { list: pack.record.list }
+                            );
+                            memberCount = listData?.items?.length || 0;
+                        }
+                    } catch (err) {
+                        logger.warn(`Failed to get member count for pack ${rkey}: ${err.message}`);
+                    }
+                    
+                    // Check if pack exists in MongoDB
+                    const existsInMongoDB = !this.noMongoDB && await this.dbManager.db
+                        .collection('starter_packs')
+                        .findOne({ rkey }, { projection: { _id: 1 } });
     
-                    if (added) {
-                        results.queued++;
-                        if (options.forceProcess) {
-                            await this.processStarterPack(`${currentProfile.handle}|${rkey}`);
+                    if (!existsInMongoDB) {
+                        logger.debug(`Adding new pack ${rkey} from ${currentProfile.handle} (${memberCount} members)`);
+                        const added = await this.taskManager.addAssociatedPack({
+                            rkey,
+                            creator: currentProfile.handle,
+                            memberCount,
+                            uri: pack.uri,
+                            name: pack.record?.name,
+                            description: pack.record?.description,
+                            createdAt: pack.record?.createdAt,
+                            list: pack.record?.list
+                        }, currentProfile.did);
+    
+                        if (added) {
+                            results.queued++;
                         }
                     } else {
                         results.skipped++;
+                        logger.debug(`Skipped existing pack ${rkey} from ${currentProfile.handle}`);
                     }
     
                 } catch (err) {
@@ -3595,6 +4426,7 @@ class MainProcessor {
                 }
             }
     
+            logger.info(`Associated packs processing complete for ${currentProfile.handle}:`, results);
             return results;
         } catch (err) {
             logger.error(`Failed to process packs for ${currentProfile.handle}:`, err);
@@ -3924,6 +4756,11 @@ class MainProcessor {
                 }
 
                 seenDids.add(memberDid);
+
+                // Check if we should process this user
+                if (!this.taskManager.shouldProcessUser(memberDid)) {
+                    continue;
+                }
                 
                 // Get full profile for the member to check for associated packs
                 const memberProfile = await this.apiHandler.getProfile(memberDid);
@@ -3979,57 +4816,163 @@ class MainProcessor {
     }
 
     async saveToDB(packData, users) {
-        if (this.noMongoDB) return;
+        if (this.noMongoDB) return { newUsers: 0, updatedUsers: 0 };
     
         try {
-            // First save the pack
-            logger.debug('Writing pack to MongoDB:', packData.rkey);
-            await this.dbManager.safeWrite('starter_packs', {
-                filter: { rkey: packData.rkey },
-                update: { $set: packData },
-                upsert: true
-            });
+            const writeResults = { newUsers: 0, updatedUsers: 0 };
     
-            // Then process users in batches
-            logger.debug(`Writing ${users.length} users to MongoDB`);
-            const userOperations = users.map(user => ({
-                updateOne: {
-                    filter: { did: user.did },
-                    update: { 
-                        $set: {
-                            ...user,
-                            pack_ids: user.pack_ids // Include pack_ids in $set instead of $addToSet
-                        }
-                    },
-                    upsert: true
+            // 1. Format pack data
+            
+            const formattedPack = {
+                rkey: packData.rkey,
+                creator: packData.creator,
+                creator_did: packData.creator_did,
+                description: packData.description || '',
+                name: packData.name,
+                previous_update: packData.previous_update || null,
+                previous_user_count: packData.previous_user_count || 0,
+                total_joins: packData.total_joins || 0,
+                updated_at: packData.updated_at || new Date().toISOString(),
+                user_count: packData.user_count || 0,
+                users: packData.users || [],
+                weekly_joins: packData.weekly_joins || 0,
+                last_updated: new Date().toISOString(),
+                status: packData.status || 'completed',
+                status_reason: packData.status_reason || null,
+                status_updated_at: packData.status_updated_at || new Date().toISOString()
+            };
+
+            // Check if pack exists
+            const existingPack = await this.dbManager.db.collection('starter_packs')
+                .findOne({ rkey: formattedPack.rkey }, { projection: { _id: 1, created_at: 1 } });
+
+            const updateOperation = {
+                filter: { rkey: formattedPack.rkey },
+                update: {
+                    $set: formattedPack
                 }
-            }));
+            };
+
+            // Only add created_at for new documents
+            if (!existingPack) {
+                updateOperation.update.$setOnInsert = {
+                    created_at: packData.created_at || new Date().toISOString()
+                };
+            } else {
+                // For existing documents, keep the original created_at
+                formattedPack.created_at = existingPack.created_at;
+                updateOperation.update.$set.created_at = existingPack.created_at;
+            }
+
+            // 2. writing prepared data
+
+            logger.debug('Writing pack to MongoDB - formatted data:', {
+                original: packData,
+                formatted: formattedPack,
+                isNew: !existingPack
+            });
+
+            await this.dbManager.safeWrite('starter_packs', updateOperation, { upsert: true });
     
-            // await this.dbManager.safeBulkWrite('users', userOperations);
+            // 3. Get existing users first
+            const userDids = users.map(u => u.did);
+            const existingUsers = await this.dbManager.db.collection('users')
+                .find({ did: { $in: userDids } })
+                .project({ did: 1, _id: 0 })
+                .toArray();
+    
+            const existingDids = new Set(existingUsers.map(u => u.did));
+            logger.debug(`Found ${existingDids.size} existing users out of ${userDids.length} total`);
+    
+            // 4. Process users in batches
             const dbType = process.env.DB_TYPE || 'cosmos';
             const batchSize = BATCH_SIZES[dbType];
-            /* for (let i = 0; i < users.length; i += batchSize) {
+            
+            for (let i = 0; i < users.length; i += batchSize) {
                 const batch = users.slice(i, i + batchSize);
-                await this.dbManager.safeBulkWrite('users', batch);
-            } */
-            for (let i = 0; i < userOperations.length; i += batchSize) {
-                const batch = userOperations.slice(i, i + batchSize);
-                await this.dbManager.safeBulkWrite('users', batch);
-            }
-            //await this.dbManager.safeBulkWrite('users', userOperations);
+                
+                // Log first user of first batch for verification
+                if (i === 0 && batch.length > 0) {
+                    const firstUser = batch[0];
+                    const formattedUser = {
+                        did: firstUser.did,
+                        cacheTime: firstUser.cacheTime || Date.now(),
+                        displayName: firstUser.displayName || '',
+                        followers_count: firstUser.followers_count || 0,
+                        follows_count: firstUser.follows_count || 0,
+                        handle: firstUser.handle,
+                        last_updated: firstUser.last_updated || new Date().toISOString(),
+                        pack_ids: [...new Set(firstUser.pack_ids || [])]
+                    };
     
-            if (this.debug) {
-                const counts = await this.dbManager.getCollectionCounts();
-                logger.debug('MongoDB collection counts after write:', {
-                    collections: counts,
-                    lastOperation: {
-                        pack: packData.rkey,
-                        usersProcessed: users.length
+                    logger.debug('First user write sample:', {
+                        original: firstUser,
+                        formatted: formattedUser,
+                        isNew: !existingDids.has(firstUser.did)
+                    });
+                }
+    
+                // Prepare bulk operations
+                const bulkOps = batch.map(user => ({
+                    updateOne: {
+                        filter: { did: user.did },
+                        update: {
+                            $set: {
+                                did: user.did,
+                                cacheTime: user.cacheTime || Date.now(),
+                                displayName: user.displayName || '',
+                                followers_count: user.followers_count || 0,
+                                follows_count: user.follows_count || 0,
+                                handle: user.handle,
+                                last_updated: user.last_updated || new Date().toISOString(),
+                                pack_ids: [...new Set(user.pack_ids || [])]
+                            }
+                        },
+                        upsert: true
+                    }
+                }));
+    
+                // Update stats
+                batch.forEach(user => {
+                    if (existingDids.has(user.did)) {
+                        writeResults.updatedUsers++;
+                    } else {
+                        writeResults.newUsers++;
                     }
                 });
+    
+                await this.dbManager.safeBulkWrite('users', bulkOps);
+    
+                // Log progress
+                logger.info('Batch processing progress:', {
+                    batchStart: i,
+                    batchSize: batch.length,
+                    processed: Math.min(i + batchSize, users.length),
+                    total: users.length,
+                    newUsers: writeResults.newUsers,
+                    updatedUsers: writeResults.updatedUsers
+                });
             }
+    
+            // Final stats
+            logger.debug('MongoDB write operation completed:', {
+                pack: formattedPack.rkey,
+                stats: {
+                    usersTotal: users.length,
+                    existingUsers: existingDids.size,
+                    newUsers: writeResults.newUsers,
+                    updatedUsers: writeResults.updatedUsers
+                }
+            });
+    
+            return writeResults;
+    
         } catch (err) {
-            logger.error(`Database write failed for pack ${packData.rkey}:`, err);
+            logger.error(`Database write failed for pack ${packData.rkey}:`, {
+                error: err.message,
+                code: err.code,
+                stack: err.stack
+            });
             throw err;
         }
     }
@@ -4056,71 +4999,53 @@ class MainProcessor {
     async cleanup() {
         logger.debug('Starting cleanup process...');
         
+        const cleanupPromises = [];
+        
         try {
-            const cleanupTasks = [];
-    
             // Only add cleanup tasks for initialized components
-            if (this.fileHandler && typeof this.fileHandler.cleanup === 'function') {
-                cleanupTasks.push(
-                    Promise.resolve(this.fileHandler.cleanup()).catch(err => {
-                        logger.error('Error during file handler cleanup:', err);
-                    })
+            if (this.initialized.files && this.fileHandler?.cleanup) {
+                cleanupPromises.push(
+                    this.fileHandler.cleanup()
                 );
             }
     
-            if (this.verificationHandler && typeof this.verificationHandler.cleanup === 'function') {
-                cleanupTasks.push(
-                    Promise.resolve(this.verificationHandler.cleanup()).catch(err => {
-                        logger.error('Error during verification handler cleanup:', err);
-                    })
+            if (this.initialized.db && !this.config.noMongoDB && this.mongoClient) {
+                cleanupPromises.push(
+                    this.mongoClient.close(true)
                 );
             }
     
-            if (this.debugManager && typeof this.debugManager.cleanup === 'function') {
-                cleanupTasks.push(
-                    Promise.resolve(this.debugManager.cleanup()).catch(err => {
-                        logger.error('Error during debug manager cleanup:', err);
-                    })
+            if (this.initialized.taskManager && this.taskManager?.maybeWriteCheckpoint) {
+                cleanupPromises.push(
+                    this.taskManager.maybeWriteCheckpoint(true)
                 );
             }
     
-            if (!this.noMongoDB) {
-                if (this.noDBWrites) {
-                    // Log final DB operations summary
-                    const summary = this.dbManager.getOperationsSummary();
-                    logger.info('Database Operations Summary:', summary);
-                } else if (this.mongoClient) {
-                    cleanupTasks.push(
-                        Promise.resolve(this.mongoClient.close(true)).catch(err => {
-                            logger.error('Error closing MongoDB connection:', err);
-                        })
-                    );
-                }
-            }
-    
-            if (this.taskManager && typeof this.taskManager.maybeWriteCheckpoint === 'function') {
-                cleanupTasks.push(
-                    Promise.resolve(this.taskManager.maybeWriteCheckpoint(true)).catch(err => {
-                        logger.error('Error saving final checkpoint:', err);
-                    })
+            if (cleanupPromises.length > 0) {
+                await Promise.all(
+                    cleanupPromises.map(p => p.catch(err => 
+                        logger.error('Error during component cleanup:', err)
+                    ))
                 );
             }
-
-            // Only wait if we have tasks
-            if (cleanupTasks.length > 0) {
-                await Promise.all(cleanupTasks);
-            }
-    
-            // Clear caches and internal state
-            if (this.profileCache) {
-                this.profileCache.clear();
-            }
-            this.clearInternalState();
     
             logger.debug('Cleanup completed successfully');
         } catch (err) {
             logger.error('Error during cleanup:', err);
-            // Don't rethrow - we're in cleanup
+        }
+    }
+
+    clearInternalState() {
+        this.activeOperations?.clear();
+        this.processingCache?.clear();
+        this.profileCache?.clear();
+        this.verificationResults?.clear();
+        
+        // Clear task-related state
+        if (this.taskManager) {
+            this.taskManager.pendingTasks?.clear();
+            this.taskManager.completedTasks?.clear();
+            this.taskManager.failures?.clear();
         }
     }
     
@@ -4235,7 +5160,9 @@ function parseArgs() {
         addPack: args.includes('--addstarterpack') ? args[args.indexOf('--addstarterpack') + 1] : null,
         cleanFiles: args.includes('--cleanfiles'),
         purge: args.includes('--purge'),
+        purgefiles: args.includes('--purgefiles'),
         cleanpackids: args.includes('--cleanpackids'),
+        updateAll: args.includes('--updateall'),
     };
 }
 
@@ -4283,6 +5210,7 @@ async function handleShutdown(signal, currentProcessor = null) {
 }
 
 async function handleMaintenanceCommands(args, processor) {
+
     if (args.cleanFiles) {
         logger.info('Starting file cleanup...');
         try {
@@ -4669,6 +5597,10 @@ class TaskManager {
         this.packRelationships = new Map();
         this.missingProfiles = new Set();
 
+        this.knownStarterPacks = new Set(); // what is already in mongodb?
+        this.knownUsers = new Set();        // what is already in mongodb?
+        this.updateAll = false;             // Will be set based on --updateall arg
+
         // Discovery tracking (only discovery-specific flags)
         this.processingDiscoveredTasks = false;
         this.discoveryDepth = 0;
@@ -4679,11 +5611,86 @@ class TaskManager {
         this.checkpointDirty = false;
 
         this.metrics = metrics;
+        this.stats = {
+            byPriority: new Map(),  // Map of priority -> {total, completed, failed}
+            total: 0,
+            completed: 0,
+            failed: 0,
+            notFound: 0,    // 404s
+            apiErrors: 0,   // Other API errors
+            current: {
+                priority: null,
+                position: 0
+            }
+        };
 
         // Validation
         if (!this.noMongoDB && !dbManager) {
             throw new Error('Database manager is required when MongoDB is enabled');
         }
+    }
+
+    async initializeAllData(updateAll = false) {
+        this.updateAll = updateAll;
+        
+        // 1. Get known data from MongoDB first (for prioritization)
+        if (!this.noMongoDB && this.dbManager) {
+            logger.info('Loading known data from MongoDB...');
+            this.knownStarterPacks = await this.dbManager.getKnownStarterPackRkeys();
+            this.knownUsers = await this.dbManager.getKnownUserDIDs();
+            logger.info(`Loaded ${this.knownStarterPacks.size} packs and ${this.knownUsers.size} users from MongoDB`);
+        }
+
+        // 2. Load local file data (with fallback)
+        logger.info('Loading local file data...');
+        const { packs: existingPacks, users: existingUsers } = 
+            await this.loadExistingDataWithFallback();
+        
+        // Merge knowledge (local files might have data not yet in MongoDB)
+        for (const pack of existingPacks.values()) {
+            this.knownStarterPacks.add(pack.rkey);
+        }
+        for (const user of existingUsers.values()) {
+            this.knownUsers.add(user.did);
+        }
+
+        // Store full data for quick access
+        this.existingPacks = existingPacks;
+        this.existingUsers = existingUsers;
+
+        // 3. Load checkpoint last (but don't trust it completely)
+        try {
+            logger.info('Loading checkpoint data...');
+            const checkpoint = await this.loadCheckpoint();
+            
+            // Use checkpoint data only for tasks we know exist
+            this.completedTasks = new Set(
+                Array.from(checkpoint.completedPacks || [])
+                    .filter(rkey => this.knownStarterPacks.has(rkey))
+            );
+            
+            // Only keep valid failure records
+            this.failures = new Map(
+                Array.from(checkpoint.failures || [])
+                    .filter(([rkey]) => this.knownStarterPacks.has(rkey))
+            );
+            
+            logger.info(`Loaded ${this.completedTasks.size} completed tasks from checkpoint`);
+        } catch (err) {
+            logger.warn('Checkpoint load failed, starting fresh:', err);
+            this.completedTasks = new Set();
+            this.failures = new Map();
+        }
+
+        logger.info('Data initialization complete:', {
+            knownPacks: this.knownStarterPacks.size,
+            knownUsers: this.knownUsers.size,
+            localPacks: existingPacks.size,
+            localUsers: existingUsers.size,
+            completedTasks: this.completedTasks.size,
+            failures: this.failures.size,
+            mode: updateAll ? 'update all' : 'new data first'
+        });
     }
 
     updatePackState(rkey, status, reason) {
@@ -4694,58 +5701,26 @@ class TaskManager {
         });
         this.markDirty();
     }
-
-    async initializeTaskList() {
-        try {
-            // Ensure valid session at the start if using MongoDB
-            if (this.dbManager && !this.noMongoDB) {
-                await this.dbManager.ensureSession();
-            }
-
-            // Try to load checkpoint first, but don't fail if missing/corrupt
-            let checkpoint = null;
+        
+    async initializeWithKnownData(updateAll = false) {
+        this.updateAll = updateAll;
+        
+        if (!this.noMongoDB && this.dbManager) {
+            logger.info('Loading known data from MongoDB...');
             try {
-                checkpoint = await this.loadCheckpoint();
-            } catch (err) {
-                logger.warn('Could not load checkpoint, starting fresh:', err);
-                checkpoint = {
-                    completedPacks: [],
-                    missingPacks: [],
-                    missingProfiles: []
-                };
-            }
-
-            // Load data from main files first, fall back to YAML if needed
-            const { packs: existingPacks, users: existingUsers } = 
-                await this.loadExistingDataWithFallback();
-
-            // Load URL list - this must exist and be valid
-            const urlPacks = await this.loadUrlsFile();
-
-            // Initialize state
-            await this.buildConsolidatedTaskList(urlPacks, existingPacks, checkpoint);
-
-            // Update caches
-            for (const pack of existingPacks.values()) {
-                this.fileHandler.updatePackCache(pack);
-            }
-            for (const user of existingUsers.values()) {
-                this.fileHandler.updateUserCache(user);
-            }
-
-            if (this.debug) {
-                logger.debug('Task list initialized:', {
-                    pending: this.pendingTasks.size,
-                    completed: this.completedTasks.size,
-                    failed: this.failures.size,
-                    existingPacks: existingPacks.size,
-                    existingUsers: existingUsers.size,
-                    urls: urlPacks.size
+                this.knownStarterPacks = await this.dbManager.getKnownStarterPackRkeys();
+                this.knownUsers = await this.dbManager.getKnownUserDIDs();
+                
+                logger.info('Loaded known data from MongoDB:', {
+                    starterPacks: this.knownStarterPacks.size,
+                    users: this.knownUsers.size,
+                    mode: updateAll ? 'update all' : 'new data first'
                 });
+            } catch (err) {
+                logger.error('Error loading MongoDB data:', err);
+                this.knownStarterPacks = new Set();
+                this.knownUsers = new Set();
             }
-        } catch (err) {
-            logger.error('Error initializing task list:', err);
-            throw err;
         }
     }
 
@@ -4803,6 +5778,14 @@ class TaskManager {
             logger.error('Error loading URLs file:', err);
             throw err;
         }
+    }
+
+    shouldProcessUser(did) {
+        // Skip known users unless updateAll is true
+        if (!this.updateAll && this.knownUsers.has(did)) {
+            return false;
+        }
+        return true;
     }
 
     async shouldProcessPack(rkey, existingPack, failure, options = {}) {
@@ -5091,48 +6074,47 @@ class TaskManager {
         const {
             source = 'initial',
             isNewlyDiscovered = false,
-            memberCount = 0,
             existingPack = null,
+            lastUpdate = null,
             failure = null
         } = options;
-
+    
         let priority = 0;
-
-        // Base priority by source
-        switch (source) {
-            case 'associated':
-            case 'discovered':
-                priority += 10;  // High priority for discovered packs
-                break;
-            case 'initial':
-                priority += 1;   // Lower priority for initial tasks
-                break;
-            default:
-                priority += 5;   // Medium priority for others
-        }
-
-        // Adjust for pack state
-        if (existingPack) {
-            // Age-based adjustment
-            const daysSinceUpdate = (Date.now() - new Date(existingPack.updated_at).getTime()) 
-                / (1000 * 60 * 60 * 24);
-            if (daysSinceUpdate > 14) priority += 3;
-            else if (daysSinceUpdate > 7) priority += 2;
+    
+        // Base priority by known status
+        const inMongoDB = this.knownStarterPacks.has(rkey);
+        const inFiles = !!existingPack;
+    
+        if (!inMongoDB && !inFiles) {
+            priority = 15;  // Completely new
+        } else {
+            // Calculate days since last update
+            const lastUpdateDate = lastUpdate || 
+                (existingPack?.updated_at ? new Date(existingPack.updated_at) : null);
             
-            // Size-based adjustment
-            if (memberCount > 100 || existingPack.user_count > 100) priority += 2;
+            if (lastUpdateDate) {
+                const daysSinceUpdate = (Date.now() - lastUpdateDate.getTime()) / (1000 * 60 * 60 * 24);
+                
+                if (daysSinceUpdate > 14) priority = 10;
+                else if (!inMongoDB && inFiles) priority = 8;  // Needs MongoDB sync
+                else if (daysSinceUpdate > 7) priority = 5;
+                else if (daysSinceUpdate > 3) priority = 3;
+                else priority = 1;
+            } else {
+                priority = 10;  // No update date - treat as old
+            }
         }
-
-        // Penalty for failures
-        if (failure) {
-            priority -= Math.min(failure.attempts * 2, 8); // Max penalty of 8
-        }
-
-        // Boost for newly discovered
-        if (isNewlyDiscovered) {
+    
+        // Source/discovery adjustments
+        if (source === 'associated' || isNewlyDiscovered) {
             priority += 5;
         }
-
+    
+        // Penalty for failures
+        if (failure) {
+            priority = Math.max(1, priority - (failure.attempts * 2));
+        }
+    
         return priority;
     }
 
@@ -5505,38 +6487,49 @@ class TaskManager {
     async addAssociatedPack(packInfo, parentDid) {
         const { rkey, creator: handle, memberCount } = packInfo;
         
-        // Only process if not already discovered
         if (!this.discoveredPacksMap.has(rkey)) {
-            // Add to discovered map first
             this.discoveredPacksMap.set(rkey, {
                 discoveredAt: new Date().toISOString(),
                 discoveredFrom: parentDid,
                 memberCount
             });
     
-            // Add to tasks
-            const added = await this.addTask({
+            const existingPack = await this.fileHandler.getPack(rkey);
+            const failure = this.failures.get(rkey);
+            
+            const priority = this.calculateTaskPriority(rkey, {
+                source: 'associated',
+                isNewlyDiscovered: true,
+                existingPack,
+                failure,
+                lastUpdate: existingPack?.updated_at
+            });
+    
+            this.pendingTasks.set(rkey, {
                 handle,
                 rkey,
+                priority,
                 source: 'associated',
                 parentDid,
                 memberCount,
-                discoveredAt: new Date().toISOString()
+                inMongoDB: this.knownStarterPacks.has(rkey),
+                inFiles: !!existingPack,
+                lastUpdate: existingPack?.updated_at,
+                discoveredAt: new Date().toISOString(),
+                addedAt: new Date().toISOString(),
+                attempts: failure?.attempts || 0
             });
     
-            if (added) {
-                this.recordPackRelationship(rkey, parentDid);
-                this.totalTaskCount++;
-                this.markDirty();
-                
-                logger.debug(`Added associated pack ${rkey}:`, {
-                    from: parentDid,
-                    pending: this.pendingTasks.size,
-                    discovered: this.discoveredPacksMap.size
-                });
-                
-                return true;
-            }
+            this.recordPackRelationship(rkey, parentDid);
+            this.markDirty();
+            
+            logger.debug(`Added associated pack ${rkey}:`, {
+                from: parentDid,
+                priority,
+                pending: this.pendingTasks.size
+            });
+            
+            return true;
         }
     
         return false;
@@ -5566,59 +6559,6 @@ class TaskManager {
         });
 
         return tasks[0];
-    }
-
-    async addTask({ 
-        handle, 
-        rkey, 
-        source = 'initial', 
-        parentDid = null, 
-        memberCount = 0,
-        discoveredAt = null 
-    }) {
-        // Skip if already completed or permanently failed
-        if (this.completedTasks.has(rkey)) {
-            logger.debug(`Skipping already completed task: ${rkey}`);
-            return false;
-        }
-        
-        const failure = this.failures.get(rkey);
-        if (failure?.permanent) {
-            logger.debug(`Skipping permanently failed task: ${rkey}`);
-            return false;
-        }
-    
-        const existingPack = await this.fileHandler.getPack(rkey);
-        const priority = this.calculateTaskPriority(rkey, {
-            source,
-            isNewlyDiscovered: !!discoveredAt,
-            memberCount,
-            existingPack,
-            failure
-        });
-    
-        this.pendingTasks.set(rkey, {
-            handle,
-            rkey,
-            priority,
-            source,
-            parentDid,
-            memberCount,
-            discoveredAt: discoveredAt || new Date().toISOString(),
-            addedAt: new Date().toISOString(),
-            attempts: failure?.attempts || 0
-        });
-    
-        logger.debug(`Added task ${rkey}:`, {
-            source,
-            priority,
-            pending: this.pendingTasks.size,
-            completed: this.completedTasks.size,
-            discovered: this.discoveredPacksMap.size
-        });
-    
-        this.markDirty();
-        return true;
     }
     
     async addAssociatedPack(packInfo, parentDid) {
@@ -5675,31 +6615,35 @@ class TaskManager {
     async processNextTask(processor) {
         const task = await this.getNextTask();
         if (!task) return null;
-    
+
+        // Update current position tracking
+        if (task.priority !== this.stats.current.priority) {
+            this.stats.current.priority = task.priority;
+            this.stats.current.position = 0;
+        }
+        this.stats.current.position++;
+
+        // Log progress with detailed stats
+        logger.info('Processing status:', {
+            currentPriority: this.stats.current.priority,
+            position: `${this.stats.current.position}/${this.stats.byPriority.get(task.priority)?.total || 0}`,
+            overall: `${this.stats.completed}/${this.stats.total}`,
+            success: `${((this.stats.completed / (this.stats.completed + this.stats.failed)) * 100).toFixed(1)}%`,
+            notFound: this.stats.notFound,
+            apiErrors: this.stats.apiErrors
+        });
+
         try {
-            const currentAttempts = this.failures.get(task.rkey)?.attempts || 0;
-            
             const success = await processor.processStarterPack(`${task.handle}|${task.rkey}`);
             
             if (success) {
-                this.completedTasks.add(task.rkey);
-                this.pendingTasks.delete(task.rkey);
-                this.failures.delete(task.rkey);
-                this.markDirty();
-            } else {
-                // Record failure using consistent attempt tracking
-                const newFailure = {
-                    attempts: currentAttempts + 1,
-                    lastAttempt: new Date().toISOString(),
-                    permanent: currentAttempts + 1 >= 3
-                };
-                this.failures.set(task.rkey, newFailure);
-                
-                if (newFailure.permanent) {
-                    this.pendingTasks.delete(task.rkey);
+                this.stats.completed++;
+                const priorityStats = this.stats.byPriority.get(task.priority);
+                if (priorityStats) {
+                    priorityStats.completed++;
                 }
             }
-    
+
             return success;
         } catch (err) {
             logger.error(`Error processing task ${task.rkey}:`, err);
@@ -5765,6 +6709,25 @@ class TaskManager {
         }
     }
 
+    async loadKnownData() {
+        if (!this.noMongoDB && this.dbManager) {
+            logger.info('Loading known data from MongoDB...');
+            try {
+                this.knownStarterPacks = await this.dbManager.getKnownStarterPackRkeys();
+                this.knownUsers = await this.dbManager.getKnownUserDIDs();
+                
+                logger.info('Loaded known data from MongoDB:', {
+                    starterPacks: this.knownStarterPacks.size,
+                    users: this.knownUsers.size
+                });
+            } catch (err) {
+                logger.error('Error loading MongoDB data:', err);
+                this.knownStarterPacks = new Set();
+                this.knownUsers = new Set();
+            }
+        }
+    }
+
     async recordFailure(rkey, reason, permanent = false) {
         const failure = this.failures.get(rkey) || {
             attempts: 0,
@@ -5785,6 +6748,22 @@ class TaskManager {
         await this.maybeWriteCheckpoint(); 
 
         this.markDirty();
+
+        // Update stats
+        this.stats.failed++;
+        if (reason.includes('not found') || reason.includes('404')) {
+            this.stats.notFound++;
+        } else if (reason.includes('API')) {
+            this.stats.apiErrors++;
+        }
+
+        const task = this.pendingTasks.get(rkey);
+        if (task) {
+            const priorityStats = this.stats.byPriority.get(task.priority);
+            if (priorityStats) {
+                priorityStats.failed++;
+            }
+        }
     }
 
     isRecentlyProcessed(timestamp, daysThreshold = 10) {
@@ -5793,115 +6772,101 @@ class TaskManager {
         return daysSinceUpdate < daysThreshold;
     }
 
-    async buildTaskList(urlsContent, existingPacks = new Map()) {
+    async buildTaskList(urlsContent) {
+        logger.debug("buildTaskList starting...");
         const tasks = [];
         const skipped = [];
         
         for (const line of urlsContent.split('\n').filter(Boolean)) {
             const [handle, rkey] = line.split('|').map(s => s.trim());
             if (!handle || !rkey) continue;
-
-            // Add position tracking
-            this.originalOrder.set(rkey, this.originalOrder.size);
-
-            // Check pack state
-            const state = this.packStates.get(rkey);
-            if (state?.status === 'deleted') {
-                const daysSince = (Date.now() - new Date(state.timestamp).getTime()) / (1000 * 60 * 60 * 24);
-                if (daysSince < 30) {
-                    skipped.push({ rkey, reason: `deleted_${daysSince.toFixed(1)}_days_ago` });
-                    continue;
-                }
-            }
-
-            // Check completed tasks from current run
-            if (this.completedTasks.has(rkey)) {
-                skipped.push({ rkey, reason: 'already_completed' });
-                continue;
-            }
-
+    
+            // Get all known states
+            const inMongoDB = this.knownStarterPacks.has(rkey);
+            const existingPack = await this.fileHandler.getPack(rkey);
             const failure = this.failures.get(rkey);
-            const existingPack = existingPacks.get(rkey);
-
-            // Check if we should process this pack
-            const processStatus = await this.shouldProcessPack(rkey, existingPack, failure);
-            
-            if (!processStatus.process) {
-                skipped.push({ 
-                    rkey, 
-                    reason: processStatus.reason,
-                    attempts: failure?.attempts
-                });
+    
+            // Skip permanent failures
+            if (failure?.permanent) {
+                skipped.push({ rkey, reason: 'permanent_failure' });
                 continue;
             }
-
-            const priority = this.calculateTaskPriority(rkey, existingPack, failure, processStatus);
-
+    
+            // Calculate priority
+            const priority = this.calculateTaskPriority(rkey, {
+                existingPack,
+                failure,
+                lastUpdate: existingPack?.updated_at
+            });
+    
+            // Add to tasks with metadata
             tasks.push({
                 handle,
                 rkey,
                 priority,
-                existingPack,
-                previousAttempts: failure?.attempts || 0,
-                mongoStatus: processStatus
+                source: 'initial',
+                lastUpdate: existingPack?.updated_at,
+                inMongoDB,
+                inFiles: !!existingPack,
+                attempts: failure?.attempts || 0,
+                addedAt: new Date().toISOString()
             });
         }
-
-        // Sort by priority (high to low) and retry attempts
-        tasks.sort((a, b) => {
-            if (a.priority !== b.priority) return b.priority - a.priority;
-            return a.previousAttempts - b.previousAttempts;
+    
+        // Sort by priority (high to low)
+        tasks.sort((a, b) => b.priority - a.priority);
+    
+        logger.debug('Task list built:', {
+            total: tasks.length,
+            priorities: tasks.reduce((acc, t) => {
+                acc[t.priority] = (acc[t.priority] || 0) + 1;
+                return acc;
+            }, {}),
+            inMongoDB: tasks.filter(t => t.inMongoDB).length,
+            inFiles: tasks.filter(t => t.inFiles).length,
+            attempts: tasks.filter(t => t.attempts > 0).length
         });
 
-        if (this.debug) {
-            logger.debug('Task list built', {
-                total: tasks.length,
-                skipped: skipped.length,
-                new: tasks.filter(t => !t.existingPack && !t.mongoStatus?.lowPriority).length,
-                updates: tasks.filter(t => t.existingPack || t.mongoStatus?.lowPriority).length,
-                lowPriority: tasks.filter(t => t.mongoStatus?.lowPriority).length,
-                failureRetries: tasks.filter(t => t.previousAttempts > 0).length
-            });
-        }
-
+        await this.initializeStats(tasks);
+    
         return { tasks, skipped };
     }
 
-    async buildConsolidatedTaskList(urlPacks, existingPacks, checkpoint) {
-        try {
-            // Initialize with empty data if needed
-            urlPacks = urlPacks || new Map();
-            existingPacks = existingPacks || new Map();
-            
-            this.pendingTasks.clear();
-    
-            // Process URLs with consistent priority calculation
-            for (const [rkey, urlData] of urlPacks) {
-                const existingPack = existingPacks.get(rkey);
-                const failure = this.failures.get(rkey);
-    
-                const { process } = await this.shouldProcessPack(rkey, existingPack, failure);
-    
-                if (process) {
-                    await this.addTask({
-                        handle: urlData.handle,
-                        rkey,
-                        source: 'initial',
-                        existingData: existingPack || null,
-                        memberCount: existingPack?.user_count || 0
-                    });
-                }
+    async initializeStats(tasks) {
+        this.stats = {
+            byPriority: new Map(),
+            total: tasks.length,
+            completed: 0,
+            failed: 0,
+            notFound: 0,
+            apiErrors: 0,
+            current: {
+                priority: null,
+                position: 0
             }
-    
-            logger.debug('Task list initialized:', {
-                pending: this.pendingTasks.size,
-                completed: this.completedTasks.size,
-                failed: this.failures.size
-            });
-        } catch (err) {
-            logger.error('Error building task list:', err);
-            throw err;
+        };
+
+        // Group by priority
+        for (const task of tasks) {
+            if (!this.stats.byPriority.has(task.priority)) {
+                this.stats.byPriority.set(task.priority, {
+                    total: 0,
+                    completed: 0,
+                    failed: 0
+                });
+            }
+            this.stats.byPriority.get(task.priority).total++;
         }
+
+        // Log initial stats
+        logger.info('Task distribution:', {
+            total: this.stats.total,
+            byPriority: Object.fromEntries(
+                Array.from(this.stats.byPriority.entries())
+                    .sort((a, b) => b[0] - a[0])  // Sort by priority desc
+                    .map(([priority, stats]) => [priority, stats.total])
+            )
+        });
     }
 
     async saveCheckpoint() {
@@ -5931,131 +6896,242 @@ class TaskManager {
 
 }
 
+async function handlePurgeFiles(context) {
+    const { logger, FILE_PATHS } = context;
+    logger.info('Starting file purge operation...');
+    const startTime = Date.now();
+
+    try {
+        // Create backup timestamp
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        
+        // Create backups
+        for (const file of [FILE_PATHS.users, FILE_PATHS.packs]) {
+            try {
+                await fs.copyFile(file, `${file}.${timestamp}.bak`);
+                logger.info(`Backed up ${file}`);
+            } catch (err) {
+                logger.warn(`Could not backup ${file}:`, err);
+            }
+        }
+
+        // Process files one at a time using streams
+        async function processFileInChunks(filePath, type) {
+            logger.info(`Processing ${filePath}...`);
+            
+            const dataMap = new Map();
+            let processedCount = 0;
+            let skippedCount = 0;
+            let chunkSize = 0;
+            let buffer = '';
+        
+            // Use createReadStream from the imported version
+            const readStream = createReadStream(filePath, {
+                encoding: 'utf8',
+                highWaterMark: 1024 * 1024 // 1MB chunks
+            });
+
+            for await (const chunk of readStream) {
+                buffer += chunk;
+                chunkSize += chunk.length;
+
+                // Process complete lines
+                let newlineIndex;
+                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                    const line = buffer.slice(0, newlineIndex);
+                    buffer = buffer.slice(newlineIndex + 1);
+
+                    if (!line.trim()) continue;
+
+                    try {
+                        const item = JSON.parse(line);
+                        const id = type === 'users' ? item.did : item.rkey;
+                        const timestamp = type === 'users' ? item.last_updated : item.updated_at;
+
+                        if (!id || !timestamp) {
+                            logger.warn(`Invalid ${type} entry, missing id or timestamp`);
+                            continue;
+                        }
+
+                        const existing = dataMap.get(id);
+                        if (!existing || new Date(timestamp) > new Date(existing.timestamp)) {
+                            dataMap.set(id, {
+                                data: item,
+                                timestamp: timestamp
+                            });
+                            processedCount++;
+                        } else {
+                            skippedCount++;
+                        }
+
+                        // Log progress every 10k items
+                        if ((processedCount + skippedCount) % 10000 === 0) {
+                            logger.info(`${type} processing progress:`, {
+                                processed: processedCount,
+                                skipped: skippedCount,
+                                unique: dataMap.size,
+                                memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
+                            });
+                        }
+                    } catch (err) {
+                        logger.warn(`Error processing ${type} line:`, err);
+                    }
+                }
+            }
+
+            // Write processed data back to file
+            logger.info(`Writing processed ${type} back to file...`);
+            const writeStream = createWriteStream(filePath);
+            
+            for (const { data } of dataMap.values()) {
+                writeStream.write(JSON.stringify(data) + '\n');
+            }
+
+            await new Promise((resolve, reject) => {
+                writeStream.end(err => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+
+            // Write YAML backup (in chunks to handle large datasets)
+            const yamlPath = type === 'users' ? FILE_PATHS.usersBackup : FILE_PATHS.packsBackup;
+            const yamlWriteStream = createWriteStream(yamlPath);
+            
+            let count = 0;
+            for (const { data } of dataMap.values()) {
+                yamlWriteStream.write('---\n');
+                yamlWriteStream.write(yaml.dump(data));
+                
+                count++;
+                if (count % 1000 === 0) {
+                    // Allow event loop to process
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }
+
+            await new Promise((resolve, reject) => {
+                yamlWriteStream.end(err => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+
+            return {
+                processed: processedCount,
+                skipped: skippedCount,
+                unique: dataMap.size
+            };
+        }
+
+        // Process files sequentially
+        const usersStats = await processFileInChunks(FILE_PATHS.users, 'users');
+        const packsStats = await processFileInChunks(FILE_PATHS.packs, 'packs');
+
+        const duration = (Date.now() - startTime) / 1000;
+        logger.info('File purge completed:', {
+            duration: `${duration.toFixed(1)} seconds`,
+            users: {
+                processed: usersStats.processed,
+                skipped: usersStats.skipped,
+                unique: usersStats.unique,
+                reductionPercent: ((usersStats.skipped / (usersStats.processed + usersStats.skipped)) * 100).toFixed(1)
+            },
+            packs: {
+                processed: packsStats.processed,
+                skipped: packsStats.skipped,
+                unique: packsStats.unique,
+                reductionPercent: ((packsStats.skipped / (packsStats.processed + packsStats.skipped)) * 100).toFixed(1)
+            }
+        });
+
+    } catch (err) {
+        logger.error('Error during file purge:', err);
+        throw err;
+    }
+}
+
 // main function
 async function main() {
     const args = parseArgs();
+    const debug = args.debug;
+    logger.level = debug ? 'debug' : 'info';
+
     logger.debug('CLI args:', args);
-    validateEnv(args);
-    
-    let processor;
     const startTime = Date.now();
-    
+
+    let processor;
     try {
         metrics.recordStartup();
 
-        if (args.cleanpackids) {
-
-            // Only initialize what we need for cleanup
-            processor = new MainProcessor({
-                noMongoDB: args.noMongoDB,
-                noDBWrites: args.noDBWrites,
-                debug: args.debug
+        // 1. Handle standalone modes first (no processor needed)
+        if (args.purgefiles) {
+            await handlePurgeFiles({
+                debug: args.debug,
+                logger,
+                FILE_PATHS
             });
-            
-            await processor.initMinimal();
-            await processor.dbManager.performPackIdsCleanup();
             return;
         }
-        
-        // For quick process, we want minimal initialization
-        if (args.addUser || args.addPack) {
-            logger.debug('Starting with quick processing...');
-            processor = new MainProcessor({
-                noMongoDB: args.noMongoDB,
-                noDBWrites: args.noDBWrites,
-                fromApi: args.fromApi,
-                debug: args.debug || process.env.DEBUG,
-                quickProcess: true  
-            });
-            
-            // Only initialize basic components
-            await processor.initMinimal();
-            
-            const result = await handleQuickProcess(args, processor);
-            return result;
-        }
-        
-        // Normal full initialization for regular run
-        processor = new MainProcessor({
+
+        // 2. Validate environment for all other modes
+        validateEnv(args);
+
+        // 3. Create processor with appropriate mode
+        const mode = determineProcessingMode(args);
+        processor = await MainProcessor.create({
             noMongoDB: args.noMongoDB,
             noDBWrites: args.noDBWrites,
             fromApi: args.fromApi,
-            debug: args.debug || process.env.DEBUG
+            debug: args.debug || process.env.DEBUG,
+            mode
         });
+
+        // 4. Handle different processing modes
+        switch (mode) {
+            case 'cleanup':
+                await processor.dbManager.performPackIdsCleanup();
+                return;
         
-        await processor.init();
-
-        // Set up shutdown handlers with the processor
-        process.on('SIGINT', () => handleShutdown('SIGINT', processor));
-        process.on('SIGTERM', () => handleShutdown('SIGTERM', processor));
-
-        logger.info('Processor initialization complete');
-
-        // Handle maintenance commands first
-        if (args.purge || args.cleanFiles) {
-            await handleMaintenanceCommands(args, processor);
-            return;
-        }
-
-        // Initialize from checkpoint
-        await processor.taskManager.initializeFromCheckpoint();
+            case 'quick':
+                const result = await handleQuickProcess(args, processor);
+                return result;
         
-        // Load existing data first
-        const { packs: existingPacks } = await processor.taskManager.loadExistingData();
-        
-        // Load and parse tasks
-        const urlsContent = await fs.readFile(FILE_PATHS.urls, 'utf8');
-        const { tasks } = await processor.taskManager.buildTaskList(urlsContent, existingPacks);
-
-        // Add all tasks to task manager
-        for (const task of tasks) {
-            await processor.taskManager.addTask({
-                handle: task.handle,
-                rkey: task.rkey,
-                priority: task.priority,
-                source: 'initial'
-            });
-        }
-
-        // Process tasks until none remain
-        let processedCount = 0;
-        let failedCount = 0;
-
-        while (processor.taskManager.hasMoreWork()) {
-            const success = await processor.taskManager.processNextTask(processor);
+            case 'normal':
+                // Set up shutdown handlers early
+                process.on('SIGINT', () => handleShutdown('SIGINT', processor));
+                process.on('SIGTERM', () => handleShutdown('SIGTERM', processor));
             
-            if (success !== null) {
-                if (success) processedCount++;
-                else failedCount++;
-            }
-
-            await processor.taskManager.maybeWriteCheckpoint();
-
-            // Give a small delay to allow for task discovery
-            if (processor.taskManager.pendingTasks.size === 0) {
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
-
-            // Log progress
-            logger.debug('Processing status:', {
-                pendingTasks: processor.taskManager.pendingTasks.size,
-                processedCount,
-                failedCount,
-                totalProcessed: processedCount + failedCount
-            });
+                // Initialize in correct order
+                logger.info('Starting normal processing...');
+                
+                // 1. Load MongoDB data (fast operation)
+                if (!args.noMongoDB) {
+                    await processor.taskManager.loadKnownData();
+                }
+            
+                // 2. Load URLs list (small file)
+                const urlsContent = await fs.readFile(FILE_PATHS.urls, 'utf8');
+                
+                // 3. Build initial task list
+                const { tasks, skipped } = await processor.taskManager.buildTaskList(urlsContent);
+            
+                // Log detailed initial state
+                logger.info('Processing setup complete:', {
+                    totalTasks: tasks.length,
+                    skipped: skipped.length,
+                    byPriority: tasks.reduce((acc, t) => {
+                        acc[t.priority] = (acc[t.priority] || 0) + 1;
+                        return acc;
+                    }, {}),
+                    mode: args.updateAll ? 'update all' : 'new data first'
+                });
+            
+                // 4. Process tasks
+                let stats = await processor.processTasks(tasks);
+            
+                break;
         }
-
-        // Force final checkpoint write
-        await processor.taskManager.maybeWriteCheckpoint(true);
-
-        // Final metrics
-        const finalMetrics = metrics.getMetrics();
-        logger.debug('Processing completed', {
-            duration: `${Math.floor((Date.now() - startTime) / 60000)} minutes`,
-            processed: processedCount,
-            failed: failedCount,
-            stats: finalMetrics
-        });
 
     } catch (err) {
         logger.error('Fatal error:', err);
@@ -6066,6 +7142,29 @@ async function main() {
             await processor.cleanup();
         }
     }
+}
+
+// Helper functions
+function determineProcessingMode(args) {
+    if (args.cleanpackids) return 'cleanup';
+    if (args.addUser || args.addPack) return 'quick';
+    if (args.purge || args.cleanFiles) return 'maintenance';
+    return 'normal';
+}
+
+function logFinalStats(stats, startTime) {
+    const duration = Math.floor((Date.now() - startTime) / 60000);
+    const { processedCount, failedCount } = stats;
+    
+    logger.info('Processing completed:', {
+        duration: `${duration} minutes`,
+        processed: processedCount,
+        failed: failedCount,
+        successRate: `${((processedCount / (processedCount + failedCount)) * 100).toFixed(1)}%`,
+        averageRate: `${(processedCount / duration).toFixed(1)} packs/minute`
+    });
+
+    logger.debug('Final metrics:', metrics.getMetrics());
 }
 
 // Error handlers
@@ -6084,4 +7183,3 @@ main().catch(err => {
     logger.error('Fatal error in main:', err);
     process.exit(1);
 });
-

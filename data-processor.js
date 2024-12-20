@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// v029
-// v029: fix members update, handle change, circular logging prevention, etc
+// v030
+// v030: support for lists
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -23,7 +23,9 @@ const FILE_PATHS = {
     errorLog: process.env.ERROR_LOG_PATH || 'processor-error.log',
     infoLog: process.env.INFO_LOG_PATH || 'processor.log',
     checkpoints: process.env.CHECKPOINTS_PATH || 'checkpoint.json',
-    checkpointsBackup: process.env.CHECKPOINTS_BACKUP_PATH || 'checkpoint.json.tmp'
+    checkpointsBackup: process.env.CHECKPOINTS_BACKUP_PATH || 'checkpoint.json.tmp',
+    lists: process.env.LISTS_PATH || 'lists.json',
+    listsBackup: process.env.LISTS_BACKUP_PATH || 'lists.yaml'
 }; 
 
 // Initialize global logger
@@ -172,6 +174,10 @@ const VALIDATION_SCHEMAS = {
     pack: {
         required: ['rkey', 'name', 'creator', 'creator_did', 'updated_at'],
         optional: ['description', 'avatar', 'user_count']
+    },
+    list: {
+        required: ['uri', 'cid', 'creator', 'name', 'purpose'],
+        optional: ['description', 'avatar', 'indexedAt', 'memberCount']
     }
 };
 
@@ -1059,6 +1065,8 @@ class FileHandler {
         this.writeLock = false;
         this.writeQueue = [];
         this.handleCache = new Map();
+        this.listCache = new Map();  // Track lists
+        this.listMembershipCache = new Map(); // Track list memberships
     }
 
     async init() {
@@ -1082,6 +1090,58 @@ class FileHandler {
         } catch (err) {
             logger.error(`FileHandler initialization failed: ${err.message}`);
             throw err;
+        }
+    }
+
+    async appendList(listData) {
+        try {
+            await this.acquireLock();
+
+            if (!listData.uri || !listData.creator) {
+                throw new Error('Invalid list data');
+            }
+
+            const formattedList = {
+                uri: listData.uri,
+                cid: listData.cid,
+                creator: listData.creator,
+                creator_did: listData.creator_did,
+                name: listData.name,
+                description: listData.description || '',
+                purpose: listData.purpose,
+                memberCount: listData.memberCount || 0,
+                indexedAt: listData.indexedAt,
+                updated_at: new Date().toISOString()
+            };
+
+            // Update cache
+            this.updateListCache(formattedList);
+
+            // Append to NDJSON file
+            const jsonLine = JSON.stringify(formattedList) + '\n';
+            await fs.writeFile(FILE_PATHS.lists, jsonLine, { flag: 'a' });
+
+            return true;
+        } finally {
+            this.releaseLock();
+        }
+    }
+
+    updateListCache(list) {
+        if (!list?.uri) return;
+        this.listCache.set(list.uri, list);
+    }
+
+    getList(uri) {
+        return this.listCache.get(uri);
+    }
+
+    async updateUserListMemberships(did, memberships) {
+        const userData = await this.getUser(did);
+        if (userData) {
+            userData.list_memberships = memberships;
+            userData.last_updated = new Date().toISOString();
+            await this.appendUser(userData);
         }
     }
 
@@ -2028,7 +2088,61 @@ class ApiHandler {
                 error: err.message
             };
         }
-    }    
+    }
+    
+    async getUserLists(did) {
+        try {
+            const lists = [];
+            let cursor = null;
+
+            do {
+                const params = {
+                    actor: did,
+                    limit: 100,
+                    ...(cursor && { cursor })
+                };
+
+                let data;
+                try {
+                    data = await this.makePublicApiCall('app.bsky.graph.getLists', params);
+                } catch (err) {
+                    if (err.status === 401) {
+                        data = await this.makeAuthApiCall('app.bsky.graph.getLists', params);
+                    } else {
+                        throw err;
+                    }
+                }
+
+                if (data?.lists) {
+                    lists.push(...data.lists);
+                }
+
+                cursor = data?.cursor;
+            } while (cursor);
+
+            return lists;
+
+        } catch (err) {
+            if (err.status === 404) {
+                logger.warn(`No lists found for ${did}`);
+                return [];
+            }
+            throw err;
+        }
+    }
+
+    async getListDetails(uri) {
+        try {
+            const data = await this.makePublicApiCall('app.bsky.graph.getList', { list: uri });
+            return data;
+        } catch (err) {
+            if (err.status === 401) {
+                const response = await this.makeAuthApiCall('app.bsky.graph.getList', { list: uri });
+                return response;
+            }
+            throw err;
+        }
+    }
 
     async getStarterPackDetails(uri) {
         logger.debug(`Getting details for starter pack: ${uri}`);
@@ -2954,6 +3068,7 @@ class DatabaseManager {
             if (!this.isCosmosDb) {
                 await this.setupIndexes();
             }
+
         } catch (err) {
             this.logger.error(`Database initialization failed: ${err.message}`);
             throw err;
@@ -2962,7 +3077,7 @@ class DatabaseManager {
 
     async setupCollections() {
         logger.debug('setupCollections');
-        const collections = ['starter_packs', 'users']; // , 'schema_versions'
+        const collections = ['starter_packs', 'users', 'lists']; // , 'schema_versions'
         const existing = await this.withRetry(
             () => this.db.listCollections().toArray(),
             'list collections'
@@ -3008,6 +3123,12 @@ class DatabaseManager {
                 { key: { creator_did: 1 }, options: { background: true } },
                 { key: { updated_at: 1 }, options: { background: true } },
                 { key: { deleted: 1 }, options: { background: true } }
+            ],
+            lists: [
+                { key: { uri: 1 }, options: { unique: true, background: true } },
+                { key: { creator_did: 1 }, options: { background: true } },
+                { key: { purpose: 1 }, options: { background: true } },
+                { key: { 'members.did': 1 }, options: { background: true } }
             ]
         })) {
             const existing = await this.withRetry(
@@ -3035,47 +3156,6 @@ class DatabaseManager {
 
     async delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    async getCollectionCounts() {
-        try {
-            // Use cached counts if recent enough
-            const now = Date.now();
-            if (this.countCache && (now - this.lastCountCheck) < this.countCacheTimeout) {
-                return this.countCache;
-            }
-
-            // Add delay before counting to respect rate limits
-            await this.delay(1000);
-
-            const counts = {};
-            for (const collection of ['users', 'starter_packs']) {
-                try {
-                    counts[collection] = await this.db.collection(collection).countDocuments();
-                    await this.delay(500); // Add delay between counts
-                } catch (err) {
-                    if (this.isCosmosThrottlingError(err)) {
-                        // Return cached counts on throttling
-                        if (this.countCache) {
-                            this.logger?.warn('Using cached counts due to rate limit');
-                            return this.countCache;
-                        }
-                        // If no cache, return null but don't throw
-                        return null;
-                    }
-                    throw err;
-                }
-            }
-
-            // Cache the results
-            this.countCache = counts;
-            this.lastCountCheck = now;
-            await this.delay(1000);
-            return counts;
-        } catch (err) {
-            this.logger?.error(`Error getting collection counts: ${err.message}`);
-            return null;
-        }
     }
 
     calculateBackoff(retryAfterMs) {
@@ -3199,7 +3279,6 @@ class DatabaseManager {
         try {
             logger.debug(`safeWrite:`, operation);
 
-
             // Log without MongoDB objects
             logger.debug(`[${operationId}] MongoDB operation:`, {
                 collection,
@@ -3214,7 +3293,7 @@ class DatabaseManager {
             }
     
             // Verify DB connection
-            if (!this.db) {
+            if (!this.db) {ƒ
                 throw new Error('No database connection available');
             }
     
@@ -3223,6 +3302,8 @@ class DatabaseManager {
                 ...options,
                 session: this.session
             };
+
+            const beforeCount = await this.db.collection(collection).countDocuments();
     
             // Log the exact operation we're about to perform
             logger.debug(`[${operationId}] Executing MongoDB operation:`, {
@@ -3239,6 +3320,8 @@ class DatabaseManager {
                 operation.update,
                 { ...options, session: this.session }
             );
+
+            const afterCount = await this.db.collection(collection).countDocuments();
     
             // Verify the write if needed
             const verifyWrite = async () => {
@@ -3260,7 +3343,8 @@ class DatabaseManager {
             const verified = await verifyWrite();
             const duration = Date.now() - startTime;
     
-            logger.info(`[${operationId}] Write completed:`, {
+            logger.info(`Wrote. ${beforeCount} before / ${afterCount} after. ${result.modifiedCount} modified, ${result.upsertedCount} upserted, ${result.matchedCount} matched]:`);
+            logger.debug(`[${operationId}] Write completed:`, {
                 collection,
                 modified: result.modifiedCount,
                 upserted: result.upsertedCount,
@@ -3647,112 +3731,85 @@ class DatabaseManager {
         }
     }
 
-    async markPackDeleted(rkey, reason, skipUserUpdates = false) {
-        const timestamp = new Date();
-        logger.debug('markPackDeleted:', { rkey, reason, skipUserUpdates });
-        
-        const session = await this.db.client.startSession();
-        try {
-            await session.withTransaction(async () => {
-
-                const existingPack = await this.db.collection('starter_packs')
-                    .findOne(
-                        { rkey },
-                        { 
-                            projection: {
-                                creator_did: 1,
-                                creator: 1,
-                                name: 1,
-                                updated_at: 1,
-                                users: 1,
-                                deleted: 1
-                            },
-                            session
-                        }
-                    );
+    async markListDeleted(uri, reason) {
+        const timestamp = new Date().toISOString();
     
-                if (!existingPack) {
-                    logger.warn(`Attempted to mark non-existent pack as deleted: ${rkey}`);
-                    return;
-                }
-        
-                if (existingPack.deleted) {
-                    logger.debug(`Pack ${rkey} already marked as deleted, updating metadata`);
-                }
-        
-                // Prepare deletion metadata
-                const deletionUpdate = {
-                    deleted: true,
-                    deleted_at: timestamp,
-                    deletion_reason: reason,
-                    members_at_deletion: existingPack.users?.length || 0,
-                    status: 'deleted',
-                    status_updated_at: timestamp,
-                    last_known_state: {
-                        creator_did: existingPack.creator_did,
-                        creator: existingPack.creator,
-                        name: existingPack.name,
-                        updated_at: existingPack.updated_at
+        try {
+            // 1. Update MongoDB
+            if (!this.noMongoDB && !this.noDBWrites) {
+                await this.dbManager.safeWrite('lists', {
+                    filter: { uri },
+                    update: {
+                        $set: {
+                            deleted: true,
+                            deleted_at: timestamp,
+                            deletion_reason: reason,
+                            last_updated: timestamp
+                        }
                     }
-                };
-        
-                // Update pack first
-                await this.db.collection('starter_packs').updateOne(
-                    { rkey },
-                    { $set: deletionUpdate },
-                    { session }
-                );
-        
-                // Update users if needed
-                if (!skipUserUpdates && existingPack.users?.length > 0) {
-                    // Your existing user updates but with session
-                    await this.db.collection('users').updateMany(
-                        { pack_ids: rkey },
-                        {
-                            $pull: { pack_ids: rkey },
-                            $set: { last_updated: timestamp }
-                        },
-                        { session }
-                    );
-        
-                    // Remove from created_packs
-                    await this.db.collection('users').updateMany(
-                        { created_packs: rkey },
-                        {
-                            $pull: { created_packs: rkey },
-                            $set: { last_updated: timestamp }
-                        }
-                    );
-        
-                    // Mark users with no packs as deleted
-                    await this.db.collection('users').updateMany(
-                        {
-                            $or: [
-                                { pack_ids: { $size: 0 } },
-                                { pack_ids: { $exists: false } }
-                            ],
-                            deleted: { $ne: true }
-                        },
-                        {
-                            $set: {
-                                deleted: true,
-                                deleted_at: timestamp,
-                                deletion_reason: 'no_remaining_packs'
-                            }
-                        }
-                    );
-                };
-
-                // After successful transaction, update internal state
-                this.deletedPacks?.set(rkey, {
-                    timestamp,
-                    reason
                 });
-                this.pendingTasks?.delete(rkey);
-                this.packCache?.delete(rkey);
+    
+                // 2. Remove list references from users
+                await this.dbManager.db.collection('users').updateMany(
+                    { 'list_stats.lists': uri },
+                    {
+                        $pull: { 'list_stats.lists': uri },
+                        $set: { 'last_updated': timestamp }
+                    }
+                );
+            }
+    
+            // 3. Update file handler cache
+            const existingList = this.fileHandler.getList(uri);
+            if (existingList) {
+                existingList.deleted = true;
+                existingList.deleted_at = timestamp;
+                existingList.deletion_reason = reason;
+                existingList.last_updated = timestamp;
+                await this.fileHandler.appendList(existingList);
+            }
+    
+            logger.info(`Marked list ${uri} as deleted: ${reason}`);
+    
+        } catch (err) {
+            logger.error(`Failed to mark list ${uri} as deleted:`, err);
+            throw err;
+        }
+    }
+
+    async markPackDeleted(rkey, reason) {
+        const timestamp = new Date().toISOString();  // Use string timestamp
+        logger.debug('markPackDeleted:', { rkey, reason });
         
-                logger.info(`Deleted pack ${rkey} with ${existingPack.users?.length || 0} members`);
-            });
+        try {
+            const initialCount = await this.db.collection('starter_packs').countDocuments();
+            logger.info(`Current starter_packs count before deletion: ${initialCount}`);
+    
+            const updateData = {
+                deleted: true,
+                deleted_at: timestamp,  // Use string timestamp
+                deletion_reason: reason,
+                status: 'deleted',
+                status_updated_at: timestamp,  // Use string timestamp
+                last_updated: timestamp  // Add this for consistency
+            };
+    
+            if (this.supportsTransactions) {
+                const session = await this.client.startSession();
+                try {
+                    await session.withTransaction(async () => {
+                        await this._markPackStatusInternal(rkey, updateData, session);
+                    });
+                } finally {
+                    await session.endSession();
+                }
+            } else {
+                await this._markPackStatusInternal(rkey, updateData);
+            }
+    
+            const finalCount = await this.db.collection('starter_packs').countDocuments();
+            logger.info(`Current starter_packs count after deletion: ${finalCount}`);
+    
         } catch (err) {
             logger.error(`Failed to mark pack ${rkey} as deleted:`, {
                 error: err.message,
@@ -3760,6 +3817,84 @@ class DatabaseManager {
                 stack: err.stack
             });
             throw err;
+        }
+    }
+    
+    async _markPackStatusInternal(rkey, update, session = null) {
+        const options = session ? { session } : {};
+        const timestamp = update.timestamp || update.deleted_at || new Date().toISOString();
+    
+        // Log counts before
+        const beforeCounts = {
+            packs: await this.db.collection('starter_packs').countDocuments(),
+            users: await this.db.collection('users').countDocuments()
+        };
+        logger.info('Collection counts before update:', beforeCounts);
+    
+        // Update pack status first
+        const packResult = await this.safeWrite('starter_packs', {
+            filter: { rkey },
+            update: { $set: update }
+        }, options);
+    
+        logger.info(`Wrote. ${beforeCounts.packs} before / ${beforeCounts.packs + (packResult.upsertedCount || 0)} after. ${packResult.modifiedCount} modified, ${packResult.upsertedCount} upserted, ${packResult.matchedCount} matched]:`);
+    
+        if (update.deleted) {
+            // Handle user updates with proper update documents
+            const userUpdates = [
+                {
+                    updateMany: {
+                        filter: { pack_ids: rkey },
+                        update: {
+                            $pull: { pack_ids: rkey },
+                            $set: { last_updated: timestamp }
+                        }
+                    }
+                },
+                {
+                    updateMany: {
+                        filter: { created_packs: rkey },
+                        update: {
+                            $pull: { created_packs: rkey },
+                            $set: { last_updated: timestamp }
+                        }
+                    }
+                }
+            ];
+    
+            try {
+                const userResults = await this.safeBulkWrite('users', userUpdates, options);
+    
+                // Log counts after all updates
+                const afterCounts = {
+                    packs: await this.db.collection('starter_packs').countDocuments(),
+                    users: await this.db.collection('users').countDocuments()
+                };
+    
+                logger.info('Collection counts after update:', afterCounts);
+                logger.info('Update results:', {
+                    pack: {
+                        matched: packResult.matchedCount,
+                        modified: packResult.modifiedCount
+                    },
+                    users: {
+                        matched: userResults.matchedCount,
+                        modified: userResults.modifiedCount
+                    },
+                    countChanges: {
+                        packs: afterCounts.packs - beforeCounts.packs,
+                        users: afterCounts.users - beforeCounts.users
+                    }
+                });
+    
+            } catch (err) {
+                logger.error('Error updating user references:', {
+                    error: err.message,
+                    code: err.code,
+                    stack: err.stack
+                });
+                throw err;
+            }
         }
     }
     
@@ -3916,7 +4051,7 @@ class DatabaseManager {
             }
     
             // Log final results
-            logger.info(`[${processingId}] Pack ${rkey} cleanup: ${results.verified}/${results.processed} verified`);
+            logger.info(`Pack ${rkey} cleanup: ${results.verified}/${results.processed} verified`);
 
     
             return results;
@@ -4050,6 +4185,58 @@ class MainProcessor {
             files: false,
             taskManager: false
         };
+    }
+
+    async processUserLists(profile) {
+        const processingId = `lists-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        
+        try {
+            // Get all lists created by the user
+            const createdLists = await this.apiHandler.getUserLists(profile.did);
+            
+            // Process each list
+            const processedLists = [];
+            for (const list of createdLists) {
+                try {
+                    // Get full list details
+                    const details = await this.apiHandler.getListDetails(list.uri);
+                    
+                    // Format and save list data
+                    const listData = {
+                        uri: list.uri,
+                        cid: list.cid,
+                        creator: profile.handle,
+                        creator_did: profile.did,
+                        name: list.name,
+                        description: list.description || '',
+                        purpose: details?.list?.purpose || 'unknown',
+                        memberCount: details?.list?.membersCount || 0,
+                        indexedAt: list.indexedAt
+                    };
+
+                    await this.fileHandler.appendList(listData);
+                    processedLists.push(listData);
+
+                } catch (err) {
+                    logger.warn(`Error processing list ${list.uri}:`, err);
+                }
+            }
+
+            // Update user's list information
+            await this.fileHandler.updateUserListMemberships(profile.did, {
+                created: processedLists.map(l => l.uri),
+                lastUpdated: new Date().toISOString()
+            });
+
+            return {
+                processed: processedLists.length,
+                total: createdLists.length
+            };
+
+        } catch (err) {
+            logger.error(`Error processing lists for ${profile.did}:`, err);
+            return { processed: 0, total: 0 };
+        }
     }
 
     // Factory method for creating processor instances
@@ -5032,6 +5219,169 @@ class MainProcessor {
         this.stats.discovered = (this.stats.discovered || 0) + 1;
     }
 
+    async processAssociatedContent(profile, options = {}) {
+        const [packResults, listResults] = await Promise.all([
+            this.processAssociatedPacks(profile, options),
+            this.processAssociatedLists(profile, options)
+        ]);
+    
+        return {
+            packs: packResults,
+            lists: listResults
+        };
+    }
+
+    async processAssociatedLists(profile, options = {}) {
+        if (!profile?.did) {
+            throw new Error('Invalid profile data provided');
+        }
+    
+        const {
+            parentDid = null,
+            processingId = `al-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            depth = 0,
+            maxDepth = 2,  // Limit list discovery depth
+            processedDIDs = new Set(),
+            forceProcess = false
+        } = options;
+    
+        if (depth >= maxDepth || processedDIDs.has(profile.did)) {
+            return { discovered: 0, queued: 0, skipped: 1 };
+        }
+    
+        processedDIDs.add(profile.did);
+        
+        const stats = {
+            startTime: Date.now(),
+            results: {
+                discovered: 0,
+                queued: 0,
+                skipped: 0,
+                failed: 0,
+                deleted: 0,
+                byPurpose: {
+                    modlist: 0,
+                    curatelist: 0,
+                    referencelist: 0
+                },
+                errors: []
+            }
+        };
+    
+        try {
+            // Get all lists for the user
+            const lists = await this.apiHandler.getUserLists(profile.did);
+            if (!lists?.length) {
+                return stats.results;
+            }
+    
+            stats.results.discovered = lists.length;
+    
+            // Process lists in batches
+            const BATCH_SIZE = 5;
+            for (let i = 0; i < lists.length; i += BATCH_SIZE) {
+                const batch = lists.slice(i, i + BATCH_SIZE);
+                
+                await Promise.all(batch.map(async (list) => {
+                    try {
+                        // Skip if recently processed and not forced
+                        const existingList = await this.fileHandler.getList(list.uri);
+                        if (!forceProcess && existingList) {
+                            const hoursSinceUpdate = (Date.now() - new Date(existingList.updated_at).getTime()) / 3600000;
+                            if (hoursSinceUpdate < 24) {
+                                stats.results.skipped++;
+                                return;
+                            }
+                        }
+    
+                        // Get full list details
+                        const details = await this.apiHandler.getListDetails(list.uri);
+                        if (!details?.list) {
+                            throw new Error('Invalid list structure');
+                        }
+    
+                        // Track list purpose
+                        const purpose = details.list.purpose || 'unknown';
+                        if (stats.results.byPurpose[purpose] !== undefined) {
+                            stats.results.byPurpose[purpose]++;
+                        }
+    
+                        // Format list data
+                        const listData = {
+                            uri: list.uri,
+                            cid: list.cid,
+                            creator: profile.handle,
+                            creator_did: profile.did,
+                            name: list.name,
+                            description: list.description || '',
+                            purpose,
+                            memberCount: details.list.membersCount || 0,
+                            indexedAt: list.indexedAt,
+                            updated_at: new Date().toISOString()
+                        };
+    
+                        // Save to files
+                        await this.fileHandler.appendList(listData);
+    
+                        // Save to MongoDB if enabled
+                        if (!this.noMongoDB && !this.noDBWrites) {
+                            await this.dbManager.safeWrite('lists', {
+                                filter: { uri: list.uri },
+                                update: {
+                                    $set: listData,
+                                    $setOnInsert: { created_at: new Date().toISOString() }
+                                },
+                                upsert: true
+                            });
+                        }
+    
+                        stats.results.queued++;
+    
+                        // Track relationship
+                        if (parentDid) {
+                            this.taskManager.recordListRelationship(list.uri, parentDid);
+                        }
+    
+                    } catch (err) {
+                        if (err.status === 404) {
+                            await this.dbManager.markListDeleted(list.uri, 'not_found');
+                            stats.results.deleted++;
+                        } else {
+                            stats.results.failed++;
+                            stats.results.errors.push({
+                                uri: list.uri,
+                                error: err.message,
+                                status: err.status
+                            });
+                        }
+                    }
+                }));
+    
+                // Rate limit delay between batches
+                if (i + BATCH_SIZE < lists.length) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            }
+    
+            const duration = Date.now() - stats.startTime;
+            logger.info(`[${processingId}] ${profile.handle}: ${stats.results.queued}/${stats.results.discovered} lists processed`, {
+                duration: `${(duration / 1000).toFixed(1)}s`,
+                byPurpose: stats.results.byPurpose
+            });
+    
+            return stats.results;
+    
+        } catch (err) {
+            logger.error(`[${processingId}] Failed processing lists for ${profile.handle}:`, {
+                error: err.message,
+                status: err.status,
+                stack: err.stack,
+                stats: stats.results
+            });
+            throw err;
+        }
+    }
+
     async processAssociatedPacks(currentProfile, options = {}) {
         if (!currentProfile?.did) {
             throw new Error('Invalid profile data provided');
@@ -5201,6 +5551,102 @@ class MainProcessor {
         return userData;
     }
 
+    async processProfileLists(profile, options = {}) {
+        const { processingId, force = false } = options;
+        const results = {
+            created: [],
+            memberships: [],
+            deleted: [],
+            failed: []
+        };
+    
+        try {
+            // 1. Get lists created by the user
+            const createdLists = await this.apiHandler.getUserLists(profile.did);
+            logger.debug(`[${processingId}] Found ${createdLists?.length || 0} lists for ${profile.handle}`);
+    
+            // Track existing lists to detect deletions
+            const existingLists = new Set();
+    
+            // 2. Process each list
+            for (const list of (createdLists || [])) {
+                try {
+                    existingLists.add(list.uri);
+    
+                    // Get full list details
+                    const details = await this.apiHandler.getListDetails(list.uri);
+                    
+                    const listData = {
+                        uri: list.uri,
+                        cid: list.cid,
+                        creator: profile.handle,
+                        creator_did: profile.did,
+                        name: list.name,
+                        description: list.description || '',
+                        purpose: details?.list?.purpose || 'unknown',
+                        memberCount: details?.list?.membersCount || 0,
+                        indexedAt: list.indexedAt,
+                        updated_at: new Date().toISOString(),
+                        deleted: false
+                    };
+    
+                    // Save to MongoDB if enabled
+                    if (!this.noMongoDB && !this.noDBWrites) {
+                        await this.dbManager.safeWrite('lists', {
+                            filter: { uri: list.uri },
+                            update: {
+                                $set: listData,
+                                $setOnInsert: {
+                                    created_at: new Date().toISOString()
+                                }
+                            },
+                            upsert: true
+                        });
+                    }
+    
+                    results.created.push(listData);
+    
+                } catch (err) {
+                    if (err.status === 404) {
+                        await this.dbManager.markListDeleted(list.uri, 'not_found');
+                        results.deleted.push(list.uri);
+                    } else {
+                        logger.error(`[${processingId}] Failed to process list ${list.uri}:`, err);
+                        results.failed.push({
+                            uri: list.uri,
+                            error: err.message,
+                            status: err.status
+                        });
+                    }
+                }
+            }
+    
+            // 3. Check for deleted lists
+            if (!this.noMongoDB && !this.noDBWrites) {
+                const previousLists = await this.dbManager.db.collection('lists')
+                    .find({ 
+                        creator_did: profile.did,
+                        deleted: { $ne: true }
+                    })
+                    .project({ uri: 1 })
+                    .toArray();
+    
+                for (const list of previousLists) {
+                    if (!existingLists.has(list.uri)) {
+                        await this.dbManager.markListDeleted(list.uri, 'no_longer_exists');
+                        results.deleted.push(list.uri);
+                    }
+                }
+            }
+    
+            return results;
+    
+        } catch (err) {
+            logger.error(`[${processingId}] Error processing lists for ${profile.did}:`, err);
+            throw err;
+        }
+    }
+
     async processPackMember(member, packRkey) {
         const memberDid = member.did || (member.subject && member.subject.did);
         if (!memberDid) {
@@ -5266,7 +5712,8 @@ class MainProcessor {
             added: [],
             failed: [],
             removed: [],
-            packs: { discovered: 0, processed: 0, failed: 0 }
+            packs: { discovered: 0, processed: 0, failed: 0 },
+            lists: { processed: 0, failed: 0, deleted: 0 }
         };
     
         try {
@@ -5291,6 +5738,14 @@ class MainProcessor {
             if (!currentProfile) {
                 throw new Error('Profile not found');
             }
+
+            // Process lists before packs
+            const listResults = await this.processProfileLists(currentProfile, {
+                processingId,
+                force: force || forceProcess || this.config.updateAll
+            });
+
+            changes.lists = listResults;
     
             // 3. Get starter packs in one API call
             const ownedPacks = await this.apiHandler.getActorStarterPacks(currentProfile.did);
@@ -5338,7 +5793,12 @@ class MainProcessor {
                 created_packs: [...new Set([
                     ...(existingProfile?.created_packs || []),
                     ...ownedPackRkeys
-                ])]
+                ])],
+                list_stats: {
+                    created_lists: listResults.created?.length || 0,
+                    member_of_lists: listResults.memberships?.length || 0,
+                    last_list_check: new Date().toISOString()
+                }
             };
     
             // Add rename history if needed
@@ -5352,83 +5812,101 @@ class MainProcessor {
             // 6. Save data (files first, then MongoDB if enabled)
             await this.fileHandler.appendUser(userData);
     
+            // In processProfile, update the MongoDB handling:
             if (!this.noMongoDB && !this.noDBWrites) {
                 try {
-                    // Separate non-array and array fields
-                    const { pack_ids, created_packs, ...otherFields } = userData;
+                    // First handle non-array fields
+                    const { created_lists, list_memberships, ...otherListFields } = listResults;
                     
-                    // First update: handle non-array fields
                     const baseUpdate = {
                         filter: { did: currentProfile.did },
                         update: {
                             $set: {
-                                ...otherFields,
+                                ...otherListFields,
+                                list_stats: {
+                                    total_lists: created_lists?.length || 0,
+                                    total_memberships: list_memberships?.length || 0,
+                                    last_list_check: new Date().toISOString()
+                                },
                                 last_updated: new Date().toISOString()
                             }
                         },
                         upsert: true
                     };
-                    
+
                     await this.dbManager.safeWrite('users', baseUpdate);
-            
-                    // Second update: handle arrays if they exist
-                    if (pack_ids?.length > 0 || created_packs?.length > 0) {
+
+                    // Then handle arrays
+                    if (created_lists?.length > 0 || list_memberships?.length > 0) {
                         const arrayUpdate = {
                             filter: { did: currentProfile.did },
                             update: { $addToSet: {} }
                         };
-            
-                        if (pack_ids?.length > 0) {
-                            arrayUpdate.update.$addToSet.pack_ids = { $each: pack_ids };
+
+                        if (created_lists?.length > 0) {
+                            arrayUpdate.update.$addToSet.created_lists = { $each: created_lists };
                         }
-                        if (created_packs?.length > 0) {
-                            arrayUpdate.update.$addToSet.created_packs = { $each: created_packs };
+                        if (list_memberships?.length > 0) {
+                            arrayUpdate.update.$addToSet.list_memberships = { $each: list_memberships };
                         }
-            
+
                         await this.dbManager.safeWrite('users', arrayUpdate);
                     }
-            
-                    logger.debug(`[${processingId}] MongoDB updates completed for ${currentProfile.did}`, {
-                        nonArrayFields: Object.keys(otherFields),
-                        arrayFields: {
-                            pack_ids: pack_ids?.length || 0,
-                            created_packs: created_packs?.length || 0
+
+                    // Handle the lists collection separately
+                    if (created_lists?.length > 0) {
+                        for (const list of created_lists) {
+                            await this.dbManager.safeWrite('lists', {
+                                filter: { uri: list.uri },
+                                update: {
+                                    $set: {
+                                        ...list,
+                                        last_updated: new Date().toISOString()
+                                    },
+                                    $setOnInsert: {
+                                        created_at: new Date().toISOString()
+                                    }
+                                },
+                                upsert: true
+                            });
                         }
-                    });
-            
+                    }
+
                 } catch (err) {
-                    // Handle specific MongoDB errors
                     if (err.code === 40) { // Array update conflict
-                        logger.warn(`[${processingId}] MongoDB array update conflict, retrying with single operation`, {
+                        logger.warn(`[${processingId}] MongoDB array update conflict for lists, retrying`, {
                             did: currentProfile.did
                         });
                         
-                        // Fallback: get current document and merge arrays manually
                         const existing = await this.dbManager.db.collection('users')
                             .findOne({ did: currentProfile.did });
-            
+
                         if (existing) {
                             const mergedUpdate = {
                                 filter: { did: currentProfile.did },
                                 update: {
                                     $set: {
                                         ...userData,
-                                        pack_ids: [...new Set([
-                                            ...(existing.pack_ids || []),
-                                            ...(userData.pack_ids || [])
+                                        created_lists: [...new Set([
+                                            ...(existing.created_lists || []),
+                                            ...(created_lists || [])
                                         ])],
-                                        created_packs: [...new Set([
-                                            ...(existing.created_packs || []),
-                                            ...(userData.created_packs || [])
+                                        list_memberships: [...new Set([
+                                            ...(existing.list_memberships || []),
+                                            ...(list_memberships || [])
                                         ])],
+                                        list_stats: {
+                                            total_lists: created_lists?.length || 0,
+                                            total_memberships: list_memberships?.length || 0,
+                                            last_list_check: new Date().toISOString()
+                                        },
                                         last_updated: new Date().toISOString()
                                     }
                                 }
                             };
-            
+
                             await this.dbManager.safeWrite('users', mergedUpdate);
                         } else {
-                            // Document doesn't exist, simple insert
                             await this.dbManager.safeWrite('users', {
                                 filter: { did: currentProfile.did },
                                 update: { $set: userData },
@@ -5436,7 +5914,7 @@ class MainProcessor {
                             });
                         }
                     } else {
-                        throw err; // Re-throw other errors
+                        throw err;
                     }
                 }
             }
@@ -5762,7 +6240,8 @@ class MainProcessor {
             const finalPack = await this.dbManager.db.collection('starter_packs')
                 .findOne({ rkey: packData.rkey });
     
-            logger.info(`[${processingId}] Save operation completed:`, {
+                logger.info(`Saved: ${packData.creator}/${packData.rkey} (${finalPack.users.length}/${users.length}`);
+                logger.debug(`[${processingId}] Save operation completed:`, {
                 packId: packData.rkey,
                 finalUserCount: finalPack.users.length,
                 expectedUserCount: users.length,
@@ -5980,6 +6459,7 @@ async function handleShutdown(signal, currentProcessor = null) {
                 const stats = currentProcessor.metrics.getMetrics();
                 logger.info('Final processing statistics:', {
                     packsProcessed: stats.processing.packsProcessed,
+                    listsProcessed: stats.processing.listsProcessed || 0,
                     usersProcessed: stats.processing.usersProcessed,
                     totalDuration: `${Math.floor((Date.now() - currentProcessor.startTime) / 60000)} minutes`
                 });
@@ -6075,7 +6555,6 @@ async function handleMaintenanceCommands(args, processor) {
 
 // Quick process functions
 async function handleQuickProcess(args, processor, startTime) {
-
     try {
         // Ensure proper MongoDB initialization and session
         if (!processor.dbManager && !processor.noMongoDB) {
@@ -6095,10 +6574,9 @@ async function handleQuickProcess(args, processor, startTime) {
                 processor.logger,
                 'starterpacks'
             );
-            await processor.dbManager.init(); // This establishes the connection
-            await processor.dbManager.ensureSession(); // Explicitly ensure session
+            await processor.dbManager.init();
+            await processor.dbManager.ensureSession();
         } else if (processor.dbManager) {
-            // If dbManager exists, ensure it has a valid session
             await processor.dbManager.ensureSession();
         }
 
@@ -6108,27 +6586,31 @@ async function handleQuickProcess(args, processor, startTime) {
                 fileHandler: processor.fileHandler,
                 debug: args.debug,
                 dbManager: processor.dbManager,
-                noMongoDB: processor.config.noMongoDB,   // passing parameter
-                updateAll: processor.config.updateAll    // use processor's config
+                noMongoDB: processor.config.noMongoDB,
+                updateAll: processor.config.updateAll
             });
             
             // Only load existing data for lookups, but don't build task list
-            const { packs: existingPacks } = await processor.taskManager.loadExistingData();
+            const { packs: existingPacks, lists: existingLists } = await processor.taskManager.loadExistingData();
             processor.taskManager.existingPacks = existingPacks;
+            processor.taskManager.existingLists = existingLists;
             
             // Initialize empty task tracking
             processor.taskManager.pendingTasks = new Map();
+            processor.taskManager.pendingLists = new Map();  // Add list tracking
             processor.taskManager.completedTasks = new Set();
+            processor.taskManager.completedLists = new Set(); // Add list tracking
             processor.taskManager.failures = new Map();
         }
-        
+
         if (args.addUser) {
             logger.debug('Commencing quick user addition');
             const result = await quickProcessUser(args.addUser, {
                 processor,
                 force: args.force,
                 debug: args.debug,
-                processAssociated: true
+                processAssociated: true,
+                includeLists: !args.listsOnly
             });
 
             // Force checkpoint write after processing
@@ -6143,22 +6625,232 @@ async function handleQuickProcess(args, processor, startTime) {
                 });
             }
 
-            if (args.addPack) {
+            // Handle pack processing after user if requested
+            if (args.addPack && !args.listsOnly) {
                 await quickProcessPack(args.addPack, { processor });
-                // Force another checkpoint write
+                await processor.taskManager.maybeWriteCheckpoint(true);
+            }
+
+            // Handle list processing after user if requested
+            if (args.addList || !args.listsOnly) {
+                if (args.addList) {
+                    await quickProcessList(args.addList, { processor });
+                }
+                // Process associated lists if requested
+                if (result.profile?.did && !args.listsOnly) {
+                    await processor.processAssociatedLists(result.profile, {
+                        forceProcess: args.force || processor.config.updateAll
+                    });
+                }
                 await processor.taskManager.maybeWriteCheckpoint(true);
             }
 
             return result;
         }
 
-        if (args.addPack) {
+        if (args.addPack && !args.listsOnly) {
             const result = await quickProcessPack(args.addPack, { processor });
+            await processor.taskManager.maybeWriteCheckpoint(true);
+            return result;
+        }
+
+        if (args.addList) {
+            const result = await quickProcessList(args.addList, { processor });
             await processor.taskManager.maybeWriteCheckpoint(true);
             return result;
         }
     } catch (err) {
         logger.error(`Error setting up quick processing:`, err);
+        throw err;
+    }
+}
+
+async function resolveListIdentifier(identifier, { processor, processingId }) {
+    // Handle AT URI format
+    if (identifier.startsWith('at://')) {
+        const match = identifier.match(/at:\/\/([^\/]+)\/[^\/]+\/([^\/]+)/);
+        if (!match) {
+            throw new Error(`Invalid list URI format: ${identifier}`);
+        }
+
+        const [_, authority, rkey] = match;
+        const creatorProfile = await processor.apiHandler.getProfile(authority);
+        
+        return {
+            uri: identifier,
+            handle: creatorProfile.handle,
+            did: authority,
+            rkey,
+            source: 'uri'
+        };
+    }
+
+    // Handle handle|rkey format
+    if (identifier.includes('|')) {
+        const [handle, rkey] = identifier.split('|').map(s => s.trim());
+        if (!handle || !rkey) {
+            throw new Error(`Invalid handle|rkey format: ${identifier}`);
+        }
+
+        const did = await processor.apiHandler.resolveHandle(handle);
+        return {
+            uri: `at://${did}/app.bsky.graph.list/${rkey}`,
+            handle,
+            did,
+            rkey,
+            source: 'handle_rkey'
+        };
+    }
+
+    throw new Error(`Cannot resolve list identifier: ${identifier}`);
+}
+
+async function quickProcessList(identifier, options = {}) {
+    const { 
+        processor, 
+        debug = false,
+        processingId = `${Date.now()}-${Math.random().toString(36).slice(2)}` 
+    } = options;
+
+    if (!processor || !processor.taskManager) {
+        throw new Error('Processor and TaskManager are required');
+    }
+
+    logger.debug(`[${processingId}] Starting list processing:`, { identifier });
+
+    try {
+        // 1. Parse and validate identifier
+        const listInfo = await resolveListIdentifier(identifier, { processor, processingId });
+        
+        logger.debug(`[${processingId}] Resolved list info:`, {
+            uri: listInfo.uri,
+            handle: listInfo.handle,
+            did: listInfo.did,
+            source: listInfo.source
+        });
+
+        // 2. Check deletion state
+        if (processor.dbManager.deletedLists?.has(listInfo.uri)) {
+            const deletion = processor.dbManager.deletedLists.get(listInfo.uri);
+            const age = Date.now() - new Date(deletion.timestamp).getTime();
+            if (age < processor.dbManager.DELETION_COOLDOWN) {
+                throw new Error(`List was recently deleted: ${deletion.reason}`);
+            }
+        }
+
+        // 3. Get list details and members
+        const details = await processor.apiHandler.getListDetails(listInfo.uri);
+        if (!details?.list) {
+            throw new Error('Invalid list structure');
+        }
+
+        // 4. Process list data
+        const listData = {
+            uri: listInfo.uri,
+            creator: listInfo.handle,
+            creator_did: listInfo.did,
+            name: details.list.name,
+            description: details.list.description || '',
+            purpose: details.list.purpose,
+            memberCount: details.list.membersCount || 0,
+            updated_at: new Date().toISOString()
+        };
+
+        // 5. Process members if present
+        const members = await processor.apiHandler.getListMembers(listInfo.uri);
+        
+        // Track processing results
+        const results = {
+            processed: new Set(),
+            failed: new Set(),
+            members: {
+                total: members.length,
+                processed: 0,
+                failed: 0
+            }
+        };
+
+        // Process members in batches
+        const BATCH_SIZE = 10;
+        for (let i = 0; i < members.length; i += BATCH_SIZE) {
+            const batch = members.slice(i, i + BATCH_SIZE);
+            
+            await Promise.all(batch.map(async (member) => {
+                try {
+                    const profile = await processor.apiHandler.getProfile(member.did);
+                    if (profile) {
+                        await processor.processProfile(profile, {
+                            force: false,
+                            processAssociated: false,
+                            processingId,
+                            source: 'list_member'
+                        });
+                        results.members.processed++;
+                        results.processed.add(member.did);
+                    }
+                } catch (err) {
+                    results.members.failed++;
+                    results.failed.add(member.did);
+                    logger.warn(`[${processingId}] Failed to process list member:`, {
+                        did: member.did,
+                        error: err.message,
+                        status: err.status
+                    });
+                }
+            }));
+
+            // Progress logging
+            logger.debug(`[${processingId}] List member processing progress:`, {
+                processed: results.members.processed,
+                total: members.length,
+                failed: results.members.failed
+            });
+
+            // Rate limit delay between batches
+            if (i + BATCH_SIZE < members.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+
+        // 6. Save list data
+        await processor.fileHandler.appendList(listData);
+
+        if (!processor.noMongoDB && !processor.noDBWrites) {
+            await processor.dbManager.safeWrite('lists', {
+                filter: { uri: listInfo.uri },
+                update: {
+                    $set: {
+                        ...listData,
+                        member_count: results.members.processed,
+                        last_member_check: new Date().toISOString()
+                    }
+                },
+                upsert: true
+            });
+        }
+
+        logger.info(`[${processingId}] List processing completed:`, {
+            uri: listInfo.uri,
+            members: results.members,
+            successRate: `${((results.members.processed / members.length) * 100).toFixed(1)}%`
+        });
+
+        return {
+            success: true,
+            results,
+            listInfo,
+            processingId
+        };
+
+    } catch (err) {
+        logger.error(`[${processingId}] List processing failed:`, {
+            identifier,
+            error: err.message,
+            code: err.code,
+            status: err.status,
+            stack: err.stack
+        });
+        processor.metrics.recordError('quick_process_list', err);
         throw err;
     }
 }
@@ -6262,7 +6954,8 @@ async function quickProcessUser(identifier, options = {}) {
             processingId,
             source: 'quick_process',
             parentPack,
-            forceProcess: true
+            forceProcess: true,
+            includeLists: true
         });
 
         // 5. Process discovered packs if within depth limit
@@ -9074,6 +9767,8 @@ function parseArgs() {
         purgefiles: args.includes('--purgefiles'),
         cleanpackids: args.includes('--cleanpackids'),
         updateAll: args.includes('--updateall'),
+        listsOnly: args.includes('--lists'),  // process only lists
+        includeAssociatedLists: args.includes('--includeassociatedlists')
     };
 }
 
@@ -9105,9 +9800,6 @@ async function main() {
 
         // 3. Create processor with appropriate mode
         const mode = determineProcessingMode(args);
-        logger.debug ("updateAll args:", args.updateAll);
-        logger.debug(`updateAll args: ${args.updateAll}`); // Use a template literal for clarity
-
         processor = await MainProcessor.create({
             noMongoDB: args.noMongoDB,
             noDBWrites: args.noDBWrites,
@@ -9122,17 +9814,16 @@ async function main() {
             case 'cleanup':
                 await processor.dbManager.performPackIdsCleanup();
                 return;
-        
+
             case 'quick':
-                const result = await handleQuickProcess(args, processor);
+                const result = await handleQuickProcess(args, processor, startTime);
                 return result;
-        
+
             case 'normal':
-                // Set up shutdown handlers early
+                // Set up shutdown handlers
                 process.on('SIGINT', () => handleShutdown('SIGINT', processor));
                 process.on('SIGTERM', () => handleShutdown('SIGTERM', processor));
             
-                // Initialize in correct order
                 logger.info('Starting normal processing...');
                 
                 // 1. Load MongoDB data (fast operation)

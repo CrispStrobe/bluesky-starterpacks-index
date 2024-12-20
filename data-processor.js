@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// v027
-// v027: fixed list cursor
+// v029
+// v029: fix members update, handle change, circular logging prevention, etc
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -33,29 +33,51 @@ const logger = winston.createLogger({
         winston.format.timestamp(),
         winston.format.errors({ stack: true }),
         winston.format.splat(),
-        winston.format.json()
+        winston.format.printf(info => {
+            // Custom formatter that handles circular references
+            const replaceCircular = (obj, seen = new WeakSet()) => {
+                if (obj === null || typeof obj !== 'object') return obj;
+                
+                // Handle circular references
+                if (seen.has(obj)) return '[Circular]';
+                seen.add(obj);
+                
+                // Handle special MongoDB objects
+                if (obj.constructor?.name === 'MongoClient') return '[MongoClient]';
+                if (obj.constructor?.name === 'ClientSession') return '[ClientSession]';
+                if (obj.constructor?.name === 'ServerSessionPool') return '[ServerSessionPool]';
+                
+                // Handle arrays
+                if (Array.isArray(obj)) {
+                    return obj.map(item => replaceCircular(item, seen));
+                }
+                
+                // Handle objects
+                const result = {};
+                for (const [key, value] of Object.entries(obj)) {
+                    result[key] = replaceCircular(value, seen);
+                }
+                return result;
+            };
+
+            // Format the actual message
+            const cleanInfo = replaceCircular(info);
+            const base = `${cleanInfo.timestamp} [${cleanInfo.level}]: ${cleanInfo.message}`;
+            
+            // Add metadata if present
+            const meta = { ...cleanInfo };
+            delete meta.timestamp;
+            delete meta.level;
+            delete meta.message;
+            
+            if (Object.keys(meta).length > 0) {
+                return `${base}\n${JSON.stringify(meta, null, 2)}`;
+            }
+            return base;
+        })
     ),
-    defaultMeta: { service: 'starter-pack-processor' },
     transports: [
-        new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                // Remove simple format to handle custom formatting
-                winston.format.printf(({ timestamp, level, message, ...meta }) => {
-                    // Exclude 'service' from metadata
-                    const { service, ...rest } = meta;
-                    // Check if there are additional metadata fields
-                    const hasAdditionalMeta = Object.keys(rest).length > 0;
-                    // Format the log message
-                    let log = `${timestamp} [${level}]: ${message}`;
-                    // Append additional metadata if present
-                    if (hasAdditionalMeta) {
-                        log += `\n${JSON.stringify(rest, null, 2)}`;
-                    }
-                    return log;
-                })
-            )
-        }),
+        new winston.transports.Console(),
         new winston.transports.File({ 
             filename: FILE_PATHS.errorLog,
             level: 'error',
@@ -297,14 +319,7 @@ class MetricsCollector {
     
         // Log summary every 10 packs
         if (this.metrics.packStats.size % 10 === 0) {
-            logger.info('Processing summary:', {
-                packsProcessed: this.metrics.packStats.size,
-                usersProcessed: this.metrics.summary.totalUsersProcessed,
-                newUsers: this.metrics.summary.totalNewUsers,
-                updatedUsers: this.metrics.summary.totalUpdatedUsers,
-                removedUsers: this.metrics.summary.totalRemovedUsers,
-                associatedPacks: this.metrics.summary.totalAssociatedPacks
-            });
+            logger.info(`Processed ${this.metrics.packStats.size} packs, ${this.metrics.summary.totalUsersProcessed} users`);
         }
     }
 
@@ -2312,6 +2327,25 @@ class ApiHandler {
                             'com.atproto.identity.resolveHandle',
                             { handle }
                         );
+                        if (result?.did) {
+                            // Try to get and cache full profile when possible
+                            try {
+                                const profile = await this.getProfile(result.did);
+                                if (profile) {
+                                    await this.fileHandler.appendUser({
+                                        did: profile.did,
+                                        handle: profile.handle,
+                                        displayName: profile.displayName || '',
+                                        followers_count: profile.followersCount || 0,
+                                        follows_count: profile.followsCount || 0,
+                                        last_updated: new Date().toISOString()
+                                    });
+                                }
+                            } catch (profileErr) {
+                                // Log but don't fail if profile fetch fails
+                                logger.debug(`Couldn't fetch full profile for ${result.did}:`, profileErr);
+                            }
+                        }
                         return result?.did;
                     }
                 },
@@ -2323,6 +2357,17 @@ class ApiHandler {
                             'app.bsky.actor.getProfile',
                             { actor: handle }
                         );
+                        if (profile) {
+                            // Cache profile data
+                            await this.fileHandler.appendUser({
+                                did: profile.did,
+                                handle: profile.handle,
+                                displayName: profile.displayName || '',
+                                followers_count: profile.followersCount || 0,
+                                follows_count: profile.followsCount || 0,
+                                last_updated: new Date().toISOString()
+                            });
+                        }
                         return profile?.did;
                     }
                 },
@@ -2332,6 +2377,24 @@ class ApiHandler {
                         await this.refreshTokenIfNeeded();
                         await this.rateLimiter.throttle();
                         const response = await this.agent.resolveHandle({ handle });
+                        if (response?.data?.did) {
+                            // Try to get and cache full profile
+                            try {
+                                const profile = await this.getProfile(response.data.did);
+                                if (profile) {
+                                    await this.fileHandler.appendUser({
+                                        did: profile.did,
+                                        handle: profile.handle,
+                                        displayName: profile.displayName || '',
+                                        followers_count: profile.followersCount || 0,
+                                        follows_count: profile.followsCount || 0,
+                                        last_updated: new Date().toISOString()
+                                    });
+                                }
+                            } catch (profileErr) {
+                                logger.debug(`Couldn't fetch full profile for ${response.data.did}:`, profileErr);
+                            }
+                        }
                         return response?.data?.did;
                     }
                 }
@@ -3100,206 +3163,177 @@ class DatabaseManager {
         }
     }
 
+    cleanForLogging(obj) {
+        if (!obj) return null;
+        if (typeof obj !== 'object') return obj;
+        
+        // Special case: if it's a MongoDB related object, just return basic info
+        if (obj.constructor?.name === 'MongoClient') {
+            return '[MongoClient]';
+        }
+        if (obj.constructor?.name === 'ClientSession') {
+            return '[ClientSession]';
+        }
+        
+        // Regular object/array handling
+        const cleaned = Array.isArray(obj) ? [] : {};
+        for (const [key, value] of Object.entries(obj)) {
+            // Skip MongoDB internal objects
+            if (value && typeof value === 'object') {
+                if (value.constructor?.name === 'MongoClient' || 
+                    value.constructor?.name === 'ClientSession' ||
+                    value.constructor?.name === 'ServerSessionPool') {
+                    cleaned[key] = `[${value.constructor.name}]`;
+                    continue;
+                }
+            }
+            cleaned[key] = value;
+        }
+        return cleaned;
+    }
+
     async safeWrite(collection, operation, options = {}) {
         const operationId = `${collection}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         const startTime = Date.now();
-        const stats = { retries: 0, delays: 0 };
-    
-        const cleanForLogging = (obj) => {
-            if (!obj) return null;
-            const cleaned = JSON.parse(JSON.stringify(obj));
-            delete cleaned.session;
-            delete cleaned.sessionPool;
-            delete cleaned.client;
-            return cleaned;
-        };
-    
-        // Initial debug log
-        logger.debug(`MongoDB write operation details:`, {
-            operationId,
-            collection,
-            operation: {
-                filter: cleanForLogging(operation.filter),
-                update: cleanForLogging(operation.update)
-            },
-            options: cleanForLogging(options)
-        });
     
         try {
+            logger.debug(`safeWrite:`, operation);
+
+
+            // Log without MongoDB objects
+            logger.debug(`[${operationId}] MongoDB operation:`, {
+                collection,
+                filter: operation.filter,
+                update: this.cleanForLogging(operation.update),
+                options: this.cleanForLogging(options)
+            });
+
             // Validation
             if (!operation.filter || !operation.update) {
                 throw new Error(`Invalid operation parameters for ${collection}`);
             }
     
-            // Special handling for created_at conflicts
-            if (options.upsert && operation.update.$set?.created_at && operation.update.$setOnInsert?.created_at) {
-                logger.debug(`Detected created_at conflict, reorganizing update operation`, {
-                    operationId,
-                    collection
+            // Verify DB connection
+            if (!this.db) {
+                throw new Error('No database connection available');
+            }
+    
+            // Add session to options if we have one
+            const writeOptions = {
+                ...options,
+                session: this.session
+            };
+    
+            // Log the exact operation we're about to perform
+            logger.debug(`[${operationId}] Executing MongoDB operation:`, {
+                collection,
+                filter: operation.filter,
+                update: operation.update,
+                options: writeOptions
+            });
+    
+            // Execute write
+            const result = await this.db.collection(collection)
+            .updateOne(
+                operation.filter,
+                operation.update,
+                { ...options, session: this.session }
+            );
+    
+            // Verify the write if needed
+            const verifyWrite = async () => {
+                const verifiedDoc = await this.db.collection(collection)
+                    .findOne(operation.filter, { session: this.session });
+    
+                logger.debug(`[${operationId}] Write verification:`, {
+                    collection,
+                    found: !!verifiedDoc,
+                    matches: verifiedDoc ? Object.keys(operation.filter).every(key => 
+                        verifiedDoc[key] === operation.filter[key]
+                    ) : false
                 });
-                
-                // Check if document exists
-                const existing = await this.db.collection(collection)
-                    .findOne(operation.filter, { projection: { _id: 1, created_at: 1 } });
     
-                if (existing) {
-                    // Use existing created_at
-                    delete operation.update.$setOnInsert.created_at;
-                    operation.update.$set.created_at = existing.created_at;
-                } else {
-                    // Document doesn't exist - move created_at to $setOnInsert only
-                    const createdAt = operation.update.$set.created_at || operation.update.$setOnInsert.created_at;
-                    delete operation.update.$set.created_at;
-                    operation.update.$setOnInsert.created_at = createdAt;
-                }
+                return !!verifiedDoc;
+            };
+    
+            // Verify and log comprehensive results
+            const verified = await verifyWrite();
+            const duration = Date.now() - startTime;
+    
+            logger.info(`[${operationId}] Write completed:`, {
+                collection,
+                modified: result.modifiedCount,
+                upserted: result.upsertedCount,
+                matched: result.matchedCount
+            });
+    
+            if (!verified && !result.modifiedCount && !result.upsertedCount) {
+                logger.warn(`[${operationId}] Write operation had no effect:`, {
+                    collection,
+                    filter: operation.filter,
+                    update: operation.update
+                });
             }
     
-            // Execute write with retries
-            const maxRetries = 5;
-            let lastError = null;
-    
-            for (let attempt = 0; attempt < maxRetries; attempt++) {
-                try {
-                    await this.ensureSession();
-                    await this.enforceOperationDelay();
-    
-                    const writeOptions = {
-                        ...options,
-                        session: this.session
-                    };
-    
-                    const result = await this.db.collection(collection)
-                        .updateOne(
-                            operation.filter,
-                            operation.update,
-                            writeOptions
-                        );
-    
-                    // Verify write if requested
-                    if (options._requiresAck) {
-                        const verifiedDoc = await this.db.collection(collection)
-                            .findOne(operation.filter, { session: this.session });
-    
-                        if (!verifiedDoc) {
-                            throw new Error('Write verification failed');
-                        }
-    
-                        logger.debug(`Write verified:`, {
-                            operationId,
-                            collection,
-                            exists: true,
-                            document: cleanForLogging(verifiedDoc)
-                        });
-                    }
-    
-                    // Log success with details
-                    logger.info(`Write operation successful:`, {
-                        operationId,
-                        collection,
-                        duration: Date.now() - startTime,
-                        stats: {
-                            matchedCount: result.matchedCount,
-                            modifiedCount: result.modifiedCount,
-                            upsertedCount: result.upsertedCount,
-                            retries: stats.retries,
-                            delays: stats.delays
-                        }
-                    });
-    
-                    return result;
-    
-                } catch (err) {
-                    lastError = err;
-                    stats.retries++;
-    
-                    // Handle specific error types
-                    if (err.code === 40 && err.message.includes('created_at')) {
-                        // This is our conflict error - try to fix it
-                        logger.warn(`created_at conflict detected, retrying with fixed operation`, {
-                            operationId,
-                            attempt: attempt + 1
-                        });
-                        // Remove created_at from $set if it exists in both
-                        if (operation.update.$set?.created_at && operation.update.$setOnInsert?.created_at) {
-                            delete operation.update.$set.created_at;
-                        }
-                        continue;
-                    }
-                    
-                    if (err.code === 11000) { // Duplicate key
-                        if (collection === 'users') {
-                            logger.warn(`Duplicate key detected, retrying without upsert:`, {
-                                operationId,
-                                attempt: attempt + 1,
-                                error: err.message
-                            });
-                            options.upsert = false;
-                            continue;
-                        }
-                        throw err; // For non-users collections, fail fast on duplicates
-                    }
-    
-                    if (this.isCosmosThrottlingError(err)) {
-                        stats.delays++;
-                        await this.handleThrottlingError(err);
-                        continue;
-                    }
-    
-                    if (err.message.includes('session')) {
-                        logger.warn(`Session error, recreating:`, {
-                            operationId,
-                            attempt: attempt + 1,
-                            error: err.message
-                        });
-                        await this.ensureSession();
-                        continue;
-                    }
-    
-                    // Log failure details
-                    logger.error(`Write attempt failed:`, {
-                        operationId,
-                        collection,
-                        attempt: attempt + 1,
-                        error: {
-                            message: err.message,
-                            code: err.code,
-                            stack: err.stack
-                        }
-                    });
-    
-                    // If not retryable, stop immediately
-                    if (!this.isRetryableError(err)) {
-                        throw err;
-                    }
-    
-                    // Apply exponential backoff
-                    const backoffMs = Math.min(1000 * Math.pow(2, attempt), 30000);
-                    stats.delays++;
-                    await new Promise(resolve => setTimeout(resolve, backoffMs));
-                }
-            }
-    
-            throw lastError || new Error(`Write failed after ${maxRetries} attempts`);
+            return result;
     
         } catch (err) {
-            // Log comprehensive error information
-            logger.error(`Write operation failed:`, {
-                operationId,
+            logger.error(`[${operationId}] Write operation failed:`, {
                 collection,
-                duration: Date.now() - startTime,
-                stats,
-                error: {
-                    message: err.message,
-                    code: err.code,
-                    stack: err.stack
-                },
-                operation: {
-                    filter: cleanForLogging(operation.filter),
-                    update: cleanForLogging(operation.update)
-                }
+                error: err.message,
+                code: err.code,
+                filter: operation.filter,
+                update: operation.update,
+                stack: err.stack
             });
+    
+            // Special handling for specific error types
+            if (err.code === 40) { // Array update conflict
+                logger.warn(`[${operationId}] Array update conflict, attempting recovery...`);
+                return await this.handleArrayUpdateConflict(collection, operation, options);
+            }
+    
             throw err;
         }
+    }
+    
+    async handleArrayUpdateConflict(collection, operation, options) {
+        // Get current document
+        const current = await this.db.collection(collection)
+            .findOne(operation.filter, { session: this.session });
+    
+        // If document exists, merge arrays
+        if (current) {
+            const update = { $set: {} };
+            
+            // Handle each field in the update
+            Object.entries(operation.update.$set || {}).forEach(([key, value]) => {
+                if (Array.isArray(value)) {
+                    // For arrays, merge with existing values
+                    update.$set[key] = [...new Set([
+                        ...(current[key] || []),
+                        ...value
+                    ])];
+                } else {
+                    // For non-arrays, use new value
+                    update.$set[key] = value;
+                }
+            });
+    
+            // Try update with merged data
+            return await this.db.collection(collection).updateOne(
+                operation.filter,
+                update,
+                { ...options, session: this.session }
+            );
+        }
+    
+        // If document doesn't exist, do simple insert
+        return await this.db.collection(collection).updateOne(
+            operation.filter,
+            operation.update,
+            { ...options, upsert: true, session: this.session }
+        );
     }
     
     // Helper method to determine if error is retryable
@@ -3468,7 +3502,7 @@ class DatabaseManager {
                 // Log progress every 5 batches
                 if (stats.batches % 5 === 0 || stats.processed === normalizedOps.length) {
                     const progress = (stats.processed / normalizedOps.length * 100).toFixed(1);
-                    logger.info(`Bulk write progress:`, {
+                    logger.debug(`Bulk write progress:`, {
                         operationId,
                         progress: `${progress}%`,
                         processed: stats.processed,
@@ -3504,14 +3538,7 @@ class DatabaseManager {
                 }
             }
     
-            logger.info(`Bulk write completed:`, {
-                operationId,
-                duration: `${((Date.now() - stats.startTime) / 1000).toFixed(1)}s`,
-                totalOperations: normalizedOps.length,
-                successful: stats.successful,
-                failed: stats.failed,
-                errorRate: `${((stats.failed / stats.processed) * 100).toFixed(1)}%`
-            });
+            logger.info(`Bulk write ${collection}: ${stats.successful}/${stats.processed} ok`);
     
             return {
                 acknowledged: true,
@@ -3624,100 +3651,108 @@ class DatabaseManager {
         const timestamp = new Date();
         logger.debug('markPackDeleted:', { rkey, reason, skipUserUpdates });
         
+        const session = await this.db.client.startSession();
         try {
-            // Get current state in one query with needed fields only
-            const existingPack = await this.db.collection('starter_packs')
-                .findOne(
-                    { rkey },
-                    { projection: { 
-                        creator_did: 1, 
-                        creator: 1, 
-                        name: 1, 
-                        updated_at: 1,
-                        users: 1,
-                        deleted: 1 
-                    }}
-                );
-    
-            if (!existingPack) {
-                logger.warn(`Attempted to mark non-existent pack as deleted: ${rkey}`);
-                return;
-            }
-    
-            if (existingPack.deleted) {
-                logger.debug(`Pack ${rkey} already marked as deleted, updating metadata`);
-            }
-    
-            // Prepare deletion metadata
-            const deletionUpdate = {
-                deleted: true,
-                deleted_at: timestamp,
-                deletion_reason: reason,
-                members_at_deletion: existingPack.users?.length || 0,
-                status: 'deleted',
-                status_updated_at: timestamp,
-                last_known_state: {
-                    creator_did: existingPack.creator_did,
-                    creator: existingPack.creator,
-                    name: existingPack.name,
-                    updated_at: existingPack.updated_at
-                }
-            };
-    
-            // Update pack first
-            await this.db.collection('starter_packs').updateOne(
-                { rkey },
-                { $set: deletionUpdate }
-            );
-    
-            // Update users if needed
-            if (!skipUserUpdates && existingPack.users?.length > 0) {
-                // Remove from pack_ids
-                await this.db.collection('users').updateMany(
-                    { pack_ids: rkey },
-                    {
-                        $pull: { pack_ids: rkey },
-                        $set: { last_updated: timestamp }
-                    }
-                );
-    
-                // Remove from created_packs
-                await this.db.collection('users').updateMany(
-                    { created_packs: rkey },
-                    {
-                        $pull: { created_packs: rkey },
-                        $set: { last_updated: timestamp }
-                    }
-                );
-    
-                // Mark users with no packs as deleted
-                await this.db.collection('users').updateMany(
-                    {
-                        $or: [
-                            { pack_ids: { $size: 0 } },
-                            { pack_ids: { $exists: false } }
-                        ],
-                        deleted: { $ne: true }
-                    },
-                    {
-                        $set: {
-                            deleted: true,
-                            deleted_at: timestamp,
-                            deletion_reason: 'no_remaining_packs'
+            await session.withTransaction(async () => {
+
+                const existingPack = await this.db.collection('starter_packs')
+                    .findOne(
+                        { rkey },
+                        { 
+                            projection: {
+                                creator_did: 1,
+                                creator: 1,
+                                name: 1,
+                                updated_at: 1,
+                                users: 1,
+                                deleted: 1
+                            },
+                            session
                         }
+                    );
+    
+                if (!existingPack) {
+                    logger.warn(`Attempted to mark non-existent pack as deleted: ${rkey}`);
+                    return;
+                }
+        
+                if (existingPack.deleted) {
+                    logger.debug(`Pack ${rkey} already marked as deleted, updating metadata`);
+                }
+        
+                // Prepare deletion metadata
+                const deletionUpdate = {
+                    deleted: true,
+                    deleted_at: timestamp,
+                    deletion_reason: reason,
+                    members_at_deletion: existingPack.users?.length || 0,
+                    status: 'deleted',
+                    status_updated_at: timestamp,
+                    last_known_state: {
+                        creator_did: existingPack.creator_did,
+                        creator: existingPack.creator,
+                        name: existingPack.name,
+                        updated_at: existingPack.updated_at
                     }
+                };
+        
+                // Update pack first
+                await this.db.collection('starter_packs').updateOne(
+                    { rkey },
+                    { $set: deletionUpdate },
+                    { session }
                 );
-            }
-    
-            logger.info(`Pack ${rkey} marked as deleted`, {
-                reason,
-                creator: existingPack.creator_did,
-                memberCount: existingPack.users?.length || 0,
-                name: existingPack.name,
-                timestamp: timestamp.toISOString(),
-                skipUserUpdates
+        
+                // Update users if needed
+                if (!skipUserUpdates && existingPack.users?.length > 0) {
+                    // Your existing user updates but with session
+                    await this.db.collection('users').updateMany(
+                        { pack_ids: rkey },
+                        {
+                            $pull: { pack_ids: rkey },
+                            $set: { last_updated: timestamp }
+                        },
+                        { session }
+                    );
+        
+                    // Remove from created_packs
+                    await this.db.collection('users').updateMany(
+                        { created_packs: rkey },
+                        {
+                            $pull: { created_packs: rkey },
+                            $set: { last_updated: timestamp }
+                        }
+                    );
+        
+                    // Mark users with no packs as deleted
+                    await this.db.collection('users').updateMany(
+                        {
+                            $or: [
+                                { pack_ids: { $size: 0 } },
+                                { pack_ids: { $exists: false } }
+                            ],
+                            deleted: { $ne: true }
+                        },
+                        {
+                            $set: {
+                                deleted: true,
+                                deleted_at: timestamp,
+                                deletion_reason: 'no_remaining_packs'
+                            }
+                        }
+                    );
+                };
+
+                // After successful transaction, update internal state
+                this.deletedPacks?.set(rkey, {
+                    timestamp,
+                    reason
+                });
+                this.pendingTasks?.delete(rkey);
+                this.packCache?.delete(rkey);
+        
+                logger.info(`Deleted pack ${rkey} with ${existingPack.users?.length || 0} members`);
             });
-    
         } catch (err) {
             logger.error(`Failed to mark pack ${rkey} as deleted:`, {
                 error: err.message,
@@ -3881,11 +3916,8 @@ class DatabaseManager {
             }
     
             // Log final results
-            logger.info(`[${processingId}] Cleanup completed for pack ${rkey}:`, {
-                duration: `${((Date.now() - timestamp) / 1000).toFixed(1)}s`,
-                ...results,
-                successRate: `${((results.verified / results.processed) * 100).toFixed(1)}%`
-            });
+            logger.info(`[${processingId}] Pack ${rkey} cleanup: ${results.verified}/${results.processed} verified`);
+
     
             return results;
     
@@ -3955,10 +3987,8 @@ class DatabaseManager {
                 );
             }
     
-            logger.info(`Completed cascading deletions for user ${did}:`, {
-                createdPacksDeleted: createdPacks.length,
-                membershipRemoved: memberPacks.length
-            });
+            logger.info(`Deleted ${createdPacks.length} packs and removed ${memberPacks.length} memberships for ${did}`);
+
     
         } catch (err) {
             logger.error(`Failed cascading deletions for user ${did}:`, {
@@ -4020,9 +4050,6 @@ class MainProcessor {
             files: false,
             taskManager: false
         };
-
-        this.profileCache = new Map();
-        this.profileCacheTTL = CACHE_CONFIG.profileCacheTTL;
     }
 
     // Factory method for creating processor instances
@@ -4306,13 +4333,8 @@ class MainProcessor {
                 await this.taskManager.markTaskCompleted(rkey);
                 session.metrics.memory.end = process.memoryUsage().heapUsed;
                 
-                logger.info(`[${session.id}] Completed:`, {
-                    duration: `${((Date.now() - session.startTime) / 1000).toFixed(1)}s`,
-                    stages: Object.fromEntries([...session.stages].map(([name, s]) => 
-                        [name, { duration: `${(s.duration / 1000).toFixed(1)}s`, success: s.success }]
-                    )),
-                    metrics: session.metrics
-                });
+                //logger.info(`[${session.id}] Completed in ${((Date.now() - session.startTime) / 1000).toFixed(1)}s`);
+
             });
     
             return true;
@@ -4472,12 +4494,8 @@ class MainProcessor {
                 }
     
                 if ((processedCount + failedCount) % 100 === 0) {
-                    logger.info('Processing status:', {
-                        remaining: tasks.length - (processedCount + failedCount),
-                        processed: processedCount,
-                        failed: failedCount,
-                        successRate: `${((processedCount / (processedCount + failedCount)) * 100).toFixed(1)}%`
-                    });
+                    logger.info(`Status: ${processedCount}/${tasks.length} processed, ${failedCount} failed`);
+
                 }
             } catch (err) {
                 logger.error(`Failed to process task ${task.rkey}:`, err);
@@ -4600,11 +4618,8 @@ class MainProcessor {
             // Remove from known users set
             this.knownUsers.delete(did);
             
-            logger.info(`Marked profile ${did} as deleted:`, {
-                reason,
-                timestamp,
-                affectedPacks: createdPacks.length
-            });
+            logger.info(`Deleted profile ${did}, affecting ${createdPacks.length} packs`);
+
     
         } catch (err) {
             logger.error(`Failed to mark profile ${did} as deleted:`, err);
@@ -4679,7 +4694,7 @@ class MainProcessor {
             throw new Error(`Invalid proof for membership removal: ${JSON.stringify(proof)}`);
         }
 
-        logger.info(`Starting membership removal:`, {
+        logger.debug(`Starting membership removal:`, {
             removalId,
             userDid,
             packRkey,
@@ -4707,7 +4722,7 @@ class MainProcessor {
                     return false;
                 }
                 if (currentUser.deleted || currentPack.deleted) {
-                    logger.info(`Skipping membership removal - item already deleted:`, {
+                    logger.idebugnfo(`Skipping membership removal - item already deleted:`, {
                         removalId,
                         userDeleted: currentUser.deleted,
                         packDeleted: currentPack.deleted
@@ -4797,13 +4812,8 @@ class MainProcessor {
                 timestamp
             });
 
-            logger.info(`Membership removal completed:`, {
-                removalId,
-                userDid,
-                packRkey,
-                remainingPacks: userData?.pack_ids?.length || 0,
-                duration: Date.now() - timestamp
-            });
+            logger.info(`Removed user ${userDid} from pack ${packRkey} in ${Date.now() - timestamp}ms`);
+
 
             return true;
 
@@ -4962,7 +4972,18 @@ class MainProcessor {
             // Try public API first
             try {
                 const publicData = await this.apiHandler.makeApiCall('app.bsky.actor.getProfile', { actor: did });
-                if (publicData) return publicData;
+                if (publicData) {
+                    // Update cache with profile data
+                    await this.fileHandler.appendUser({
+                        did: publicData.did,
+                        handle: publicData.handle,
+                        displayName: publicData.displayName || '',
+                        followers_count: publicData.followersCount || 0,
+                        follows_count: publicData.followsCount || 0,
+                        last_updated: new Date().toISOString()
+                    });
+                    return publicData;
+                }
             } catch (err) {
                 if (this.isRateLimitError(err)) {
                     await this.rateLimiter.handleResponse(err);
@@ -4975,7 +4996,18 @@ class MainProcessor {
     
             // Fall back to authenticated API
             const response = await this.agent.getProfile({ actor: did });
-            return response?.data;
+            if (response?.data) {
+                // Update cache with profile data
+                await this.fileHandler.appendUser({
+                    did: response.data.did,
+                    handle: response.data.handle,
+                    displayName: response.data.displayName || '',
+                    followers_count: response.data.followersCount || 0,
+                    follows_count: response.data.followsCount || 0,
+                    last_updated: new Date().toISOString()
+                });
+                return response.data;
+            }
         } catch (err) {
             if (err.status === 401) {
                 await this.agent.login({
@@ -5127,16 +5159,8 @@ class MainProcessor {
             }
     
             const duration = Date.now() - stats.startTime;
-            logger.info(`[${processingId}] Completed processing packs for ${currentProfile.handle}:`, {
-                duration: `${(duration / 1000).toFixed(1)}s`,
-                results: {
-                    ...stats.results,
-                    successRate: stats.results.discovered ? 
-                        `${((stats.results.queued / stats.results.discovered) * 100).toFixed(1)}%` : 
-                        '0.0%'
-                }
-            });
-    
+            logger.info(`[${processingId}] ${currentProfile.handle}: ${stats.results.queued}/${stats.results.discovered} queued`);
+
             return stats.results;
     
         } catch (err) {
@@ -5160,20 +5184,36 @@ class MainProcessor {
         return rkey;
     }
 
+    async updateProfileData(profile, source = 'api') {
+        const timestamp = new Date().toISOString();
+        const userData = {
+            did: profile.did,
+            handle: profile.handle,
+            displayName: profile.displayName || '',
+            followers_count: profile.followersCount || 0,
+            follows_count: profile.followsCount || 0,
+            last_updated: timestamp,
+            source_update: source
+        };
+    
+        // Update both cache and files
+        await this.fileHandler.appendUser(userData);
+        return userData;
+    }
+
     async processPackMember(member, packRkey) {
         const memberDid = member.did || (member.subject && member.subject.did);
         if (!memberDid) {
             logger.warn(`Could not extract DID from member: ${JSON.stringify(member)}`);
             return null;
         }
-    
+
         try {
-            // Check cache first
-            let profile = this.profileCache.get(memberDid);
+            // Check FileHandler's cache first
+            let profile = this.fileHandler.getUser(memberDid);
             const now = Date.now();
-            const cacheTime = profile?.cacheTime || 0;
-    
-            if (!profile || (now - cacheTime > this.profileCacheTTL)) {
+
+            if (!profile || (now - new Date(profile.last_updated).getTime() > 48 * 60 * 60 * 1000)) {
                 const fetchedProfile = await this.getProfile(memberDid);
                 if (fetchedProfile) {
                     profile = {
@@ -5183,20 +5223,17 @@ class MainProcessor {
                         followers_count: fetchedProfile.followersCount || 0,
                         follows_count: fetchedProfile.followsCount || 0,
                         pack_ids: [packRkey],
-                        last_updated: new Date().toISOString(),
-                        cacheTime: now
+                        last_updated: new Date().toISOString()
                     };
-                    this.profileCache.set(memberDid, profile);
+                    // Use FileHandler to update both cache and files
+                    await this.fileHandler.appendUser(profile);
                 }
-            } else {
-                // Update pack_ids for existing profile
-                if (!profile.pack_ids?.includes(packRkey)) {
-                    profile.pack_ids = [...(profile.pack_ids || []), packRkey];
-                }
+            } else if (!profile.pack_ids?.includes(packRkey)) {
+                profile.pack_ids = [...(profile.pack_ids || []), packRkey];
+                await this.fileHandler.appendUser(profile);
             }
-    
+
             return profile;
-    
         } catch (err) {
             logger.warn(`Error processing member ${memberDid}:`, err);
             return null;
@@ -5205,21 +5242,21 @@ class MainProcessor {
 
     async processProfile(profile, options = {}) {
         const {
-            rkey = null,                  
-            force = false,                
-            processAssociated = true,     
-            parentPack = null,            
+            rkey = null,
+            force = false,
+            processAssociated = true,
+            parentPack = null,
             processingId = `${Date.now()}-${Math.random().toString(36).slice(2)}`,
             source = 'direct',
-            existingMemberships = [],     
-            existingCreatedPacks = [],
-            forceProcess = false,     
+            forceProcess = false
         } = options;
     
         logger.debug(`[${processingId}] Processing profile:`, { 
             did: profile.did, 
+            handle: profile.handle,
             source, 
-            parentPack 
+            parentPack,
+            force: force || forceProcess || this.config.updateAll
         });
     
         const startTime = Date.now();
@@ -5233,44 +5270,54 @@ class MainProcessor {
         };
     
         try {
-            if (!profile?.did) {
-                throw new Error('Invalid profile data provided');
+            // 1. Cache check (only if not forced)
+            const existingProfile = this.fileHandler.getUser(profile.did);
+            if (!force && !forceProcess && !this.config.updateAll && existingProfile) {
+                const hoursSinceUpdate = (Date.now() - new Date(existingProfile.last_updated).getTime()) / 3600000;
+                
+                if (hoursSinceUpdate < 48 && source !== 'quick_process') {
+                    logger.debug(`[${processingId}] Using cached profile (${Math.round(hoursSinceUpdate)}h old)`);
+                    return { 
+                        success: true, 
+                        changes: [],
+                        cached: true,
+                        profile: existingProfile
+                    };
+                }
             }
     
-            // 1. Get current and historical state
-            const [currentProfile, existingProfile] = await Promise.all([
-                this.apiHandler.getProfile(profile.did),
-                this.fileHandler.getUser(profile.did)
-            ]);
-    
+            // 2. Get current profile data
+            const currentProfile = await this.apiHandler.getProfile(profile.did);
             if (!currentProfile) {
                 throw new Error('Profile not found');
             }
     
-            // 2. Get user's owned packs
-            // In processProfile:
+            // 3. Get starter packs in one API call
             const ownedPacks = await this.apiHandler.getActorStarterPacks(currentProfile.did);
             const ownedPackRkeys = (ownedPacks?.starterPacks || [])
-                .filter(p => p && p.uri)  // Make sure we have valid entries
-                .map(p => this.apiHandler.extractRkeyFromURI(p.uri));
+                .filter(p => p?.uri)
+                .map(p => {
+                    try {
+                        return this.apiHandler.extractRkeyFromURI(p.uri);
+                    } catch (err) {
+                        logger.warn(`[${processingId}] Invalid pack URI: ${p.uri}`);
+                        return null;
+                    }
+                })
+                .filter(Boolean);
     
-            // 3. Detect state changes
+            logger.debug(`[${processingId}] Found ${ownedPackRkeys.length} owned packs`);
+    
+            // 4. Detect state changes
             const profileState = {
                 isNew: !existingProfile,
                 isRenamed: existingProfile && existingProfile.handle !== currentProfile.handle,
                 hasDisplayNameChange: existingProfile && existingProfile.display_name !== currentProfile.displayName,
                 hasPackMemberships: existingProfile?.pack_ids?.length > 0,
-                isCreator: ownedPackRkeys.length > 0
+                hasStarterPacks: ownedPackRkeys.length > 0,
+                hoursSinceUpdate: existingProfile ? 
+                    (Date.now() - new Date(existingProfile.last_updated).getTime()) / 3600000 : null
             };
-    
-            // 4. Early return check
-            if (!force && source !== 'quick_process' && existingProfile) {
-                const daysSinceUpdate = (Date.now() - new Date(existingProfile.last_updated).getTime()) 
-                    / (1000 * 60 * 60 * 24);
-                if (daysSinceUpdate < 7 && !currentProfile.associated?.starterPacks) {
-                    return { success: true, changes, cached: true };
-                }
-            }
     
             // 5. Prepare merged user data
             const userData = {
@@ -5282,95 +5329,128 @@ class MainProcessor {
                 follows_count: currentProfile.followsCount || 0,
                 posts_count: currentProfile.postsCount || 0,
                 last_updated: new Date().toISOString(),
-                handle_history: [
-                    ...(existingProfile?.handle_history || []),
-                    ...(profileState.isRenamed ? [{
-                        oldHandle: existingProfile.handle,
-                        timestamp: existingProfile.last_updated
-                    }] : [])
-                ],
-                // Merge pack memberships
+                handle_history: existingProfile?.handle_history || [],
                 pack_ids: [...new Set([
                     ...(existingProfile?.pack_ids || []),
                     ...(rkey ? [rkey] : []),
-                    ...ownedPackRkeys  // Creator is always a member
+                    ...ownedPackRkeys
                 ])],
-                // Track created packs separately
                 created_packs: [...new Set([
                     ...(existingProfile?.created_packs || []),
                     ...ownedPackRkeys
                 ])]
             };
     
-            // 6. Save to files first
-            await this.fileHandler.appendUser(userData);
-    
-            // 7. Update MongoDB if enabled (Fixed version)
-            if (!this.noMongoDB && !this.noDBWrites) {
-                // First get existing data
-                const existingDoc = await this.dbManager.db.collection('users')
-                    .findOne(
-                        { did: currentProfile.did }, 
-                        { projection: { pack_ids: 1, created_packs: 1 } }
-                    );
-
-                // Carefully prepare update
-                const updateOp = {
-                    filter: { did: currentProfile.did },
-                    update: {
-                        $set: {
-                            did: currentProfile.did,
-                            handle: currentProfile.handle,
-                            display_name: currentProfile.displayName || '',
-                            description: currentProfile.description || '',
-                            followers_count: currentProfile.followersCount || 0,
-                            follows_count: currentProfile.followsCount || 0,
-                            posts_count: currentProfile.postsCount || 0,
-                            last_updated: new Date().toISOString(),
-                            handle_history: userData.handle_history
-                        }
-                    }
-                };
-
-                // Handle arrays separately
-                if (userData.pack_ids?.length > 0) {
-                    updateOp.update.$addToSet = {
-                        pack_ids: { $each: userData.pack_ids }
-                    };
-                }
-
-                if (userData.created_packs?.length > 0) {
-                    if (!updateOp.update.$addToSet) {
-                        updateOp.update.$addToSet = {};
-                    }
-                    updateOp.update.$addToSet.created_packs = { 
-                        $each: userData.created_packs 
-                    };
-                }
-
-                logger.debug('MongoDB update operation:', {
-                    filter: updateOp.filter,
-                    arrays: {
-                        pack_ids: userData.pack_ids,
-                        created_packs: userData.created_packs
-                    }
+            // Add rename history if needed
+            if (profileState.isRenamed) {
+                userData.handle_history.push({
+                    oldHandle: existingProfile.handle,
+                    timestamp: existingProfile.last_updated
                 });
-
-                await this.dbManager.safeWrite('users', updateOp);
             }
     
-            // 8. Process associated packs
-            if (processAssociated && ownedPacks.starterPacks.length > 0) {
-                //logger.debug('processProfile Call - forceProcess/updateAll:', this.config.updateAll);
-
+            // 6. Save data (files first, then MongoDB if enabled)
+            await this.fileHandler.appendUser(userData);
+    
+            if (!this.noMongoDB && !this.noDBWrites) {
+                try {
+                    // Separate non-array and array fields
+                    const { pack_ids, created_packs, ...otherFields } = userData;
+                    
+                    // First update: handle non-array fields
+                    const baseUpdate = {
+                        filter: { did: currentProfile.did },
+                        update: {
+                            $set: {
+                                ...otherFields,
+                                last_updated: new Date().toISOString()
+                            }
+                        },
+                        upsert: true
+                    };
+                    
+                    await this.dbManager.safeWrite('users', baseUpdate);
+            
+                    // Second update: handle arrays if they exist
+                    if (pack_ids?.length > 0 || created_packs?.length > 0) {
+                        const arrayUpdate = {
+                            filter: { did: currentProfile.did },
+                            update: { $addToSet: {} }
+                        };
+            
+                        if (pack_ids?.length > 0) {
+                            arrayUpdate.update.$addToSet.pack_ids = { $each: pack_ids };
+                        }
+                        if (created_packs?.length > 0) {
+                            arrayUpdate.update.$addToSet.created_packs = { $each: created_packs };
+                        }
+            
+                        await this.dbManager.safeWrite('users', arrayUpdate);
+                    }
+            
+                    logger.debug(`[${processingId}] MongoDB updates completed for ${currentProfile.did}`, {
+                        nonArrayFields: Object.keys(otherFields),
+                        arrayFields: {
+                            pack_ids: pack_ids?.length || 0,
+                            created_packs: created_packs?.length || 0
+                        }
+                    });
+            
+                } catch (err) {
+                    // Handle specific MongoDB errors
+                    if (err.code === 40) { // Array update conflict
+                        logger.warn(`[${processingId}] MongoDB array update conflict, retrying with single operation`, {
+                            did: currentProfile.did
+                        });
+                        
+                        // Fallback: get current document and merge arrays manually
+                        const existing = await this.dbManager.db.collection('users')
+                            .findOne({ did: currentProfile.did });
+            
+                        if (existing) {
+                            const mergedUpdate = {
+                                filter: { did: currentProfile.did },
+                                update: {
+                                    $set: {
+                                        ...userData,
+                                        pack_ids: [...new Set([
+                                            ...(existing.pack_ids || []),
+                                            ...(userData.pack_ids || [])
+                                        ])],
+                                        created_packs: [...new Set([
+                                            ...(existing.created_packs || []),
+                                            ...(userData.created_packs || [])
+                                        ])],
+                                        last_updated: new Date().toISOString()
+                                    }
+                                }
+                            };
+            
+                            await this.dbManager.safeWrite('users', mergedUpdate);
+                        } else {
+                            // Document doesn't exist, simple insert
+                            await this.dbManager.safeWrite('users', {
+                                filter: { did: currentProfile.did },
+                                update: { $set: userData },
+                                upsert: true
+                            });
+                        }
+                    } else {
+                        throw err; // Re-throw other errors
+                    }
+                }
+            }
+    
+            // 7. Process associated packs if needed
+            if (processAssociated && profileState.hasStarterPacks) {
                 const packResults = await this.processAssociatedPacks(currentProfile, {
                     parentDid: currentProfile.did,
                     processingId,
-                    forceProcess: this.config.updateAll || false
+                    forceProcess: force || forceProcess || this.config.updateAll
                 });
                 changes.packs = packResults;
     
-                // Process discovered packs immediately in quick mode
+                // Immediate processing for quick mode
                 if (source === 'quick_process') {
                     while (this.taskManager.pendingTasks.size > 0) {
                         await this.taskManager.processNextTask(this);
@@ -5378,7 +5458,7 @@ class MainProcessor {
                 }
             }
     
-            // 9. Record changes
+            // 8. Record changes
             if (profileState.isNew) changes.added.push(currentProfile.did);
             if (profileState.isRenamed) {
                 changes.renamed.push({
@@ -5390,26 +5470,39 @@ class MainProcessor {
             }
             if (!profileState.isNew) changes.updated.push(currentProfile.did);
     
-            // 10. Update metrics
-            metrics?.recordUserProcessing(true);
-            metrics?.recordProfileProcessing(Date.now() - startTime);
+            // 9. Update metrics and complete
+            if (this.metrics) {
+                this.metrics.recordUserProcessing(true);
+                this.metrics.recordProfileProcessing(Date.now() - startTime);
+            }
     
-            // 11. Mark task complete if from parent pack
             if (parentPack) {
                 await this.taskManager.markTaskCompleted(parentPack);
             }
     
-            return { success: true, changes };
+            return {
+                success: true,
+                changes,
+                profile: userData,
+                timing: {
+                    total: Date.now() - startTime
+                },
+                state: profileState
+            };
     
         } catch (err) {
-            metrics?.recordUserProcessing(false);
-            metrics?.recordError('profile_processing', err);
+            if (this.metrics) {
+                this.metrics.recordUserProcessing(false);
+                this.metrics.recordError('profile_processing', err);
+            }
             
-            logger.error(`[${processingId}] Error processing profile ${profile?.did}:`, {
+            logger.error(`[${processingId}] Profile processing failed:`, {
+                did: profile.did,
+                handle: profile.handle,
                 error: err.message,
                 status: err.status,
-                parentPack,
-                stack: err.stack
+                stack: err.stack,
+                parentPack
             });
     
             changes.failed.push({
@@ -5419,7 +5512,7 @@ class MainProcessor {
                 timestamp: new Date().toISOString()
             });
     
-            return { success: false, changes, error: err.message };
+            throw err;  // Let caller handle the error
         }
     }
 
@@ -5516,116 +5609,6 @@ class MainProcessor {
         if (this.noMongoDB) return { newUsers: 0, updatedUsers: 0 };
     
         const processingId = `save-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const stats = { newUsers: 0, updatedUsers: 0 };
-    
-        try {
-            // Validate dbManager access
-            if (!this.dbManager?.db) {
-                throw new Error('Database access not available');
-            }
-    
-            // 1. Format and save pack data
-            const formattedPack = {
-                rkey: packData.rkey,
-                creator: packData.creator,
-                creator_did: packData.creator_did,
-                description: packData.description || '',
-                name: packData.name,
-                previous_update: packData.previous_update || null,
-                previous_user_count: packData.previous_user_count || 0,
-                total_joins: packData.total_joins || 0,
-                updated_at: packData.updated_at || new Date().toISOString(),
-                user_count: packData.user_count || 0,
-                users: packData.users || [],
-                weekly_joins: packData.weekly_joins || 0,
-                last_updated: new Date().toISOString(),
-                status: packData.status || 'completed',
-                status_reason: packData.status_reason || null,
-                status_updated_at: packData.status_updated_at || new Date().toISOString()
-            };
-    
-            // Get existing pack state
-            const existingPack = await this.dbManager.db.collection('starter_packs')
-                .findOne(
-                    { rkey: formattedPack.rkey },
-                    { projection: { created_at: 1, users: 1 } }
-                );
-    
-            // Update pack document
-            await this.dbManager.safeWrite('starter_packs', {
-                filter: { rkey: formattedPack.rkey },
-                update: {
-                    $set: formattedPack,
-                    ...(!existingPack ? {
-                        $setOnInsert: {
-                            created_at: packData.created_at || new Date().toISOString()
-                        }
-                    } : {
-                        $set: { created_at: existingPack.created_at }
-                    })
-                }
-            }, { upsert: true });
-    
-            // 2. Process users in batches
-            const BATCH_SIZE = this.dbManager.isCosmosDb ? 10 : 100;
-            const userDids = users.map(u => u.did);
-    
-            for (let i = 0; i < users.length; i += BATCH_SIZE) {
-                const batch = users.slice(i, i + BATCH_SIZE);
-    
-                const bulkOps = batch.map(user => ({
-                    updateOne: {
-                        filter: { did: user.did },
-                        update: {
-                            $set: {
-                                did: user.did,
-                                handle: user.handle,
-                                displayName: user.displayName || '',
-                                description: user.description || '',
-                                followers_count: user.followers_count || 0,
-                                follows_count: user.follows_count || 0,
-                                last_updated: new Date().toISOString()
-                            },
-                            $addToSet: { pack_ids: packData.rkey }
-                        },
-                        upsert: true
-                    }
-                }));
-    
-                await this.dbManager.safeBulkWrite('users', bulkOps);
-    
-                stats.newUsers += batch.filter(user => !existingPack?.users?.includes(user.did)).length;
-                stats.updatedUsers += batch.filter(user => existingPack?.users?.includes(user.did)).length;
-    
-                // Log progress
-                logger.debug(`[${processingId}] Batch progress:`, {
-                    processed: Math.min(i + BATCH_SIZE, users.length),
-                    total: users.length,
-                    stats
-                });
-            }
-    
-            logger.debug(`[${processingId}] Save completed:`, {
-                pack: packData.rkey,
-                stats
-            });
-    
-            return stats;
-    
-        } catch (err) {
-            logger.error(`[${processingId}] Database write failed:`, {
-                pack: packData.rkey,
-                error: err.message,
-                stack: err.stack
-            });
-            throw err;
-        }
-    }
-
-    async saveToDB_old(packData, users) {
-        if (this.noMongoDB) return { newUsers: 0, updatedUsers: 0 };
-    
-        const processingId = `save-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const stats = {
             newUsers: 0,
             updatedUsers: 0,
@@ -5633,100 +5616,113 @@ class MainProcessor {
         };
     
         try {
-            // 1. Format and save pack data
-            const formattedPack = {
-                rkey: packData.rkey,
-                creator: packData.creator,
-                creator_did: packData.creator_did,
-                description: packData.description || '',
-                name: packData.name,
-                previous_update: packData.previous_update || null,
-                previous_user_count: packData.previous_user_count || 0,
-                total_joins: packData.total_joins || 0,
-                updated_at: packData.updated_at || new Date().toISOString(),
-                user_count: packData.user_count || 0,
-                users: packData.users || [],
-                weekly_joins: packData.weekly_joins || 0,
-                last_updated: new Date().toISOString(),
-                status: packData.status || 'completed',
-                status_reason: packData.status_reason || null,
-                status_updated_at: packData.status_updated_at || new Date().toISOString()
-            };
+            if (!this.dbManager?.db) {
+                throw new Error('Database access not available');
+            }
+    
+            logger.debug(`[${processingId}] Starting save operation for pack ${packData.rkey} with ${users.length} users`);
     
             // Get existing pack state
-            const existingPack = await this.db.collection('starter_packs')
+            const existingPack = await this.dbManager.db.collection('starter_packs')
                 .findOne(
-                    { rkey: formattedPack.rkey },
-                    { projection: { created_at: 1, users: 1 } }
+                    { rkey: packData.rkey },
+                    { projection: { created_at: 1, users: 1, user_count: 1 } }
                 );
     
-            // Update pack document
-            await this.safeWrite('starter_packs', {
-                filter: { rkey: formattedPack.rkey },
-                update: {
-                    $set: formattedPack,
-                    ...(!existingPack ? {
-                        $setOnInsert: {
-                            created_at: packData.created_at || new Date().toISOString()
-                        }
-                    } : {
-                        $set: { created_at: existingPack.created_at }
-                    })
+            logger.debug(`[${processingId}] Existing pack state:`, {
+                found: !!existingPack,
+                currentUsers: existingPack?.users?.length || 0,
+                currentUserCount: existingPack?.user_count || 0
+            });
+    
+            // Prepare user DIDs array
+            const userDids = users.map(u => u.did);
+    
+            // Format pack update
+            const now = new Date().toISOString();
+            const packUpdate = {
+                $set: {
+                    rkey: packData.rkey,
+                    creator: packData.creator,
+                    creator_did: packData.creator_did,
+                    description: packData.description || '',
+                    name: packData.name,
+                    previous_update: existingPack?.updated_at || null,
+                    previous_user_count: existingPack?.users?.length || 0,
+                    total_joins: packData.total_joins || 0,
+                    updated_at: now,
+                    user_count: users.length,
+                    users: userDids,  // Store all current user DIDs
+                    weekly_joins: packData.weekly_joins || 0,
+                    last_updated: now,
+                    status: 'completed',
+                    status_updated_at: now
                 }
+            };
+    
+            // Handle created_at separately
+            if (!existingPack) {
+                packUpdate.$setOnInsert = {
+                    created_at: packData.created_at || now
+                };
+            } else {
+                packUpdate.$set.created_at = existingPack.created_at;
+            }
+    
+            logger.debug(`[${processingId}] Updating pack document:`, {
+                filter: { rkey: packData.rkey },
+                updateFields: Object.keys(packUpdate.$set),
+                newUserCount: users.length
+            });
+    
+            // Update pack document
+            const packResult = await this.dbManager.safeWrite('starter_packs', {
+                filter: { rkey: packData.rkey },
+                update: packUpdate
             }, { upsert: true });
     
-            // 2. Process user memberships
-            const userDids = users.map(u => u.did);
-            
-            // Get current state of all affected users
-            const existingUsers = await this.db.collection('users')
+            logger.debug(`[${processingId}] Pack update result:`, {
+                matched: packResult.matchedCount,
+                modified: packResult.modifiedCount,
+                upserted: packResult.upsertedCount
+            });
+    
+            // Get existing users state
+            const existingUsers = await this.dbManager.db.collection('users')
                 .find(
                     { did: { $in: userDids } },
-                    { 
-                        projection: { 
-                            did: 1, 
-                            pack_ids: 1,
-                            created_packs: 1,
-                            handle: 1 
-                        } 
-                    }
+                    { projection: { did: 1, pack_ids: 1, handle: 1 } }
                 ).toArray();
     
-            const existingUserMap = new Map(
-                existingUsers.map(u => [u.did, u])
-            );
+            const existingUserMap = new Map(existingUsers.map(u => [u.did, u]));
     
-            // 3. Process users in batches with proper membership handling
-            const BATCH_SIZE = this.isCosmosDb ? 10 : 100;
-            
-            for (let i = 0; i < users.length; i += BATCH_SIZE) {
-                const batch = users.slice(i, i + BATCH_SIZE);
+            logger.debug(`[${processingId}] Found ${existingUsers.length} existing users`);
+    
+            // Process users in batches
+            const BATCH_SIZE = this.dbManager.isCosmosDb ? 10 : 100;
+            const totalBatches = Math.ceil(users.length / BATCH_SIZE);
+    
+            for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                const start = batchIndex * BATCH_SIZE;
+                const batch = users.slice(start, start + BATCH_SIZE);
                 
+                logger.debug(`[${processingId}] Processing batch ${batchIndex + 1}/${totalBatches}`, {
+                    batchSize: batch.length,
+                    startIndex: start
+                });
+    
                 const bulkOps = batch.map(user => {
                     const existing = existingUserMap.get(user.did);
                     const isNew = !existing;
     
-                    // Carefully merge pack_ids
-                    const existingPackIds = existing?.pack_ids || [];
-                    const mergedPackIds = [...new Set([
-                        ...existingPackIds,
-                        packData.rkey
-                    ])];
-    
-                    // Special handling for creator
-                    const isCreator = user.did === packData.creator_did;
-                    const existingCreatedPacks = existing?.created_packs || [];
-                    const mergedCreatedPacks = isCreator ? 
-                        [...new Set([...existingCreatedPacks, packData.rkey])] :
-                        existingCreatedPacks;
-    
-                    // Track stats
+                    // Update stats
                     if (isNew) {
                         stats.newUsers++;
                     } else {
                         stats.updatedUsers++;
                     }
-                    if (!existingPackIds.includes(packData.rkey)) {
+    
+                    if (!existing?.pack_ids?.includes(packData.rkey)) {
                         stats.membershipChanges.added++;
                     } else {
                         stats.membershipChanges.preserved++;
@@ -5743,40 +5739,37 @@ class MainProcessor {
                                     description: user.description || '',
                                     followers_count: user.followers_count || 0,
                                     follows_count: user.follows_count || 0,
-                                    last_updated: new Date().toISOString(),
-                                    pack_ids: mergedPackIds,
-                                    created_packs: mergedCreatedPacks
+                                    last_updated: now
                                 },
-                                $addToSet: {
-                                    'membership_history': {
-                                        pack: packData.rkey,
-                                        action: existingPackIds.includes(packData.rkey) ? 
-                                            'confirmed' : 'added',
-                                        timestamp: new Date().toISOString()
-                                    }
-                                }
+                                $addToSet: { pack_ids: packData.rkey }
                             },
                             upsert: true
                         }
                     };
                 });
     
-                await this.safeBulkWrite('users', bulkOps);
-    
-                logger.debug(`[${processingId}] Batch progress:`, {
-                    processed: Math.min(i + BATCH_SIZE, users.length),
-                    total: users.length,
-                    stats
+                const batchResult = await this.dbManager.safeBulkWrite('users', bulkOps);
+                
+                logger.debug(`[${processingId}] Batch ${batchIndex + 1} result:`, {
+                    matched: batchResult.matchedCount,
+                    modified: batchResult.modifiedCount,
+                    upserted: batchResult.upsertedCount,
+                    currentStats: stats
                 });
             }
     
-            logger.info(`[${processingId}] Database write completed:`, {
-                pack: packData.rkey,
-                stats: {
-                    usersTotal: users.length,
-                    newUsers: stats.newUsers,
-                    updatedUsers: stats.updatedUsers,
-                    membershipChanges: stats.membershipChanges
+            // Verify final state
+            const finalPack = await this.dbManager.db.collection('starter_packs')
+                .findOne({ rkey: packData.rkey });
+    
+            logger.info(`[${processingId}] Save operation completed:`, {
+                packId: packData.rkey,
+                finalUserCount: finalPack.users.length,
+                expectedUserCount: users.length,
+                stats: stats,
+                verification: {
+                    usersMatch: finalPack.users.length === users.length,
+                    userCountMatch: finalPack.user_count === users.length
                 }
             });
     
@@ -5791,13 +5784,6 @@ class MainProcessor {
             });
             throw err;
         }
-    }
-
-    clearInternalState() {
-        this.activeOperations = new Set();
-        this.processingCache = new Map();
-        this.profileCache.clear();
-        this.verificationResults?.clear();
     }
     
     isRateLimitError(err) {
@@ -5854,7 +5840,6 @@ class MainProcessor {
     clearInternalState() {
         this.activeOperations?.clear();
         this.processingCache?.clear();
-        this.profileCache?.clear();
         this.verificationResults?.clear();
         
         // Clear task-related state
@@ -6224,7 +6209,7 @@ async function quickProcessUser(identifier, options = {}) {
                         stats.deleted++;
                         return { success: false, reason: 'profile_not_found' };
                     }
-                } else if (processor.rateLimiter.isRateLimitError(err)) {
+                } else if (processor.isRateLimitError(err)) {
                     await processor.rateLimiter.handleResponse(err);
                     throw err; // Retry will be handled by caller
                 } else {
@@ -6338,8 +6323,8 @@ async function quickProcessUser(identifier, options = {}) {
                     await processor.taskManager.maybeWriteCheckpoint();
 
                 } catch (err) {
-                    if (processor.rateLimiter.isRateLimitError(err)) {
-                        await processor.rateLimiter.handleResponse(err);
+                    if (processor.isRateLimitError(err)) {
+                        await processor.handleResponse(err);
                         // Put task back in queue
                         await processor.taskManager.addTask(task);
                     } else {
@@ -6398,119 +6383,49 @@ async function quickProcessPack(identifier, options = {}) {
         processingId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     } = options;
 
-    logger.debug(`Quick processing pack [${processingId}]:`, { identifier });
+    if (!processor || !processor.taskManager) {
+        throw new Error('Processor and TaskManager are required for quickProcessPack');
+    }
+
+    logger.debug(`[${processingId}] Starting pack processing:`, { identifier });
 
     try {
-        // 1. Resolve pack identifier with validation
-        let urlLine;
+        // Step 1: Parse and validate identifier, with comprehensive resolution
+        const packInfo = await resolvePackIdentifier(identifier, { processor, processingId });
         
-        // Resolve rkey early
-        let rkey = await Promise.resolve(identifier.split('|')[1] || identifier);
-        if (!rkey || rkey.toString() === '[object Promise]' || !rkey.match(/^[a-zA-Z0-9]+$/)) {
-            throw new Error(`Invalid rkey format: ${rkey}`);
-        }
+        logger.debug(`[${processingId}] Resolved pack info:`, {
+            rkey: packInfo.rkey,
+            handle: packInfo.handle,
+            did: packInfo.did,
+            uri: packInfo.uri,
+            source: packInfo.source
+        });
 
-        // Add validation
-        if (this.deletedPacks?.has(rkey)) {
-            const deletion = this.deletedPacks.get(rkey);
-            const age = Date.now() - new Date(deletion.timestamp).getTime();
-            if (age < (this.DELETION_COOLDOWN || 7 * 24 * 60 * 60 * 1000)) {
-                return { success: false, reason: 'pack_deleted' };
-            }
-        }
+        // Step 2: Validate pack state
+        await validatePackState(packInfo, { processor, processingId });
 
-        if (identifier.startsWith('at://')) {
-            const [_, handle, __, packRkey] = identifier.split('/');
-            if (!handle || !packRkey) {
-                throw new Error(`Invalid AT URI format: ${identifier}`);
-            }
-            urlLine = `${handle}|${packRkey}`;
-            rkey = packRkey;
-        } else if (identifier.includes('|')) {
-            urlLine = identifier;
-            rkey = identifier.split('|')[1].trim();
-        } else {
-            // Try to find in existing packs
-            const pack = await processor.fileHandler.getPack(identifier);
-            if (!pack) {
-                throw new Error(`Cannot resolve pack: ${identifier}`);
-            }
-            urlLine = `${pack.creator}|${identifier}`;
-            rkey = identifier;
-        }
-
-        // 2. Check deletion state
-        if (processor.deletedPacks?.has(rkey)) {
-            const deletion = processor.deletedPacks.get(rkey);
-            const age = Date.now() - new Date(deletion.timestamp).getTime();
-            if (age < (processor.DELETION_COOLDOWN || 7 * 24 * 60 * 60 * 1000)) {
-                return { success: false, reason: 'pack_deleted' };
-            }
-        }
-
-        // 3. Add as high-priority task
-        await processor.taskManager.addTask({
-            ...processor.taskManager.parsePackIdentifier(urlLine),
+        // Step 3: Add high-priority task
+        const task = await processor.taskManager.addTask({
+            handle: packInfo.handle,
+            rkey: packInfo.rkey,
+            did: packInfo.did,
+            uri: packInfo.uri,
             priority: 1,
             source: 'quick_process',
             processingId
         });
 
-        // 4. Process pack and track results
-        const results = {
-            processed: new Set(),
-            failed: new Set(),
-            members: {
-                processed: 0,
-                failed: 0
-            }
-        };
+        // Step 4: Process pack with detailed tracking
+        const results = await processPackWithTracking(task, { processor, processingId });
 
-        while (processor.taskManager.pendingTasks.size > 0) {
-            const task = await processor.taskManager.getNextTask();
-            if (!task) break;
-
-            try {
-                const success = await processor.processStarterPack(
-                    `${task.handle}|${task.rkey}`,
-                    { processingId }
-                );
-
-                if (success) {
-                    results.processed.add(task.rkey);
-                    
-                    // Get pack data and update stats
-                    const pack = await processor.fileHandler.getPack(task.rkey);
-                    if (pack) {
-                        results.members.processed += pack.users?.length || 0;
-                    }
-                } else {
-                    results.failed.add(task.rkey);
-                }
-
-                await processor.taskManager.markTaskCompleted(task.rkey);
-                await processor.taskManager.maybeWriteCheckpoint();
-
-            } catch (err) {
-                if (processor.rateLimiter.isRateLimitError(err)) {
-                    await processor.rateLimiter.handleResponse(err);
-                    await processor.taskManager.addTask(task);
-                } else if (err.status === 404) {
-                    await processor.taskManager.markPackDeleted(task.rkey, 'not_found');
-                    results.failed.add(task.rkey);
-                } else {
-                    results.failed.add(task.rkey);
-                    logger.error(`Failed to process pack [${processingId}]:`, {
-                        rkey: task.rkey,
-                        error: err.message
-                    });
-                }
-            }
-        }
-
-        // 5. Log completion with stats
-        logger.info(`Quick pack process completed [${processingId}]:`, {
+        // Step 5: Final logging and return
+        logger.info(`[${processingId}] Processing completed:`, {
             identifier,
+            resolvedInfo: {
+                rkey: packInfo.rkey,
+                handle: packInfo.handle,
+                source: packInfo.source
+            },
             results: {
                 processed: results.processed.size,
                 failed: results.failed.size,
@@ -6522,18 +6437,295 @@ async function quickProcessPack(identifier, options = {}) {
         return {
             success: true,
             results,
-            processingId
+            processingId,
+            packInfo
         };
 
     } catch (err) {
-        logger.error(`Error in quick process pack [${processingId}]:`, {
+        logger.error(`[${processingId}] Processing failed:`, {
             identifier,
             error: err.message,
+            code: err.code,
+            status: err.status,
             stack: err.stack
         });
         processor.metrics.recordError('quick_process_pack', err);
         throw err;
     }
+}
+
+async function resolvePackIdentifier(identifier, { processor, processingId }) {
+    // Step 1: Parse AT URI if provided
+    if (identifier.startsWith('at://')) {
+        const match = identifier.match(/at:\/\/([^\/]+)\/app\.bsky\.graph\.starterpack\/([^\/]+)/);
+        if (!match) {
+            throw new Error(`Invalid AT URI format: ${identifier}`);
+        }
+        
+        const [_, authority, rkey] = match;
+        const resolvedHandle = await resolveAuthority(authority, { processor, processingId });
+        
+        return {
+            rkey,
+            handle: resolvedHandle,
+            did: authority.startsWith('did:') ? authority : null,
+            uri: identifier,
+            source: 'at_uri'
+        };
+    }
+
+    // Step 2: Parse handle|rkey format
+    if (identifier.includes('|')) {
+        const [handle, rkey] = identifier.split('|').map(s => s.trim());
+        if (!handle || !rkey || !rkey.match(/^[a-zA-Z0-9]+$/)) {
+            throw new Error(`Invalid handle|rkey format: ${identifier}`);
+        }
+
+        // Resolve handle to DID for stable URI
+        const did = await processor.apiHandler.resolveHandle(handle);
+        return {
+            rkey,
+            handle,
+            did,
+            uri: `at://${did}/app.bsky.graph.starterpack/${rkey}`,
+            source: 'handle_rkey'
+        };
+    }
+
+    // Step 3: Resolve lone rkey through multiple methods
+    const rkey = identifier.trim();
+    if (!rkey.match(/^[a-zA-Z0-9]+$/)) {
+        throw new Error(`Invalid rkey format: ${rkey}`);
+    }
+
+    // Try each resolution method in sequence
+    const resolutionMethods = [
+        {
+            name: 'search',
+            handler: async () => {
+                const results = await processor.apiHandler.searchStarterPacks(rkey);
+                const match = results?.starterPacks?.find(p => 
+                    p.uri.endsWith(`/app.bsky.graph.starterpack/${rkey}`)  // More specific match
+                );
+                if (match?.creator) {
+                    return {
+                        rkey,
+                        handle: match.creator.handle,
+                        did: match.creator.did,
+                        uri: match.uri,
+                        source: 'search_api'
+                    };
+                }
+                return null;
+            }
+        },
+        {
+            name: 'direct_api',
+            handler: async () => {
+                // Try with public API first
+                try {
+                    const packDetails = await processor.apiHandler.getStarterPack(`at://${rkey}`);
+                    if (packDetails?.starterPack?.creator) {
+                        return {
+                            rkey,
+                            handle: packDetails.starterPack.creator.handle,
+                            did: packDetails.starterPack.creator.did,
+                            uri: packDetails.starterPack.uri,
+                            source: 'direct_api'
+                        };
+                    }
+                } catch (err) {
+                    logger.debug(`[${processingId}] Direct API lookup failed:`, err);
+                }
+                return null;
+            }
+        },
+        {
+            name: 'local_cache',
+            handler: async () => {
+                const pack = await processor.fileHandler.getPack(rkey);
+                if (pack?.creator && pack?.creator_did) {
+                    return {
+                        rkey,
+                        handle: pack.creator,
+                        did: pack.creator_did,
+                        uri: `at://${pack.creator_did}/app.bsky.graph.starterpack/${rkey}`,
+                        source: 'local_cache'
+                    };
+                }
+                return null;
+            }
+        },
+        {
+            name: 'mongodb',
+            handler: async () => {
+                if (processor.noMongoDB || !processor.dbManager) return null;
+                
+                const pack = await processor.dbManager.db.collection('starter_packs')
+                    .findOne({ rkey }, { 
+                        projection: { 
+                            creator: 1, 
+                            creator_did: 1 
+                        } 
+                    });
+                
+                if (pack?.creator && pack?.creator_did) {
+                    return {
+                        rkey,
+                        handle: pack.creator,
+                        did: pack.creator_did,
+                        uri: `at://${pack.creator_did}/app.bsky.graph.starterpack/${rkey}`,
+                        source: 'mongodb'
+                    };
+                }
+                return null;
+            }
+        }
+    ];
+
+    for (const method of resolutionMethods) {
+        try {
+            logger.debug(`[${processingId}] Trying ${method.name} resolution for ${rkey}...`);
+            const result = await method.handler();
+            if (result) {
+                logger.debug(`[${processingId}] Found pack via ${method.name}:`, result);
+                return result;
+            }
+        } catch (err) {
+            logger.debug(`[${processingId}] ${method.name} resolution failed:`, {
+                error: err.message,
+                status: err.status
+            });
+        }
+    }
+
+    throw new Error(`Cannot resolve pack: ${rkey}`);
+}
+
+async function validatePackState(packInfo, { processor, processingId }) {
+    // Check deletion state
+    if (processor.taskManager.deletedPacks?.has(packInfo.rkey)) {
+        const deletion = processor.taskManager.deletedPacks.get(packInfo.rkey);
+        const age = Date.now() - new Date(deletion.timestamp).getTime();
+        if (age < (processor.taskManager.DELETION_COOLDOWN || 7 * 24 * 60 * 60 * 1000)) {
+            throw new Error(`Pack ${packInfo.rkey} was recently deleted: ${deletion.reason}`);
+        }
+    }
+
+    // Verify pack still exists and is accessible
+    try {
+        const verificationResult = await processor.apiHandler.getStarterPackDetails(packInfo.uri);
+        if (!verificationResult?.starterPack?.record?.list) {
+            throw new Error(`Pack ${packInfo.rkey} has invalid structure`);
+        }
+        
+        // Update pack info with latest data
+        packInfo.memberCount = verificationResult.starterPack.record.membersCount;
+        packInfo.name = verificationResult.starterPack.record.name;
+        packInfo.description = verificationResult.starterPack.record.description;
+        
+        logger.debug(`[${processingId}] Pack verification successful:`, {
+            rkey: packInfo.rkey,
+            memberCount: packInfo.memberCount,
+            name: packInfo.name
+        });
+        
+    } catch (err) {
+        if (err.status === 404) {
+            await processor.taskManager.markPackDeleted(packInfo.rkey, 'not_found');
+            throw new Error(`Pack ${packInfo.rkey} no longer exists`);
+        }
+        throw err;
+    }
+}
+
+async function processPackWithTracking(task, { processor, processingId }) {
+    const results = {
+        processed: new Set(),
+        failed: new Set(),
+        members: {
+            processed: 0,
+            failed: 0
+        }
+    };
+
+    while (processor.taskManager.pendingTasks.size > 0) {
+        const currentTask = await processor.taskManager.getNextTask();
+        if (!currentTask) break;
+
+        try {
+            logger.debug(`[${processingId}] Processing task:`, {
+                rkey: currentTask.rkey,
+                handle: currentTask.handle,
+                uri: currentTask.uri
+            });
+
+            const success = await processor.processStarterPack(
+                `${currentTask.handle}|${currentTask.rkey}`,
+                { processingId }
+            );
+
+            if (success) {
+                results.processed.add(currentTask.rkey);
+                
+                const pack = await processor.fileHandler.getPack(currentTask.rkey);
+                if (pack) {
+                    results.members.processed += pack.users?.length || 0;
+                    
+                    logger.debug(`[${processingId}] Pack processed successfully:`, {
+                        rkey: currentTask.rkey,
+                        membersProcessed: pack.users?.length || 0
+                    });
+                }
+            } else {
+                results.failed.add(currentTask.rkey);
+                logger.warn(`[${processingId}] Pack processing returned false:`, {
+                    rkey: currentTask.rkey
+                });
+            }
+
+            await processor.taskManager.markTaskCompleted(currentTask.rkey);
+            await processor.taskManager.maybeWriteCheckpoint();
+
+        } catch (err) {
+            // Use the standalone function instead of accessing through rateLimiter
+            if (processor.isRateLimitError(err)) {
+                await processor.rateLimiter.handleResponse(err);
+                await processor.taskManager.addTask(currentTask);
+                logger.debug(`[${processingId}] Rate limit hit, retrying task:`, {
+                    rkey: currentTask.rkey
+                });
+            } else if (err.status === 404) {
+                await processor.taskManager.markPackDeleted(currentTask.rkey, 'not_found');
+                results.failed.add(currentTask.rkey);
+                logger.warn(`[${processingId}] Pack not found:`, {
+                    rkey: currentTask.rkey
+                });
+            } else {
+                results.failed.add(currentTask.rkey);
+                logger.error(`[${processingId}] Task failed:`, {
+                    rkey: currentTask.rkey,
+                    error: err.message,
+                    status: err.status
+                });
+            }
+        }
+    }
+
+    return results;
+}
+
+async function resolveAuthority(authority, { processor, processingId }) {
+    if (authority.startsWith('did:')) {
+        try {
+            const profile = await processor.apiHandler.getProfile(authority);
+            return profile.handle;
+        } catch (err) {
+            logger.error(`[${processingId}] Failed to resolve DID ${authority}:`, err);
+            throw new Error(`Cannot resolve DID: ${authority}`);
+        }
+    }
+    return authority;
 }
 
 class TaskManager {
@@ -6959,19 +7151,7 @@ class TaskManager {
                 this.markDirty();
     
                 // Log success with comprehensive state
-                logger.info(`[${processingId}] Successfully added associated pack:`, {
-                    rkey,
-                    from: parentDid,
-                    name,
-                    memberCount,
-                    force,
-                    duration: `${(Date.now() - startTime).toFixed(1)}ms`,
-                    state: {
-                        pending: this.pendingTasks.size,
-                        discovered: this.discoveredPacksMap.size,
-                        completed: this.completedTasks.size
-                    }
-                });
+                logger.info(`[${processingId}] Added pack ${rkey} with ${memberCount} members in ${(Date.now() - startTime).toFixed(1)}ms`);
     
                 return true;
     
@@ -7232,9 +7412,6 @@ class TaskManager {
             }
         
             // Clear caches and internal state
-            if (this.profileCache) {
-                this.profileCache.clear();
-            }
             this.clearInternalState();
 
             // Clear all internal collections
@@ -8178,46 +8355,6 @@ class TaskManager {
         return this.stats;
     }
     
-    // Helper Methods
-    async initializeStats(tasks = []) {
-        this.stats = {
-            byPriority: new Map(),
-            total: this.pendingTasks.size,
-            completed: 0,
-            failed: 0,
-            notFound: 0,
-            apiErrors: 0,
-            current: {
-                priority: null,
-                position: 0
-            }
-        };
-    
-        // Group pending tasks by priority
-        for (const task of this.pendingTasks.values()) {
-            if (!this.stats.byPriority.has(task.priority)) {
-                this.stats.byPriority.set(task.priority, {
-                    total: 0,
-                    completed: 0,
-                    failed: 0
-                });
-            }
-            this.stats.byPriority.get(task.priority).total++;
-        }
-    
-        // Log initial stats
-        logger.info('Task distribution:', {
-            total: this.stats.total,
-            byPriority: Object.fromEntries(
-                Array.from(this.stats.byPriority.entries())
-                    .sort((a, b) => b[0] - a[0])
-                    .map(([priority, stats]) => [priority, stats.total])
-            )
-        });
-    
-        return this.stats;
-    }
-    
     validateTask(task) {
         if (!task.rkey || task.rkey.toString() === '[object Promise]') {
             logger.warn(`Invalid task structure:`, {
@@ -8262,13 +8399,10 @@ class TaskManager {
         await this.markTaskCompleted(task.rkey);
     
         // Log success with metrics
-        logger.info(`[${context.id}] Task completed:`, {
-            rkey: task.rkey,
-            duration: `${((Date.now() - context.startTime) / 1000).toFixed(1)}s`,
-            progress: `${stats.completed}/${stats.total}`,
-            success_rate: `${((stats.completed / (stats.completed + stats.failed)) * 100).toFixed(1)}%`
-        });
-    
+        const percentage = stats.total > 0 
+            ? ((stats.completed / stats.total) * 100).toFixed(1) 
+            : '0.0';
+        logger.info(`Task ${context.id}: ${stats.completed}/${stats.total} done, ${percentage}%`);
         this.markDirty();
     }
     
@@ -8319,22 +8453,8 @@ class TaskManager {
             ? ((stats.completed / totalProcessed) * 100).toFixed(1) 
             : '0.0';
     
-        logger.info('Processing status:', {
-            taskId: context.id,
-            priority: stats.current.priority,
-            position: `${stats.current.position}/${priorityStats.total}`,
-            progress: {
-                current: stats.completed,
-                total: stats.total,
-                percentage: ((stats.completed / stats.total) * 100).toFixed(1)
-            },
-            metrics: {
-                success: `${successRate}%`,
-                notFound: stats.notFound,
-                apiErrors: stats.apiErrors,
-                rateLimit: stats.rateLimit
-            }
-        });
+        logger.info(`[${context.id}] Task ${task.rkey}: ${stats.completed}/${stats.total} done, ${((stats.completed / (stats.completed + stats.failed)) * 100).toFixed(1)}% success`);
+
     }
     
     logTaskCompletion(context, result) {
@@ -8858,12 +8978,7 @@ async function handlePurgeFiles(context) {
 
                         // Log progress every 10k items
                         if ((processedCount + skippedCount) % 10000 === 0) {
-                            logger.info(`${type} processing progress:`, {
-                                processed: processedCount,
-                                skipped: skippedCount,
-                                unique: dataMap.size,
-                                memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
-                            });
+                            logger.info(`${type} progress: ${processedCount}/${dataMap.size} processed, ${skippedCount} skipped`);
                         }
                     } catch (err) {
                         logger.warn(`Error processing ${type} line:`, err);

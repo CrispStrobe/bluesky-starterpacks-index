@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// v031
-// v031: purge files update
+// v032
+// v032: cleaning files (interval purging) fix
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -1641,21 +1641,31 @@ class FileHandler {
     }
 
     async appendPack(packData) {
+        // 1. Validate input
         if (!packData?.rkey || !packData?.updated_at) {
             logger.warn('Invalid pack data:', packData);
             return false;
         }
     
         try {
+            // 2. Ensure state exists
+            if (!this.state?.deleted?.packs) {
+                logger.warn('State not properly initialized');
+                this.state = this.state || {};
+                this.state.deleted = this.state.deleted || {};
+                this.state.deleted.packs = new Map();
+            }
+    
+            // 3. Acquire lock
             await this.acquireLock();
     
-            // Check deletion state first
+            // 4. Check deletion state
             if (this.state.deleted.packs.has(packData.rkey)) {
                 logger.debug(`Skipping deleted pack ${packData.rkey}`);
                 return false;
             }
     
-            // Get existing data - just from entities
+            // 5. Get existing data
             const existing = this.entities.packs.get(packData.rkey);
     
             // Format pack data
@@ -1673,24 +1683,43 @@ class FileHandler {
                 total_joins: packData.total_joins || 0
             };
     
-            // Check if we should write
-            if (existing && this.shouldWritePack(existing, packData)) {
-                this.writeStats.duplicateWrites++;
-                if (this.writeStats.duplicateWrites >= this.PURGE_THRESHOLD) {
-                    await this.cleanFiles();
-                    this.writeStats.duplicateWrites = 0;
-                    this.writeStats.lastPurge = Date.now();
+            // 6. Handle write logic and duplicates
+            let shouldWrite = false;
+            if (existing) {
+                const timeDiff = Date.now() - new Date(existing.updated_at).getTime();
+                if (timeDiff > this.WRITE_INTERVAL) {
+                    // Data is stale, count as duplicate and write
+                    this.writeStats.duplicateWrites++;
+                    shouldWrite = true;
+    
+                    // Check if we need to purge
+                    if (this.writeStats.duplicateWrites >= this.PURGE_THRESHOLD) {
+                        logger.info('Duplicate threshold reached, starting file purge...');
+                        try {
+                            await this.cleanFiles();
+                            this.writeStats.duplicateWrites = 0;
+                            this.writeStats.lastPurge = Date.now();
+                            logger.info('File purge completed successfully');
+                        } catch (purgeErr) {
+                            logger.error('File purge failed:', purgeErr);
+                            // Continue with write operation even if purge fails
+                        }
+                    }
                 }
-                await this.writeToFiles(formattedPack, 'packs');
-                metrics.recordFileOperation('write', 0, true);
-            } else if (!existing) {
-                // New pack - write directly
-                await this.writeToFiles(formattedPack, 'packs');
-                metrics.recordFileOperation('write', 0, true);
+            } else {
+                // New pack, write directly
+                shouldWrite = true;
             }
     
-            // Always update in-memory data
+            // 7. Update in-memory data
             this.entities.packs.set(packData.rkey, formattedPack);
+    
+            // 8. Write to files if needed
+            if (shouldWrite) {
+                await this.writeToFiles(formattedPack, 'packs');
+                metrics.recordFileOperation('write', 0, true);
+                this.writeStats.totalWrites++;
+            }
     
             return true;
     
@@ -1699,6 +1728,7 @@ class FileHandler {
             metrics.recordFileOperation('write', 0, false);
             throw err;
         } finally {
+            // 9. Always release lock
             this.releaseLock();
         }
     }
@@ -1901,20 +1931,20 @@ class FileHandler {
     }
 
     async cleanFiles() {
-        logger.debug('Starting file cleanup...');
+        logger.info('Starting file cleanup...');
         
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         
         try {
-            // Create backups first
+            // 1. Create backups first
             await fs.copyFile(FILE_PATHS.users, `${FILE_PATHS.users}.${timestamp}.bak`);
             await fs.copyFile(FILE_PATHS.packs, `${FILE_PATHS.packs}.${timestamp}.bak`);
             
-            // Write temp files excluding deleted entities
+            // 2. Write temp files
             const tmpUsers = `${FILE_PATHS.users}.tmp`;
             const tmpPacks = `${FILE_PATHS.packs}.tmp`;
             
-            // Filter and write users
+            // 3. Write unique, non-deleted entries to temp files
             await fs.writeFile(tmpUsers, 
                 Array.from(this.entities.users.values())
                     .filter(u => !this.state.deleted.users.has(u.did))
@@ -1922,7 +1952,6 @@ class FileHandler {
                     .join('\n') + '\n'
             );
     
-            // Filter and write packs
             await fs.writeFile(tmpPacks,
                 Array.from(this.entities.packs.values())
                     .filter(p => !this.state.deleted.packs.has(p.rkey))
@@ -1930,17 +1959,20 @@ class FileHandler {
                     .join('\n') + '\n'
             );
     
-            // Atomic rename
+            // 4. Atomic rename
             await fs.rename(tmpUsers, FILE_PATHS.users);
             await fs.rename(tmpPacks, FILE_PATHS.packs);
     
-            // Update YAML backups
+            // 5. Update YAML backups
             await this.writeYamlBackups(
                 Array.from(this.entities.users.values()).filter(u => !this.state.deleted.users.has(u.did)),
                 Array.from(this.entities.packs.values()).filter(p => !this.state.deleted.packs.has(p.rkey))
             );
     
-            logger.info('File cleanup completed');
+            // 6. Clean old backups
+            await this.cleanupBackups();
+    
+            logger.info('File cleanup completed successfully');
         } catch (err) {
             logger.error('Error during file cleanup:', err);
             throw err;

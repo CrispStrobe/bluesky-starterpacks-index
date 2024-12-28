@@ -1104,6 +1104,9 @@ class FileHandler {
         this.MAX_USERS = 20000000;       // 20M users max
         this.MAX_PACKS = 200000;         // 200K packs max
 
+        // Add constants
+        BACKUP_RETENTION = 2;  // Number of backup files to keep
+
         // Write lock handling - properly initialize
         this.writeLock = false;
         this.writeQueue = [];  // Initialize the queue
@@ -1979,23 +1982,44 @@ class FileHandler {
         }
     }
 
-    async cleanupBackups(retainDays = 7) {
+    async cleanupBackups(retainCount = 2) {
         const backupFiles = await fs.readdir('.');
-        const now = Date.now();
         
+        // Group backups by base filename
+        const backupGroups = new Map();
         for (const file of backupFiles) {
             if (file.endsWith('.bak')) {
-                try {
-                    const stats = await fs.stat(file);
-                    const ageInDays = (now - stats.mtimeMs) / (1000 * 60 * 60 * 24);
-                    
-                    if (ageInDays > retainDays) {
-                        await fs.unlink(file);
-                        logger.debug(`Removed old backup file: ${file}`);
-                    }
-                } catch (err) {
-                    logger.warn(`Error processing backup file ${file}:`, err);
+                const baseName = file.split('.').slice(0, -2).join('.');  // Remove timestamp and .bak
+                if (!backupGroups.has(baseName)) {
+                    backupGroups.set(baseName, []);
                 }
+                backupGroups.get(baseName).push(file);
+            }
+        }
+    
+        // For each group, keep only most recent N backups
+        for (const [baseName, files] of backupGroups) {
+            try {
+                // Sort by mtime, newest first
+                const sortedFiles = await Promise.all(
+                    files.map(async file => ({
+                        name: file,
+                        mtime: (await fs.stat(file)).mtimeMs
+                    }))
+                );
+                sortedFiles.sort((a, b) => b.mtime - a.mtime);
+    
+                // Remove older backups
+                for (const file of sortedFiles.slice(retainCount)) {
+                    try {
+                        await fs.unlink(file.name);
+                        logger.debug(`Removed old backup file: ${file.name}`);
+                    } catch (err) {
+                        logger.warn(`Error removing backup ${file.name}:`, err);
+                    }
+                }
+            } catch (err) {
+                logger.warn(`Error processing backup group ${baseName}:`, err);
             }
         }
     }
@@ -2176,14 +2200,73 @@ class ApiHandler {
     }
 
     async handleApiError(err, context) {
+        if (!err.status || !context) return;
+
         if (err.status === 404) {
-            if (context.type === 'profile') {
-                await this.markProfileDeleted(context.did, 'not_found');
-                return false;
-            } else if (context.type === 'pack') {
+            if (context.type === 'profile' && context.did) {
+                // For profiles, verify thoroughly before marking deleted
+                const isDeleted = await this.verifyProfileDeletion(context.did);
+                if (isDeleted) {
+                    await this.dbManager.markProfileDeleted(context.did, 'not_found_on_bsky');
+                    return false;
+                }
+            } else if (context.type === 'pack' && context.rkey) {
                 await this.markPackDeleted(context.rkey, 'not_found');
                 return false;
             }
+        }
+    }
+
+    async verifyProfileDeletion(did) {
+        if (!did) return false;
+        const processingId = `verify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+        try {
+            logger.debug(`[${processingId}] Verifying profile deletion: ${did}`);
+
+            // Try multiple verification methods
+            const attempts = [
+                // Public API
+                this.makePublicApiCall('app.bsky.actor.getProfile', { actor: did }),
+                // Auth API
+                this.makeAuthApiCall('app.bsky.actor.getProfile', { actor: did }),
+                // Handle resolution if available
+                this.fileHandler.getUserByDid(did).then(async user => {
+                    if (!user?.handle) return Promise.reject(new Error('No handle'));
+                    return this.resolveHandle(user.handle);
+                })
+            ];
+
+            // Initial delay to avoid temporary issues
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Run all attempts
+            const results = await Promise.allSettled(attempts);
+            
+            // Check results - must all be 404s
+            const isDeleted = results.every(result => 
+                result.status === 'rejected' && 
+                (result.reason?.status === 404 || result.reason?.message?.includes('not found'))
+            );
+
+            logger.debug(`[${processingId}] Deletion verification result:`, {
+                did,
+                isDeleted,
+                attemptResults: results.map(r => ({
+                    status: r.status,
+                    error: r.reason?.status || r.reason?.message
+                }))
+            });
+
+            return isDeleted;
+
+        } catch (err) {
+            logger.warn(`[${processingId}] Error verifying deletion:`, {
+                did,
+                error: err.message,
+                stack: err.stack
+            });
+            return false; // Never mark as deleted if verification fails
         }
     }
 
@@ -3212,6 +3295,65 @@ class DatabaseManager {
         }
     }
 
+    // In DatabaseManager
+    async markProfileDeleted(did, reason) {
+        if (reason !== 'not_found_on_bsky') {
+            logger.warn(`Invalid deletion reason for ${did}: ${reason}`);
+            return;
+        }
+
+        const timestamp = new Date();
+        const session = await this.client.startSession();
+
+        try {
+            await session.withTransaction(async () => {
+                await this.db.collection('users').updateOne(
+                    { did },
+                    {
+                        $set: {
+                            deleted: true,
+                            deleted_at: timestamp,
+                            deletion_reason: reason,
+                            deletion_verification: {
+                                timestamp,
+                                method: 'api_verification',
+                                verifiedBy: process.env.BSKY_USERNAME
+                            }
+                        }
+                    },
+                    { session }
+                );
+
+                await this.db.collection('starter_packs').updateMany(
+                    { creator_did: did },
+                    {
+                        $set: {
+                            creator_status: 'deleted',
+                            creator_status_updated: timestamp
+                        }
+                    },
+                    { session }
+                );
+
+                this.fileHandler.state.deleted.users.set(did, {
+                    timestamp,
+                    reason
+                });
+            });
+
+            logger.info(`Marked profile ${did} as deleted (${reason})`);
+
+        } catch (err) {
+            logger.error(`Failed to mark profile ${did} as deleted:`, {
+                error: err.message,
+                stack: err.stack
+            });
+            throw err;
+        } finally {
+            await session.endSession();
+        }
+    }
+
     async connect(maxRetries = 2) {
         logger.debug('connect');
         for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -4225,93 +4367,80 @@ class DatabaseManager {
         
         const processingId = `cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const timestamp = new Date();
-        
-        logger.debug(`[${processingId}] Starting cleanup for ${removedDids.length} users in pack ${rkey}`);
-    
         const results = {
             processed: 0,
             verified: 0,
             skipped: 0,
             errors: 0,
-            markedDeleted: 0
+            updated: 0
         };
-    
+
         try {
-            // 1. First get current state of all affected users
-            const users = await this.db.collection('users')
-                .find(
-                    { 
-                        did: { $in: removedDids },
-                        deleted: { $ne: true }
-                    },
-                    { 
-                        projection: { 
-                            did: 1, 
-                            pack_ids: 1,
-                            handle: 1,
-                            last_updated: 1
-                        }
+            // Get current active users
+            const users = await this.db.collection('users').find(
+                { 
+                    did: { $in: removedDids },
+                    deleted: { $ne: true }
+                },
+                { 
+                    projection: { 
+                        did: 1, 
+                        pack_ids: 1,
+                        handle: 1,
+                        last_updated: 1
                     }
-                ).toArray();
-    
-            logger.debug(`[${processingId}] Found ${users.length} active users to process`);
-    
-            // 2. Process in smaller batches to avoid overwhelming API
+                }
+            ).toArray();
+
+            logger.debug(`[${processingId}] Processing ${users.length} users from pack ${rkey}`);
+
+            // Process in batches
             const BATCH_SIZE = 10;
             for (let i = 0; i < users.length; i += BATCH_SIZE) {
                 const batch = users.slice(i, i + BATCH_SIZE);
                 
-                // Process batch with retries
-                const batchResults = await Promise.all(batch.map(async (user) => {
+                const verifiedRemovals = await Promise.all(batch.map(async (user) => {
                     try {
                         results.processed++;
-    
-                        // Double-check if user still exists and verify membership
+
+                        // Verify membership status
                         const membershipCheck = await this.fileHandler.validatePackMembership(
                             user.did, 
                             rkey, 
                             { maxRetries: 3 }
                         );
-    
-                        // If we can't verify, skip to be safe
+
                         if (membershipCheck === null) {
-                            logger.warn(`[${processingId}] Could not verify membership for ${user.did}, skipping`);
                             results.skipped++;
                             return null;
                         }
-    
-                        // Only remove if we confirm they're not a member
+
                         if (membershipCheck === false) {
                             results.verified++;
                             return user.did;
                         }
-    
-                        // They're still a member - skip
+
                         results.skipped++;
                         return null;
-    
+
                     } catch (err) {
-                        logger.error(`[${processingId}] Error processing user ${user.did}:`, {
-                            error: err.message,
-                            code: err.code
+                        logger.error(`[${processingId}] User processing error:`, {
+                            did: user.did,
+                            error: err.message
                         });
                         results.errors++;
                         return null;
                     }
                 }));
-    
-                // Filter out nulls and update verified non-members
-                const verifiedRemovals = batchResults.filter(Boolean);
-                if (verifiedRemovals.length > 0) {
-                    // Update in MongoDB with optimistic concurrency
-                    const userOperations = verifiedRemovals.map(did => ({
-                        updateOne: {
-                            filter: {
-                                did: did,  // Make sure did is string
-                                deleted: { $ne: true },
-                                pack_ids: rkey  // Make sure rkey is string
-                            },
-                            update: {
+
+                // Update verified removals
+                const validRemovals = verifiedRemovals.filter(Boolean);
+                if (validRemovals.length > 0) {
+                    const session = await this.client.startSession();
+                    try {
+                        await session.withTransaction(async () => {
+                            // Remove pack from user's pack_ids
+                            const updateOp = {
                                 $pull: { pack_ids: rkey },
                                 $set: { 
                                     last_updated: timestamp,
@@ -4321,66 +4450,40 @@ class DatabaseManager {
                                         verified: true
                                     }
                                 }
-                            }
-                        }
-                    }));
-                
-                    await this.safeBulkWrite('users', userOperations, session);
-    
-                    // Check for empty packs with proper operation structure
-                    const emptyPacksOperations = verifiedRemovals.map(did => ({
-                        updateOne: {
-                            filter: {  // Must be explicit object
-                                did: did,
-                                deleted: { $ne: true },
-                                $or: [
-                                    { pack_ids: { $size: 0 } },
-                                    { pack_ids: { $exists: false } }
-                                ]
-                            },
-                            update: {
-                                $set: {
-                                    deleted: true,
-                                    deleted_at: timestamp,
-                                    deletion_reason: 'no_remaining_packs',
-                                    'deletion_metadata.last_pack': rkey,
-                                    'deletion_metadata.verification_id': processingId
-                                }
-                            }
-                        }
-                    }));
+                            };
 
-                    await this.safeBulkWrite('users', emptyPacksOperations);
-    
-                    results.markedDeleted += emptyPacksResult.modifiedCount;
+                            await this.safeBulkWrite('users', 
+                                validRemovals.map(did => ({
+                                    updateOne: {
+                                        filter: { 
+                                            did,
+                                            deleted: { $ne: true },
+                                            pack_ids: rkey
+                                        },
+                                        update: updateOp
+                                    }
+                                })),
+                                { session }
+                            );
+
+                            results.updated += validRemovals.length;
+                        });
+                    } finally {
+                        await session.endSession();
+                    }
                 }
-    
-                // Log batch progress
-                logger.debug(`[${processingId}] Batch progress:`, {
-                    processed: results.processed,
-                    verified: results.verified,
-                    skipped: results.skipped,
-                    errors: results.errors,
-                    markedDeleted: results.markedDeleted,
-                    remaining: users.length - (i + BATCH_SIZE)
-                });
-    
-                // Small delay between batches
+
                 if (i + BATCH_SIZE < users.length) {
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             }
-    
-            // Log final results
-            logger.info(`Pack ${rkey} cleanup: ${results.verified}/${results.processed} verified`);
 
-    
+            logger.info(`[${processingId}] Cleanup completed:`, results);
             return results;
-    
+
         } catch (err) {
-            logger.error(`[${processingId}] Fatal error during cleanup:`, {
+            logger.error(`[${processingId}] Cleanup failed:`, {
                 error: err.message,
-                code: err.code,
                 stack: err.stack,
                 results
             });
@@ -5131,57 +5234,85 @@ class MainProcessor {
     }
 
     async markProfileMissing(did, reason) {
-        if (!this.missingProfiles) {
-            this.missingProfiles = new Set();
+        // Input validation
+        if (!did || !reason) {
+            logger.warn('Invalid parameters for markProfileMissing');
+            return;
         }
-        this.missingProfiles.add(did);
-        logger.warn(`Marked profile as missing: ${did} (${reason})`);
-    }
 
-    async markProfileDeleted(did, reason) {
-        const timestamp = new Date();
-        
         try {
-            // 1. Mark profile as deleted in MongoDB
-            await this.dbManager.safeWrite('users', {
-                filter: { did },
-                update: {
-                    $set: {
-                        deleted: true,
-                        deleted_at: timestamp,
-                        deletion_reason: reason
+            // Get or initialize failure tracking
+            const failure = this.fileHandler.state.failures.get(did) || {
+                type: 'profile_missing',
+                attempts: 0,
+                firstSeen: new Date().toISOString()
+            };
+
+            // Update attempt info
+            failure.attempts++;
+            failure.lastAttempt = new Date().toISOString();
+            failure.reason = reason;
+
+            // Store updated failure state
+            this.fileHandler.state.failures.set(did, failure);
+
+            // Log the missing status
+            logger.warn(`Profile missing: ${did} (${reason}) - attempt ${failure.attempts}`);
+
+            // After multiple attempts, verify if actually deleted
+            if (failure.attempts >= 3) {
+                const hoursSinceFirst = (Date.now() - new Date(failure.firstSeen).getTime()) / (1000 * 60 * 60);
+                if (hoursSinceFirst >= 24) { // Only verify if missing for at least 24h
+                    const isDeleted = await this.verifyProfileDeletion(did);
+                    if (isDeleted) {
+                        await this.fileHandler.markDeleted(did, 'user', 'not_found_on_bsky');
+                        this.fileHandler.state.failures.delete(did);
+                        logger.info(`Confirmed deletion for profile: ${did}`);
                     }
                 }
-            });
-    
-            // 2. Find and mark their packs as deleted
-            const createdPacks = await this.dbManager.db.collection('starter_packs')
-                .find({ creator_did: did })
-                .project({ rkey: 1 })
-                .toArray();
-    
-            for (const pack of createdPacks) {
-                await this.markPackDeleted(pack.rkey, 'creator_deleted');
             }
-    
-            // 3. Update internal state
-            this.deletedProfiles.set(did, { timestamp, reason });
-            this.permanentFailures.set(did, { 
-                type: 'profile', 
-                timestamp, 
-                reason 
-            });
-            
-            // Remove from known users set
-            this.knownUsers.delete(did);
-            
-            logger.info(`Deleted profile ${did}, affecting ${createdPacks.length} packs`);
 
-    
         } catch (err) {
-            logger.error(`Failed to mark profile ${did} as deleted:`, err);
-            throw err;
+            logger.error(`Error in markProfileMissing for ${did}:`, err);
+            // Don't throw - this is a non-critical operation
         }
+    }
+
+    // Add a recovery method
+    async recoverIncorrectlyDeletedProfiles() {
+        const deletedUsers = await this.db.collection('users')
+            .find({ 
+                deleted: true,
+                deletion_reason: { $ne: 'not_found_on_bsky' }
+            })
+            .toArray();
+
+        let recovered = 0;
+        for (const user of deletedUsers) {
+            try {
+                // Remove deletion marking
+                await this.db.collection('users').updateOne(
+                    { did: user.did },
+                    {
+                        $unset: {
+                            deleted: "",
+                            deleted_at: "",
+                            deletion_reason: "",
+                            deletion_verification: ""
+                        },
+                        $set: {
+                            last_updated: new Date().toISOString()
+                        }
+                    }
+                );
+                recovered++;
+                logger.info(`Recovered profile ${user.did}`);
+            } catch (err) {
+                logger.error(`Failed to recover profile ${user.did}:`, err);
+            }
+        }
+
+        return recovered;
     }
 
     async refreshSession() {
@@ -6811,6 +6942,110 @@ function validateEnv(args) {
     }
 }
 
+async function fixIncorrectlyDeletedProfiles(mongoClient) {
+    const db = mongoClient.db('starterpacks');
+    const stats = {
+        found: 0,
+        restored: 0,
+        failed: 0,
+        skipped: 0
+    };
+
+    try {
+        // Initialize FileHandler
+        const fileHandler = new FileHandler();
+        await fileHandler.init();
+
+        // Find profiles to restore
+        const incorrectlyDeleted = await db.collection('users').find({
+            deleted: true,
+            deletion_reason: { $ne: 'not_found_on_bsky' }
+        }).toArray();
+
+        stats.found = incorrectlyDeleted.length;
+        logger.info(`Found ${stats.found} incorrectly deleted profiles`);
+
+        // Process in batches for better memory management
+        const BATCH_SIZE = 100;
+        for (let i = 0; i < incorrectlyDeleted.length; i += BATCH_SIZE) {
+            const batch = incorrectlyDeleted.slice(i, Math.min(i + BATCH_SIZE, incorrectlyDeleted.length));
+            
+            // Process batch with transaction
+            const session = await mongoClient.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    for (const user of batch) {
+                        try {
+                            // 1. Update MongoDB
+                            await db.collection('users').updateOne(
+                                { did: user.did },
+                                {
+                                    $unset: {
+                                        deleted: "",
+                                        deleted_at: "",
+                                        deletion_reason: "",
+                                        deletion_verification: ""
+                                    },
+                                    $set: {
+                                        last_updated: new Date().toISOString(),
+                                        restored_from_incorrect_deletion: {
+                                            timestamp: new Date().toISOString(),
+                                            previous_reason: user.deletion_reason
+                                        }
+                                    }
+                                },
+                                { session }
+                            );
+
+                            // 2. Update FileHandler state
+                            fileHandler.state.deleted.users.delete(user.did);
+
+                            // 3. Update file storage
+                            await fileHandler.appendUser({
+                                ...user,
+                                deleted: false,
+                                last_updated: new Date().toISOString()
+                            });
+
+                            stats.restored++;
+                            logger.info(`Restored profile ${user.did} (reason: ${user.deletion_reason})`);
+
+                        } catch (err) {
+                            stats.failed++;
+                            logger.error(`Failed to restore ${user.did}:`, err);
+                        }
+                    }
+                });
+
+            } catch (err) {
+                logger.error(`Batch transaction failed:`, err);
+                stats.failed += batch.length;
+            } finally {
+                await session.endSession();
+            }
+
+            // Progress update
+            logger.info(`Progress: ${i + batch.length}/${incorrectlyDeleted.length} processed`);
+        }
+
+        await fileHandler.cleanup();
+
+        // Final stats
+        logger.info('Restoration complete:', {
+            total: stats.found,
+            restored: stats.restored,
+            failed: stats.failed,
+            skipped: stats.skipped
+        });
+
+        return stats;
+
+    } catch (err) {
+        logger.error('Fatal error in fixIncorrectlyDeletedProfiles:', err);
+        throw err;
+    }
+}
+
 async function handleShutdown(signal, currentProcessor = null) {
     logger.info(`\nReceived ${signal}. Starting graceful shutdown...`);
     
@@ -7267,7 +7502,7 @@ async function quickProcessUser(identifier, options = {}) {
                         logger.info(`Found DID ${did} via historical handle ${identifier}`);
                     } else {
                         // Mark as deleted and record
-                        await processor.taskManager.markProfileDeleted(identifier, 'not_found');
+                        await processor.dbManager.markProfileDeleted(identifier, 'not_found');
                         stats.deleted++;
                         return { success: false, reason: 'profile_not_found' };
                     }
@@ -7298,7 +7533,7 @@ async function quickProcessUser(identifier, options = {}) {
         const profile = await processor.apiHandler.getProfile(did)
             .catch(async (err) => {
                 if (err.status === 404) {
-                    await processor.taskManager.markProfileDeleted(did, 'not_found');
+                    await processor.dbManager.markProfileDeleted(did, 'not_found');
                     stats.deleted++;
                     return null;
                 }
@@ -10247,7 +10482,8 @@ function parseArgs() {
         cleanpackids: args.includes('--cleanpackids'),
         updateAll: args.includes('--updateall'),
         listsOnly: args.includes('--lists'),  // process only lists
-        includeAssociatedLists: args.includes('--includeassociatedlists')
+        includeAssociatedLists: args.includes('--includeassociatedlists'),
+        fixDeletions: args.includes('--fixdeletions'),
     };
 }
 
@@ -10265,6 +10501,21 @@ async function main() {
         metrics.recordStartup();
 
         // 1. Handle standalone modes first (no processor needed)
+
+        if (args.fixDeletions) {
+            logger.info('Starting deletion fixes...');
+            // Need MongoDB connection for this
+            const mongoClient = new MongoClient(process.env.MONGODB_URI, DB_CONFIG);
+            try {
+                await mongoClient.connect();
+                const restored = await fixIncorrectlyDeletedProfiles(mongoClient);
+                logger.info(`Deletion fix complete: restored ${restored} profiles`);
+                return;
+            } finally {
+                await mongoClient.close();
+            }
+        }
+
         if (args.purgefiles) {
             await handlePurgeFiles({
                 debug: args.debug,

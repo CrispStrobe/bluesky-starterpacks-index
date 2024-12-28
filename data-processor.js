@@ -1104,9 +1104,6 @@ class FileHandler {
         this.MAX_USERS = 20000000;       // 20M users max
         this.MAX_PACKS = 200000;         // 200K packs max
 
-        // Add constants
-        BACKUP_RETENTION = 2;  // Number of backup files to keep
-
         // Write lock handling - properly initialize
         this.writeLock = false;
         this.writeQueue = [];  // Initialize the queue

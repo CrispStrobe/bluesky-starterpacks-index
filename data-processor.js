@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// v032
-// v032: cleaning files (interval purging) fix
+// v033
+// v033: fix writeYamlBackups, fileFormats, fixdeletions, transactions
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -1104,6 +1104,9 @@ class FileHandler {
         this.MAX_USERS = 20000000;       // 20M users max
         this.MAX_PACKS = 200000;         // 200K packs max
 
+        // File formats tracking
+        this.fileFormats = new Map();
+
         // Write lock handling - properly initialize
         this.writeLock = false;
         this.writeQueue = [];  // Initialize the queue
@@ -1928,6 +1931,20 @@ class FileHandler {
             logger.error('Error during file handler cleanup:', err);
             throw err;
         }
+    }
+
+    async writeYamlBackups(users, packs) {
+        // Write users YAML
+        const usersYaml = users.map(user => 
+            '---\n' + yaml.dump(user)
+        ).join('\n');
+        await fs.writeFile(FILE_PATHS.usersBackup, usersYaml);
+
+        // Write packs YAML
+        const packsYaml = packs.map(pack => 
+            '---\n' + yaml.dump(pack)
+        ).join('\n');
+        await fs.writeFile(FILE_PATHS.packsBackup, packsYaml);
     }
 
     async cleanFiles() {
@@ -6945,15 +6962,14 @@ async function fixIncorrectlyDeletedProfiles(mongoClient) {
         found: 0,
         restored: 0,
         failed: 0,
-        skipped: 0
+        skipped: 0,
+        invalid: 0
     };
 
     try {
-        // Initialize FileHandler
         const fileHandler = new FileHandler();
         await fileHandler.init();
 
-        // Find profiles to restore
         const incorrectlyDeleted = await db.collection('users').find({
             deleted: true,
             deletion_reason: { $ne: 'not_found_on_bsky' }
@@ -6962,83 +6978,104 @@ async function fixIncorrectlyDeletedProfiles(mongoClient) {
         stats.found = incorrectlyDeleted.length;
         logger.info(`Found ${stats.found} incorrectly deleted profiles`);
 
-        // Process in batches for better memory management
         const BATCH_SIZE = 100;
         for (let i = 0; i < incorrectlyDeleted.length; i += BATCH_SIZE) {
             const batch = incorrectlyDeleted.slice(i, Math.min(i + BATCH_SIZE, incorrectlyDeleted.length));
             
-            // Process batch with transaction
-            const session = await mongoClient.startSession();
-            try {
-                await session.withTransaction(async () => {
-                    for (const user of batch) {
-                        try {
-                            // 1. Update MongoDB
-                            await db.collection('users').updateOne(
-                                { did: user.did },
-                                {
-                                    $unset: {
-                                        deleted: "",
-                                        deleted_at: "",
-                                        deletion_reason: "",
-                                        deletion_verification: ""
-                                    },
-                                    $set: {
-                                        last_updated: new Date().toISOString(),
-                                        restored_from_incorrect_deletion: {
-                                            timestamp: new Date().toISOString(),
-                                            previous_reason: user.deletion_reason
-                                        }
-                                    }
-                                },
-                                { session }
-                            );
+            for (const user of batch) {
+                // Validate user data
+                if (!user.did || typeof user.did !== 'string') {
+                    logger.warn(`Invalid user data - missing or invalid DID:`, user);
+                    stats.invalid++;
+                    continue;
+                }
 
-                            // 2. Update FileHandler state
-                            fileHandler.state.deleted.users.delete(user.did);
+                try {
+                    // Get full user data first
+                    const fullUser = await db.collection('users').findOne(
+                        { did: user.did },
+                        { projection: { _id: 0 } }  // Exclude _id field
+                    );
 
-                            // 3. Update file storage
-                            await fileHandler.appendUser({
-                                ...user,
-                                deleted: false,
-                                last_updated: new Date().toISOString()
-                            });
-
-                            stats.restored++;
-                            logger.info(`Restored profile ${user.did} (reason: ${user.deletion_reason})`);
-
-                        } catch (err) {
-                            stats.failed++;
-                            logger.error(`Failed to restore ${user.did}:`, err);
-                        }
+                    if (!fullUser) {
+                        logger.warn(`User ${user.did} not found in database`);
+                        stats.failed++;
+                        continue;
                     }
-                });
 
-            } catch (err) {
-                logger.error(`Batch transaction failed:`, err);
-                stats.failed += batch.length;
-            } finally {
-                await session.endSession();
+                    // Update MongoDB
+                    await db.collection('users').updateOne(
+                        { did: user.did },
+                        {
+                            $unset: {
+                                deleted: "",
+                                deleted_at: "",
+                                deletion_reason: "",
+                                deletion_verification: ""
+                            },
+                            $set: {
+                                last_updated: new Date().toISOString(),
+                                restored_from_incorrect_deletion: {
+                                    timestamp: new Date().toISOString(),
+                                    previous_reason: user.deletion_reason
+                                }
+                            }
+                        }
+                    );
+
+                    // Update FileHandler state
+                    fileHandler.state.deleted.users.delete(user.did);
+
+                    // Update file storage with validated data
+                    await fileHandler.appendUser({
+                        ...fullUser,
+                        deleted: false,
+                        last_updated: new Date().toISOString()
+                    });
+
+                    stats.restored++;
+                    logger.info(`Restored profile ${user.did} (previous reason: ${user.deletion_reason})`);
+
+                } catch (err) {
+                    stats.failed++;
+                    logger.error(`Failed to restore ${user.did}:`, {
+                        error: err.message,
+                        stack: err.stack
+                    });
+                }
             }
 
-            // Progress update
-            logger.info(`Progress: ${i + batch.length}/${incorrectlyDeleted.length} processed`);
+            logger.info(`Progress: ${i + batch.length}/${incorrectlyDeleted.length} processed`, {
+                restored: stats.restored,
+                failed: stats.failed,
+                invalid: stats.invalid
+            });
         }
 
-        await fileHandler.cleanup();
+        // Skip cleanup if no successful restorations
+        if (stats.restored > 0) {
+            logger.info('Performing file cleanup...');
+            await fileHandler.cleanup();
+        } else {
+            logger.info('Skipping cleanup as no profiles were restored');
+        }
 
-        // Final stats
         logger.info('Restoration complete:', {
             total: stats.found,
             restored: stats.restored,
             failed: stats.failed,
-            skipped: stats.skipped
+            skipped: stats.skipped,
+            invalid: stats.invalid
         });
 
-        return stats;
+        return stats.restored; // Return just the number
 
     } catch (err) {
-        logger.error('Fatal error in fixIncorrectlyDeletedProfiles:', err);
+        logger.error('Fatal error in fixIncorrectlyDeletedProfiles:', {
+            error: err.message,
+            stack: err.stack,
+            stats
+        });
         throw err;
     }
 }
@@ -10501,12 +10538,11 @@ async function main() {
 
         if (args.fixDeletions) {
             logger.info('Starting deletion fixes...');
-            // Need MongoDB connection for this
             const mongoClient = new MongoClient(process.env.MONGODB_URI, DB_CONFIG);
             try {
                 await mongoClient.connect();
-                const restored = await fixIncorrectlyDeletedProfiles(mongoClient);
-                logger.info(`Deletion fix complete: restored ${restored} profiles`);
+                const restoredCount = await fixIncorrectlyDeletedProfiles(mongoClient);
+                logger.info(`Deletion fix complete: restored ${restoredCount} profiles`);
                 return;
             } finally {
                 await mongoClient.close();

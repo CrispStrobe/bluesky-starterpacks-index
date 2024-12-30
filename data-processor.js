@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// v033
-// v033: fix writeYamlBackups, fileFormats, fixdeletions, transactions
+// v034
+// v034: +search profiles per mentions in posts
 import * as dotenv from 'dotenv';
 import { BskyAgent } from '@atproto/api';
 import { MongoClient } from 'mongodb';
@@ -1410,25 +1410,56 @@ class FileHandler {
     }
 
     async getUserByHistoricalHandle(handle) {
+        // Guard against uninitialized state
+        if (!this.entities?.users) {
+            logger.debug(`FileHandler.entities.users not initialized when checking handle ${handle}`);
+            // Instead of returning null immediately, try MongoDB if available
+            if (!this.noMongoDB && this.dbManager) {
+                const mongoUser = await this.dbManager.db.collection('users').findOne({
+                    $or: [
+                        { handle: handle.toLowerCase().trim() },
+                        { 'handle_history.oldHandle': handle.toLowerCase().trim() }
+                    ]
+                });
+                if (mongoUser?.did) {
+                    return this.getUser(mongoUser.did);
+                }
+            }
+            return null;
+        }
+    
         const sanitizedHandle = handle.toLowerCase().trim();
         
         // Check current handles first
         for (const [did, userData] of this.entities.users) {
-            if (userData.handle.toLowerCase() === sanitizedHandle) {
+            if (userData?.handle?.toLowerCase() === sanitizedHandle) {
                 return this.getUser(did);
             }
         }
-
+        
         // Check handle history
         for (const [did, userData] of this.entities.users) {
-            const fullData = this.userCache.get(did) || userData;
-            if (fullData.handle_history?.some(entry => 
-                entry.oldHandle.toLowerCase() === sanitizedHandle
+            const fullData = this.userCache?.get(did) || userData;
+            if (fullData?.handle_history?.some(entry =>
+                entry.oldHandle?.toLowerCase() === sanitizedHandle
             )) {
                 return this.getUser(did);
             }
         }
-
+    
+        // If not found and MongoDB enabled, check there
+        if (!this.noMongoDB && this.dbManager) {
+            const mongoUser = await this.dbManager.db.collection('users').findOne({
+                $or: [
+                    { handle: sanitizedHandle },
+                    { 'handle_history.oldHandle': sanitizedHandle }
+                ]
+            });
+            if (mongoUser?.did) {
+                return this.getUser(mongoUser.did);
+            }
+        }
+    
         return null;
     }
 
@@ -2214,30 +2245,122 @@ class ApiHandler {
     }
 
     async handleApiError(err, context) {
-        if (!err.status || !context) return;
-
-        if (err.status === 404) {
+        // Check for both 404 and handle-not-found 400s
+        if (err.status === 404 || 
+            (err.status === 400 && (
+                err.message?.includes('resolve handle') ||
+                err.message?.includes('Unable to resolve') ||
+                err.message?.includes('Profile not found')
+            ))) {
             if (context.type === 'profile' && context.did) {
-                // For profiles, verify thoroughly before marking deleted
-                const isDeleted = await this.verifyProfileDeletion(context.did);
-                if (isDeleted) {
-                    await this.dbManager.markProfileDeleted(context.did, 'not_found_on_bsky');
-                    return false;
+                await this.markProfileMissing(context.did, `api_${err.status}: ${err.message}`);
+                const failure = this.fileHandler.state.failures.get(context.did);
+                if (failure?.attempts >= 3) {
+                    const isDeleted = await this.verifyProfileDeletion(context.did);
+                    if (isDeleted) {
+                        await this.dbManager.markProfileDeleted(context.did, 'not_found_on_bsky');
+                        return false;
+                    }
                 }
-            } else if (context.type === 'pack' && context.rkey) {
-                await this.markPackDeleted(context.rkey, 'not_found');
                 return false;
             }
         }
     }
 
+    async findUserByPostSearch(handle) {
+        try {
+            // Search for posts mentioning the handle
+            const searchResult = await this.makePublicApiCall(
+                'app.bsky.feed.searchPosts',
+                { 
+                    q: `${handle}`, 
+                    limit: 25  // Keep reasonable for performance
+                }
+            );
+    
+            logger.debug("Found these posts mentioning the user:", JSON.stringify(searchResult, null, 2));
+    
+            if (!searchResult?.posts?.length) return null;
+    
+            // Normalize the handle for case-insensitive comparison
+            const normalizedHandle = handle.toLowerCase();
+    
+            // Initialize a Set to track processed DIDs
+            const processedDids = new Set();
+    
+            // Iterate through each post
+            for (const post of searchResult.posts) {
+                // Ensure the post has a record and facets
+                if (post.record?.facets?.length) {
+                    // Iterate through each facet in the post
+                    for (const facet of post.record.facets) {
+                        // Check if the facet is a mention type
+                        if (facet.features?.[0]?.$type === 'app.bsky.richtext.facet#mention') {
+                            const mentionDid = facet.features[0].did;
+    
+                            // Skip if this DID has already been processed
+                            if (processedDids.has(mentionDid)) {
+                                logger.debug(`Already processed DID: ${mentionDid}, skipping.`);
+                                continue;
+                            }
+    
+                            // Mark this DID as processed
+                            processedDids.add(mentionDid);
+                            logger.debug(`Processing mention DID: ${mentionDid}`);
+    
+                            try {
+                                // Fetch the profile using the DID from the mention
+                                const profile = await this.getProfile(mentionDid);
+
+                                logger.debug("Found this profile", profile);
+                                
+                                logger.info(`Found profile ${handle} via post search with DID: ${mentionDid}`);
+                                return mentionDid;  // Early exit upon finding a match
+                                
+                            } catch (err) {
+                                // Log the error for debugging purposes
+                                logger.warn(`Failed to fetch profile for DID ${mentionDid}:`, err);
+                                // Continue to the next facet if there's an error
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+    
+            // If no matching profile is found, return null
+            return null;
+        } catch (err) {
+            logger.debug(`Post search for ${handle} failed:`, err);
+            return null;
+        }
+    }      
+
     async verifyProfileDeletion(did) {
         if (!did) return false;
         const processingId = `verify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
+    
         try {
             logger.debug(`[${processingId}] Verifying profile deletion: ${did}`);
+    
+            // First check if we have historical information
+            const user = await this.fileHandler.getUserByDid(did);
+            if (user?.handle) {
+                // Check if profile exists under a different handle/DID
+                const historicalUser = await this.fileHandler.getUserByHistoricalHandle(user.handle);
+                if (historicalUser?.did && historicalUser.did !== did) {
+                    logger.debug(`[${processingId}] Profile ${did} found under different DID: ${historicalUser.did}`);
+                    return false;
+                }
 
+                // Try post search as additional verification
+                const searchDid = await this.findUserByPostSearch(user.handle);
+                if (searchDid) {
+                    logger.debug(`[${processingId}] Profile ${did} found via post search: ${searchDid}`);
+                    return false;
+                }
+            }
+    
             // Try multiple verification methods
             const attempts = [
                 // Public API
@@ -2245,35 +2368,39 @@ class ApiHandler {
                 // Auth API
                 this.makeAuthApiCall('app.bsky.actor.getProfile', { actor: did }),
                 // Handle resolution if available
-                this.fileHandler.getUserByDid(did).then(async user => {
-                    if (!user?.handle) return Promise.reject(new Error('No handle'));
-                    return this.resolveHandle(user.handle);
-                })
+                user?.handle ? this.resolveHandle(user.handle) : Promise.reject(new Error('No handle'))
             ];
-
+    
             // Initial delay to avoid temporary issues
             await new Promise(resolve => setTimeout(resolve, 1000));
-
+    
             // Run all attempts
             const results = await Promise.allSettled(attempts);
-            
-            // Check results - must all be 404s
-            const isDeleted = results.every(result => 
-                result.status === 'rejected' && 
-                (result.reason?.status === 404 || result.reason?.message?.includes('not found'))
+    
+            // Check results - must all be 404s or "not found"
+            const isDeleted = results.every(result =>
+                result.status === 'rejected' &&
+                (result.reason?.status === 404 || 
+                 (result.reason?.status === 400 && 
+                  (result.reason?.message?.includes('resolve handle') ||
+                   result.reason?.message?.includes('Unable to resolve') ||
+                   result.reason?.message?.includes('Profile not found')))
+                )
             );
-
+    
+            // Log detailed results
             logger.debug(`[${processingId}] Deletion verification result:`, {
                 did,
+                handle: user?.handle,
                 isDeleted,
                 attemptResults: results.map(r => ({
                     status: r.status,
                     error: r.reason?.status || r.reason?.message
                 }))
             });
-
+    
             return isDeleted;
-
+    
         } catch (err) {
             logger.warn(`[${processingId}] Error verifying deletion:`, {
                 did,
@@ -2815,16 +2942,17 @@ class ApiHandler {
                         // Handle specific error types
                         if (err.status === 429) {
                             await this.rateLimiter.handleResponse(err);
-                            continue; // Retry after rate limit
+                            continue;
                         }
     
                         if (err.status === 401 && m.name === 'auth') {
                             await this.refreshTokenIfNeeded(true);
-                            continue; // Retry after token refresh
+                            continue;
                         }
     
-                        if (err.status === 404) {
-                            break; // Don't retry 404s
+                        // Don't retry 400s or 404s
+                        if (err.status === 400 || err.status === 404) {
+                            break;
                         }
     
                         // Add delay between retries
@@ -2843,18 +2971,28 @@ class ApiHandler {
             }
     
             // 7. Handle failure
-            logger.error(`[${processingId}] Handle resolution failed:`, {
-                handle,
-                methodsAttempted: Array.from(methodsTried),
-                errors: allErrors.map(e => ({
-                    method: e.method,
-                    attempt: e.attempt,
-                    status: e.error.status,
-                    message: e.error.message
-                }))
-            });
-    
-            throw new Error(`Could not resolve handle: ${handle}`);
+            // If all methods failed with 400, throw structured error
+            if (allErrors.length > 0 && 
+                allErrors.every(e => e.error.status === 400)) {
+                const error = new Error(`Handle not found: ${handle}`);
+                error.status = 400;
+                error.context = {
+                    processingId,
+                    handle: rawHandle,
+                    attempts: allErrors
+                };
+                throw error;
+            }
+
+            // Otherwise throw with accumulated error context
+            const error = new Error(`Could not resolve handle: ${handle}`);
+            error.status = lastError?.status;  // Preserve status
+            error.context = {
+                processingId,
+                handle: rawHandle,
+                attempts: allErrors
+            };
+            throw error;
     
         } catch (err) {
             // 8. Final error handling
@@ -2906,6 +3044,12 @@ class ApiHandler {
         if (!this.fileHandler) return null;
     
         try {
+            // First ensure fileHandler is properly initialized
+            if (!this.fileHandler.entities?.users) {
+                logger.debug(`FileHandler not yet fully initialized when checking cache for ${handle}`);
+                return null;
+            }
+    
             // Check direct cache
             const cachedUser = await this.fileHandler.getUser(handle);
             if (cachedUser?.did) return cachedUser.did;
@@ -5253,7 +5397,7 @@ class MainProcessor {
             logger.warn('Invalid parameters for markProfileMissing');
             return;
         }
-
+    
         try {
             // Get or initialize failure tracking
             const failure = this.fileHandler.state.failures.get(did) || {
@@ -5261,33 +5405,46 @@ class MainProcessor {
                 attempts: 0,
                 firstSeen: new Date().toISOString()
             };
-
+    
             // Update attempt info
             failure.attempts++;
             failure.lastAttempt = new Date().toISOString();
             failure.reason = reason;
-
+    
             // Store updated failure state
             this.fileHandler.state.failures.set(did, failure);
-
-            // Log the missing status
+    
+            // Log the missing status with attempt count
             logger.warn(`Profile missing: ${did} (${reason}) - attempt ${failure.attempts}`);
-
-            // After multiple attempts, verify if actually deleted
+    
+            // After 3 attempts and 24h waiting period, verify deletion
             if (failure.attempts >= 3) {
                 const hoursSinceFirst = (Date.now() - new Date(failure.firstSeen).getTime()) / (1000 * 60 * 60);
-                if (hoursSinceFirst >= 24) { // Only verify if missing for at least 24h
+                if (hoursSinceFirst >= 24) {
+                    // Before full verification, check if already marked deleted
+                    if (this.fileHandler.state.deleted.users.has(did)) {
+                        logger.debug(`Profile ${did} already marked as deleted`);
+                        this.fileHandler.state.failures.delete(did);
+                        return;
+                    }
+    
+                    // Do full verification
                     const isDeleted = await this.verifyProfileDeletion(did);
                     if (isDeleted) {
                         await this.fileHandler.markDeleted(did, 'user', 'not_found_on_bsky');
                         this.fileHandler.state.failures.delete(did);
-                        logger.info(`Confirmed deletion for profile: ${did}`);
+                        logger.info(`Confirmed deletion for profile: ${did} after ${failure.attempts} attempts over ${Math.floor(hoursSinceFirst)}h`);
+                    } else {
+                        logger.debug(`Profile ${did} still not confirmed as deleted after ${failure.attempts} attempts`);
                     }
                 }
             }
-
         } catch (err) {
-            logger.error(`Error in markProfileMissing for ${did}:`, err);
+            logger.error(`Error in markProfileMissing for ${did}:`, {
+                error: err.message,
+                stack: err.stack,
+                attempts: this.fileHandler.state.failures.get(did)?.attempts
+            });
             // Don't throw - this is a non-critical operation
         }
     }
@@ -7528,17 +7685,24 @@ async function quickProcessUser(identifier, options = {}) {
             try {
                 did = await processor.apiHandler.resolveHandle(identifier);
             } catch (err) {
-                if (err.status === 404) {
+                if (err.status === 400 || err.status === 404) {  // Handle both error types
                     // Check historical handles first
                     const historicalUser = await processor.fileHandler.getUserByHistoricalHandle(identifier);
                     if (historicalUser) {
                         did = historicalUser.did;
                         logger.info(`Found DID ${did} via historical handle ${identifier}`);
                     } else {
-                        // Mark as deleted and record
-                        await processor.dbManager.markProfileDeleted(identifier, 'not_found');
-                        stats.deleted++;
-                        return { success: false, reason: 'profile_not_found' };
+                        // Before marking as deleted, try post search
+                        const searchDid = await processor.apiHandler.findUserByPostSearch(identifier);
+                        if (searchDid) {
+                            did = searchDid;
+                            logger.info(`Found DID ${did} via post search for ${identifier}`);
+                        } else {
+                            // Mark as deleted and record
+                            await processor.dbManager.markProfileDeleted(identifier, 'not_found');
+                            stats.deleted++;
+                            return { success: false, reason: 'profile_not_found' };
+                        }
                     }
                 } else if (processor.isRateLimitError(err)) {
                     await processor.rateLimiter.handleResponse(err);

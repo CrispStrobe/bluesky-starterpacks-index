@@ -1142,6 +1142,21 @@ class FileHandler {
         return false;
     }
 
+    async appendList(listData) {
+        try {
+            const listLine = JSON.stringify(listData) + '\n';
+            const yamlDoc = '---\n' + yaml.dump(listData);
+
+            await fs.appendFile(FILE_PATHS.lists, listLine);
+            await fs.appendFile(FILE_PATHS.listsBackup, yamlDoc);
+            
+            return true;
+        } catch (err) {
+            logger.error(`Error appending list ${listData.uri}:`, err);
+            throw err;
+        }
+    }
+
     async markDeleted(id, type, reason) {
         const timestamp = new Date().toISOString();
         
@@ -3930,113 +3945,138 @@ class DatabaseManager {
         return cleaned;
     }
 
+    // Fix for safeWrite - moved special error handling to catch block
     async safeWrite(collection, operation, options = {}) {
-        const operationId = `${collection}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const operationId = `${collection}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
         const startTime = Date.now();
-    
+
         try {
-            logger.debug(`safeWrite:`, operation);
-
-            // Log without MongoDB objects
-            logger.debug(`[${operationId}] MongoDB operation:`, {
-                collection,
-                filter: operation.filter,
-                update: this.cleanForLogging(operation.update),
-                options: this.cleanForLogging(options)
-            });
-
-            // Validation
+            // Input validation
             if (!operation.filter || !operation.update) {
                 throw new Error(`Invalid operation parameters for ${collection}`);
             }
-    
-            // Verify DB connection
-            if (!this.db) {ƒ
+
+            if (!this.db) {
                 throw new Error('No database connection available');
             }
-    
-            // Add session to options if we have one
+
             const writeOptions = {
                 ...options,
-                session: this.session
+                session: this.session,
+                upsert: options.upsert !== false  // Default to true unless explicitly disabled
             };
 
-            const beforeCount = await this.db.collection(collection).countDocuments();
-    
-            // Log the exact operation we're about to perform
-            logger.debug(`[${operationId}] Executing MongoDB operation:`, {
-                collection,
-                filter: operation.filter,
-                update: operation.update,
-                options: writeOptions
-            });
-    
-            // Execute write
-            const result = await this.db.collection(collection)
-            .updateOne(
-                operation.filter,
-                operation.update,
-                { ...options, session: this.session }
-            );
+            const beforeCount = await this.db.collection(collection)
+                .countDocuments(operation.filter, { session: this.session });
 
-            const afterCount = await this.db.collection(collection).countDocuments();
-    
-            // Verify the write if needed
-            const verifyWrite = async () => {
-                const verifiedDoc = await this.db.collection(collection)
-                    .findOne(operation.filter, { session: this.session });
-    
-                logger.debug(`[${operationId}] Write verification:`, {
-                    collection,
+            const result = await this.db.collection(collection)
+                .updateOne(
+                    operation.filter,
+                    operation.update,
+                    writeOptions
+                );
+
+            const afterCount = await this.db.collection(collection)
+                .countDocuments(operation.filter, { session: this.session });
+
+            const verifiedDoc = await this.db.collection(collection)
+                .findOne(operation.filter, { session: this.session });
+
+            logger.debug(`[${operationId}] Write result:`, {
+                collection,
+                documents: {
+                    before: beforeCount,
+                    after: afterCount,
+                    delta: afterCount - beforeCount
+                },
+                operation: {
+                    modified: result.modifiedCount,
+                    upserted: result.upsertedCount,
+                    matched: result.matchedCount
+                },
+                verification: {
                     found: !!verifiedDoc,
                     matches: verifiedDoc ? Object.keys(operation.filter).every(key => 
                         verifiedDoc[key] === operation.filter[key]
                     ) : false
-                });
-    
-                return !!verifiedDoc;
-            };
-    
-            // Verify and log comprehensive results
-            const verified = await verifyWrite();
-            const duration = Date.now() - startTime;
-    
-            logger.info(`Wrote. ${beforeCount} before / ${afterCount} after. ${result.modifiedCount} modified, ${result.upsertedCount} upserted, ${result.matchedCount} matched]:`);
-            logger.debug(`[${operationId}] Write completed:`, {
-                collection,
-                modified: result.modifiedCount,
-                upserted: result.upsertedCount,
-                matched: result.matchedCount
+                },
+                duration: Date.now() - startTime
             });
-    
-            if (!verified && !result.modifiedCount && !result.upsertedCount) {
+
+            if (!verifiedDoc && !result.modifiedCount && !result.upsertedCount) {
                 logger.warn(`[${operationId}] Write operation had no effect:`, {
                     collection,
                     filter: operation.filter,
                     update: operation.update
                 });
             }
-    
+
             return result;
-    
+
         } catch (err) {
-            logger.error(`[${operationId}] Write operation failed:`, {
+            logger.error(`[${operationId}] Write failed:`, {
                 collection,
                 error: err.message,
                 code: err.code,
-                filter: operation.filter,
-                update: operation.update,
-                stack: err.stack
+                stack: err.stack,
+                operation: {
+                    filter: operation.filter,
+                    update: Object.keys(operation.update)
+                }
             });
-    
-            // Special handling for specific error types
+
+            // Special error handling moved here
             if (err.code === 40) { // Array update conflict
                 logger.warn(`[${operationId}] Array update conflict, attempting recovery...`);
                 return await this.handleArrayUpdateConflict(collection, operation, options);
             }
-    
+
+            if (err.code === 11000) { // Duplicate key
+                return await this.handleDuplicateKey(collection, operation, options);
+            }
+
             throw err;
         }
+    }
+    
+    async handleArrayUpdateConflict(collection, operation, options) {
+        // Get current document
+        const current = await this.db.collection(collection)
+            .findOne(operation.filter, { session: this.session });
+    
+        if (!current) {
+            return await this.db.collection(collection)
+                .updateOne(operation.filter, operation.update, { 
+                    ...options, 
+                    upsert: true 
+                });
+        }
+    
+        // Merge arrays
+        const update = { $set: {} };
+        Object.entries(operation.update.$set || {}).forEach(([key, value]) => {
+            if (Array.isArray(value)) {
+                update.$set[key] = [...new Set([
+                    ...(current[key] || []),
+                    ...value
+                ])];
+            } else {
+                update.$set[key] = value;
+            }
+        });
+    
+        return await this.db.collection(collection)
+            .updateOne(operation.filter, update, options);
+    }
+    
+    async handleDuplicateKey(collection, operation, options) {
+        logger.warn('Handling duplicate key error, retrying without upsert');
+        return await this.db.collection(collection)
+            .updateOne(
+                operation.filter,
+                operation.update,
+                { ...options, upsert: false }
+            );
     }
     
     async handleArrayUpdateConflict(collection, operation, options) {
@@ -4853,14 +4893,28 @@ class MainProcessor {
             startTime: Date.now(),
             stages: new Map(),
             metrics: {
-                members: { total: 0, processed: 0, removed: 0, added: 0 },
-                memory: { start: process.memoryUsage().heapUsed }
+                members: { 
+                    total: 0,           // Total members found
+                    processed: 0,       // Successfully processed members
+                    removed: 0,         // Members removed
+                    added: 0,           // New members added
+                    failed: 0           // Failed member processing
+                },
+                associated: {
+                    discovered: 0,      // Associated packs found
+                    queued: 0,         // Successfully queued
+                    skipped: 0         // Skipped due to various reasons
+                },
+                memory: { 
+                    start: process.memoryUsage().heapUsed 
+                }
             }
         };
     
         const trackStage = async (name, fn) => {
             const stage = { name, startTime: Date.now() };
             session.stages.set(name, stage);
+            logger.debug(`[${session.id}] Starting stage: ${name}`);
             try {
                 const result = await fn();
                 stage.duration = Date.now() - stage.startTime;
@@ -4913,6 +4967,7 @@ class MainProcessor {
     
             if (setup.skip) return true;
             const { handle, rkey, existingPack, creatorProfile } = setup;
+            logger.debug(`[${session.id}] Starting pack processing: ${handle}|${rkey}`);
     
             // 2. Fetch Pack Details
             const { packDetails } = await trackStage('fetch', async () => {
@@ -4934,11 +4989,12 @@ class MainProcessor {
             const memberResults = await trackStage('members', async () => {
                 // Fetch all list members with pagination
                 const memberList = await this.getListMembers(packDetails.starterPack.record.list);
+                const totalMembers = memberList?.length || 0;
             
-                logger.debug("Fetched total members:", memberList.length);
+                logger.debug(`[${session.id}] Found ${totalMembers} members for ${handle}|${rkey}`);
             
                 // Don't throw on empty list, mark as deleted and proceed
-                if (!memberList?.length) {
+                if (!totalMembers) {
                     await this.taskManager.markPackStatus(rkey, 'deleted', 'empty_list');
                     return {
                         processedUsers: [],
@@ -4975,6 +5031,8 @@ class MainProcessor {
             
                 // Process each batch sequentially
                 for (const batch of batches) {
+                    logger.debug(`[${session.id}] Processing batch ${batches.indexOf(batch) + 1}/${batches.length} (${batch.length} members)`);
+
                     // Process all members in the current batch concurrently
                     const results = await Promise.allSettled(
                         batch.map(async member => {
@@ -4987,16 +5045,24 @@ class MainProcessor {
                                     // Process associated packs if within depth limit and not skipped
                                     if (!options.skipAssociated && 
                                         (options.depth === undefined || options.depth < MAX_PACK_DEPTH)) {
-                                        await this.processAssociatedPacks(user, {
+                                        const assocResults = await this.processAssociatedPacks(user, {
                                             parentPack: rkey,
                                             depth: (options.depth || 0) + 1,
                                             processingId: session.id,
                                             forceProcess: this.config.updateAll || false
                                         });
+                                        // Update metrics during processing
+                                        session.metrics.associated.discovered += assocResults.discovered || 0;
+                                        session.metrics.associated.queued += assocResults.queued || 0;
+                                        session.metrics.associated.skipped += assocResults.skipped || 0;
                                     }
-                                }
+                                } else {
+                                    session.metrics.members.failed++;  // Count failed processing
+                                }   
+
                                 return user;
                             } catch (err) {
+                                session.metrics.members.failed++;  // Count errors
                                 logger.warn(`Failed to process member ${member.subject?.did || 'unknown'}:`, err);
                                 return null;
                             }
@@ -5005,7 +5071,8 @@ class MainProcessor {
             
                     // Update processed members metric
                     session.metrics.members.processed = processedUsers.size;
-                    logger.debug(`[${session.id}] Progress: ${processedUsers.size}/${allMembers.length}`);
+                    const progress = ((session.metrics.members.processed / totalMembers) * 100).toFixed(1);
+                    logger.debug(`[${session.id}] Progress: ${session.metrics.members.processed}/${totalMembers} members (${progress}%)`);
                 }
             
                 // Determine membership changes
@@ -5090,8 +5157,8 @@ class MainProcessor {
             if (!options.skipAssociated) {
 
                 //logging.debug ("processStarterPack 5 call: this.updateAll:", this.updateAll);
-                await trackStage('associated', () =>
-                    this.processAssociatedPacks(
+                await trackStage('associated', async () => {
+                    const packResults = await this.processAssociatedPacks(
                         creatorProfile,
                         { 
                             parentPack: rkey, 
@@ -5099,8 +5166,20 @@ class MainProcessor {
                             depth: (options.depth || 0) + 1,
                             forceProcess: this.config.updateAll || false
                         }
-                    )
-                );
+                    );
+                
+                    // Update associated metrics
+                    session.metrics.associated.discovered = packResults.discovered || 0;
+                    session.metrics.associated.queued = packResults.queued || 0;
+                    session.metrics.associated.skipped = packResults.skipped || 0;
+                
+                    // Log meaningful progress
+                    if (packResults.discovered > 0) {
+                        logger.info(`[${session.id}] Associated packs: ${packResults.queued}/${packResults.discovered} queued`);
+                    }
+                
+                    return packResults;
+                });
             }
     
             // 6. Finalize
@@ -5108,8 +5187,39 @@ class MainProcessor {
                 await this.taskManager.markTaskCompleted(rkey);
                 session.metrics.memory.end = process.memoryUsage().heapUsed;
                 
-                //logger.info(`[${session.id}] Completed in ${((Date.now() - session.startTime) / 1000).toFixed(1)}s`);
-
+                // Log comprehensive final stats
+                logger.info(`[${session.id}] Pack ${handle}|${rkey} completed:`, {
+                    duration: `${((Date.now() - session.startTime) / 1000).toFixed(1)}s`,
+                    members: {
+                        total: session.metrics.members.total,
+                        processed: session.metrics.members.processed,
+                        success_rate: session.metrics.members.total ? 
+                            ((session.metrics.members.processed / session.metrics.members.total) * 100).toFixed(1) + '%' : 
+                            'N/A',
+                        changes: {
+                            added: session.metrics.members.added,
+                            removed: session.metrics.members.removed,
+                            failed: session.metrics.members.failed
+                        },
+                        processing_stats: {
+                            total_time: `${((Date.now() - session.startTime) / 1000).toFixed(1)}s`,
+                            avg_per_member: session.metrics.members.processed ? 
+                                `${((Date.now() - session.startTime) / session.metrics.members.processed / 1000).toFixed(1)}s` : 
+                                'N/A'
+                        }
+                    },
+                    associated: session.metrics.associated.discovered > 0 ? {
+                        discovered: session.metrics.associated.discovered,
+                        queued: session.metrics.associated.queued,
+                        skipped: session.metrics.associated.skipped,
+                        queue_rate: ((session.metrics.associated.queued / session.metrics.associated.discovered) * 100).toFixed(1) + '%'
+                    } : null,
+                    memory_usage: {
+                        start: Math.round(session.metrics.memory.start / 1024 / 1024) + 'MB',
+                        end: Math.round(session.metrics.memory.end / 1024 / 1024) + 'MB',
+                        diff: Math.round((session.metrics.memory.end - session.metrics.memory.start) / 1024 / 1024) + 'MB'
+                    }
+                });
             });
     
             return true;
@@ -5263,7 +5373,8 @@ class MainProcessor {
                     debug: this.config.debug,
                     dbManager: this.dbManager,
                     noMongoDB: this.config.noMongoDB,
-                    updateAll: this.config.updateAll
+                    updateAll: this.config.updateAll,
+                    emptyfirst: this.config.emptyfirst,
                 });
                 this.initialized.taskManager = true;
             }
@@ -5904,6 +6015,7 @@ class MainProcessor {
     }
 
     async processAssociatedLists(profile, options = {}) {
+        // Keep initial validation and setup
         if (!profile?.did) {
             throw new Error('Invalid profile data provided');
         }
@@ -5912,7 +6024,7 @@ class MainProcessor {
             parentDid = null,
             processingId = `al-${Date.now()}-${Math.random().toString(36).slice(2)}`,
             depth = 0,
-            maxDepth = 2,  // Limit list discovery depth
+            maxDepth = 2,
             processedDIDs = new Set(),
             forceProcess = false
         } = options;
@@ -5922,7 +6034,8 @@ class MainProcessor {
         }
     
         processedDIDs.add(profile.did);
-        
+    
+        // Enhanced stats tracking
         const stats = {
             startTime: Date.now(),
             results: {
@@ -5931,6 +6044,11 @@ class MainProcessor {
                 skipped: 0,
                 failed: 0,
                 deleted: 0,
+                members: {
+                    total: 0,
+                    processed: 0,
+                    failed: 0
+                },
                 byPurpose: {
                     modlist: 0,
                     curatelist: 0,
@@ -5940,105 +6058,151 @@ class MainProcessor {
             }
         };
     
+        const trackStage = async (name, fn) => {
+            logger.debug(`[${processingId}] Starting stage: ${name}`);
+            const startTime = Date.now();
+            try {
+                const result = await fn();
+                logger.debug(`[${processingId}] Completed stage ${name} in ${Date.now() - startTime}ms`);
+                return result;
+            } catch (err) {
+                logger.error(`[${processingId}] Failed stage ${name}:`, err);
+                throw err;
+            }
+        };
+    
         try {
-            // Get all lists for the user
-            const lists = await this.apiHandler.getUserLists(profile.did);
-            if (!lists?.length) {
+            // 1. Fetch Lists
+            const lists = await trackStage('fetch', async () => {
+                const userLists = await this.apiHandler.getUserLists(profile.did);
+                if (userLists?.length) {
+                    logger.info(`[${processingId}] Found ${userLists.length} lists for ${profile.handle}`);
+                    stats.results.discovered = userLists.length;
+                }
+                return userLists || [];
+            });
+    
+            if (!lists.length) {
                 return stats.results;
             }
     
-            stats.results.discovered = lists.length;
-    
-            // Process lists in batches
-            const BATCH_SIZE = 5;
-            for (let i = 0; i < lists.length; i += BATCH_SIZE) {
-                const batch = lists.slice(i, i + BATCH_SIZE);
-                
-                await Promise.all(batch.map(async (list) => {
-                    try {
-                        // Skip if recently processed and not forced
-                        const existingList = await this.fileHandler.getList(list.uri);
-                        if (!forceProcess && existingList) {
-                            const hoursSinceUpdate = (Date.now() - new Date(existingList.updated_at).getTime()) / 3600000;
-                            if (hoursSinceUpdate < 24) {
-                                stats.results.skipped++;
-                                return;
+            // 2. Process Lists
+            await trackStage('process', async () => {
+                const BATCH_SIZE = 5;
+                for (let i = 0; i < lists.length; i += BATCH_SIZE) {
+                    const batch = lists.slice(i, i + BATCH_SIZE);
+                    logger.debug(`[${processingId}] Processing batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(lists.length/BATCH_SIZE)}`);
+                    
+                    await Promise.all(batch.map(async (list) => {
+                        try {
+                            // Skip check
+                            const existingList = await this.fileHandler.getList(list.uri);
+                            if (!forceProcess && existingList) {
+                                const hoursSinceUpdate = (Date.now() - new Date(existingList.updated_at).getTime()) / 3600000;
+                                if (hoursSinceUpdate < 24) {
+                                    stats.results.skipped++;
+                                    return;
+                                }
                             }
-                        }
     
-                        // Get full list details
-                        const details = await this.apiHandler.getListDetails(list.uri);
-                        if (!details?.list) {
-                            throw new Error('Invalid list structure');
-                        }
+                            // Get list details and members
+                            const details = await this.apiHandler.getListDetails(list.uri);
+                            if (!details?.list) {
+                                throw new Error('Invalid list structure');
+                            }
     
-                        // Track list purpose
-                        const purpose = details.list.purpose || 'unknown';
-                        if (stats.results.byPurpose[purpose] !== undefined) {
-                            stats.results.byPurpose[purpose]++;
-                        }
+                            // Get all members with pagination
+                            const members = await this.getListMembers(list.uri);
+                            stats.results.members.total += members.length;
     
-                        // Format list data
-                        const listData = {
-                            uri: list.uri,
-                            cid: list.cid,
-                            creator: profile.handle,
-                            creator_did: profile.did,
-                            name: list.name,
-                            description: list.description || '',
-                            purpose,
-                            memberCount: details.list.membersCount || 0,
-                            indexedAt: list.indexedAt,
-                            updated_at: new Date().toISOString()
-                        };
+                            // Track purpose
+                            const purpose = details.list.purpose || 'unknown';
+                            stats.results.byPurpose[purpose] = (stats.results.byPurpose[purpose] || 0) + 1;
     
-                        // Save to files
-                        await this.fileHandler.appendList(listData);
+                            // Process members
+                            for (const member of members) {
+                                try {
+                                    const memberData = {
+                                        did: member.subject.did,
+                                        handle: member.subject.handle,
+                                        list_memberships: [list.uri],
+                                        last_updated: new Date().toISOString()
+                                    };
+                                    await this.fileHandler.appendUser(memberData);
+                                    stats.results.members.processed++;
+                                } catch (memberErr) {
+                                    stats.results.members.failed++;
+                                    logger.warn(`Failed to process list member ${member.subject?.did}:`, memberErr);
+                                }
+                            }
     
-                        // Save to MongoDB if enabled
-                        if (!this.noMongoDB && !this.noDBWrites) {
-                            await this.dbManager.safeWrite('lists', {
-                                filter: { uri: list.uri },
-                                update: {
-                                    $set: listData,
-                                    $setOnInsert: { created_at: new Date().toISOString() }
-                                },
-                                upsert: true
-                            });
-                        }
-    
-                        stats.results.queued++;
-    
-                        // Track relationship
-                        if (parentDid) {
-                            this.taskManager.recordListRelationship(list.uri, parentDid);
-                        }
-    
-                    } catch (err) {
-                        if (err.status === 404) {
-                            await this.dbManager.markListDeleted(list.uri, 'not_found');
-                            stats.results.deleted++;
-                        } else {
-                            stats.results.failed++;
-                            stats.results.errors.push({
+                            // Save list data
+                            const listData = {
                                 uri: list.uri,
-                                error: err.message,
-                                status: err.status
-                            });
+                                cid: list.cid,
+                                creator: profile.handle,
+                                creator_did: profile.did,
+                                name: list.name,
+                                description: list.description || '',
+                                purpose,
+                                memberCount: members.length,
+                                indexedAt: list.indexedAt,
+                                updated_at: new Date().toISOString(),
+                                members: members.map(m => m.subject.did)
+                            };
+    
+                            await this.fileHandler.appendList(listData);
+    
+                            if (!this.noMongoDB && !this.noDBWrites) {
+                                await this.dbManager.safeWrite('lists', {
+                                    filter: { uri: list.uri },
+                                    update: {
+                                        $set: listData,
+                                        $setOnInsert: { created_at: new Date().toISOString() }
+                                    },
+                                    upsert: true
+                                });
+                            }
+    
+                            stats.results.queued++;
+    
+                            // Log progress
+                            logger.debug(`[${processingId}] Processed list ${list.uri}: ${members.length} members`);
+    
+                        } catch (err) {
+                            this.handleListError(err, list, stats);
                         }
+                    }));
+    
+                    // Progress logging
+                    const progress = ((i + batch.length) / lists.length * 100).toFixed(1);
+                    logger.info(`[${processingId}] Progress: ${i + batch.length}/${lists.length} lists (${progress}%)`);
+    
+                    if (i + BATCH_SIZE < lists.length) {
+                        await new Promise(resolve => setTimeout(resolve, 100));
                     }
-                }));
-    
-                // Rate limit delay between batches
-                if (i + BATCH_SIZE < lists.length) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
                 }
-            }
+            });
     
-            const duration = Date.now() - stats.startTime;
-            logger.info(`[${processingId}] ${profile.handle}: ${stats.results.queued}/${stats.results.discovered} lists processed`, {
-                duration: `${(duration / 1000).toFixed(1)}s`,
-                byPurpose: stats.results.byPurpose
+            // 3. Final Stats
+            const duration = (Date.now() - stats.startTime) / 1000;
+            logger.info(`[${processingId}] ${profile.handle} lists completed:`, {
+                duration: `${duration.toFixed(1)}s`,
+                lists: {
+                    total: stats.results.discovered,
+                    processed: stats.results.queued,
+                    skipped: stats.results.skipped,
+                    failed: stats.results.failed,
+                    byPurpose: stats.results.byPurpose
+                },
+                members: {
+                    total: stats.results.members.total,
+                    processed: stats.results.members.processed,
+                    failed: stats.results.members.failed,
+                    success_rate: stats.results.members.total ? 
+                        ((stats.results.members.processed / stats.results.members.total) * 100).toFixed(1) + '%' : 
+                        'N/A'
+                }
             });
     
             return stats.results;
@@ -6051,6 +6215,28 @@ class MainProcessor {
                 stats: stats.results
             });
             throw err;
+        }
+    }
+    
+    async handleListError(err, list, stats) {
+        // Check for both 404 and handle-not-found 400s
+        if (err.status === 404 || 
+            (err.status === 400 && (
+                err.message?.includes('Unable to resolve') ||
+                err.message?.includes('List not found') ||
+                err.message?.includes('Invalid list')
+            ))) {
+            this.dbManager.markListDeleted(list.uri, 'not_found');
+            stats.results.deleted++;
+            logger.debug(`List ${list.uri} marked as deleted (${err.status}: ${err.message})`);
+        } else {
+            stats.results.failed++;
+            stats.results.errors.push({
+                uri: list.uri,
+                error: err.message,
+                status: err.status
+            });
+            logger.warn(`Failed to process list ${list.uri}:`, err);
         }
     }
 
@@ -6085,6 +6271,13 @@ class MainProcessor {
                 errors: []
             }
         };
+
+        let queueStats = {
+            total: 0,
+            skipped: 0,
+            queued: 0,
+            processed: 0
+        };        
     
         try {
             // 1. Get packs
@@ -6092,12 +6285,25 @@ class MainProcessor {
             if (!packs?.starterPacks?.length) {
                 return stats.results;
             }
+
+            const queueStats = {
+                total: packs?.starterPacks?.length || 0,
+                skipped: 0,
+                queued: 0,
+                processed: 0
+            };
+
+            logger.debug(`[${processingId}] Found ${packs.starterPacks.length} packs for ${currentProfile.handle}`);
     
             stats.results.discovered = packs.starterPacks.length;
     
             // 2. Process each pack
             const BATCH_SIZE = 5;
             for (let i = 0; i < packs.starterPacks.length; i += BATCH_SIZE) {
+                const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+                const totalBatches = Math.ceil(packs.starterPacks.length / BATCH_SIZE);
+                logger.debug(`[${processingId}] Processing batch ${batchNum}/${totalBatches}`);
+
                 const batch = packs.starterPacks.slice(i, i + BATCH_SIZE);
                 
                 await Promise.all(batch.map(async (pack) => {
@@ -6118,7 +6324,9 @@ class MainProcessor {
                         
                         if (!packCheck.process && !forceProcess) {
                             stats.results.skipped++;
+                            queueStats.skipped++;
                             logger.debug(`[${processingId}] Skipping assoc. pack ${rkey}: ${packCheck.reason}`);
+                            logger.info(`[${processingId}] ${currentProfile.handle}: ${queueStats.queued}/${queueStats.total} queued (${queueStats.skipped} skipped)`);
                             return;
                         }
                         
@@ -6136,6 +6344,16 @@ class MainProcessor {
                         }
     
                         // Add to task queue
+                        // Calculate priority for this associated pack
+                        const taskPriority = await this.taskManager.calculateTaskPriority(rkey, {
+                            source: 'associated',
+                            isNewlyDiscovered: true,
+                            memberCount: packDetails?.starterPack?.membersCount,
+                            existingPack: await this.fileHandler.getPack(rkey),
+                            failure: this.taskManager.failures.get(rkey)
+                        });
+
+                        // Add to task queue with priority
                         const added = await this.taskManager.addTask({
                             rkey,
                             handle: currentProfile.handle,
@@ -6143,18 +6361,23 @@ class MainProcessor {
                             parentDid,
                             depth,
                             uri: pack.uri,
-                            processingId
+                            processingId,
+                            priority: taskPriority
                         });
     
                         if (added) {
                             if (!this.stats) {
-                                this.stats = { discovered: 0 };  // Defensive initialization
+                                this.stats = { discovered: 0 };
                             }
                             this.recordNewAssociatedPack();
                             stats.results.queued++;
+                            queueStats.queued++;
                             this.taskManager.recordPackRelationship(rkey, currentProfile.did);
+                            logger.info(`[${processingId}] ${currentProfile.handle}: ${stats.results.queued}/${packs.starterPacks.length} processed (${stats.results.skipped} skipped)`);
+                            
                         } else {
                             stats.results.skipped++;
+                            queueStats.skipped++;
                         }
     
                     } catch (err) {
@@ -6180,8 +6403,18 @@ class MainProcessor {
                 }
             }
     
-            const duration = Date.now() - stats.startTime;
-            logger.info(`[${processingId}] ${currentProfile.handle}: ${stats.results.queued}/${stats.results.discovered} queued`);
+            if (packs.starterPacks.length > 0) {
+                // Only log if we found any packs
+                logger.debug(`[${processingId}] ${currentProfile.handle} associated packs:`, {
+                    total: packs.starterPacks.length,
+                    processed: stats.results.queued + stats.results.skipped,
+                    queued: stats.results.queued,
+                    skipped: stats.results.skipped,
+                    duration: `${((Date.now() - stats.startTime) / 1000).toFixed(1)}s`,
+                    success_rate: ((stats.results.queued / packs.starterPacks.length) * 100).toFixed(1) + '%'
+                });
+            }
+            //logger.info(`${currentProfile.handle}: ${stats.results.queued}/${stats.results.discovered} queued`);
 
             return stats.results;
     
@@ -6224,29 +6457,39 @@ class MainProcessor {
     }
 
     async processProfileLists(profile, options = {}) {
-        const { processingId, force = false } = options;
+        const processingId = `lists-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        
         const results = {
             created: [],
             memberships: [],
             deleted: [],
-            failed: []
+            failed: [],
+            stats: {
+                processed: 0,
+                failed: 0,
+                skipped: 0,
+                deleted: 0
+            }
         };
     
         try {
-            // 1. Get lists created by the user
+            // Get lists created by the user
             const createdLists = await this.apiHandler.getUserLists(profile.did);
             logger.debug(`[${processingId}] Found ${createdLists?.length || 0} lists for ${profile.handle}`);
     
             // Track existing lists to detect deletions
             const existingLists = new Set();
     
-            // 2. Process each list
+            // Process each list
             for (const list of (createdLists || [])) {
                 try {
                     existingLists.add(list.uri);
     
                     // Get full list details
                     const details = await this.apiHandler.getListDetails(list.uri);
+                    if (!details?.list) {
+                        throw { status: 400, message: 'Invalid list structure' };
+                    }
                     
                     const listData = {
                         uri: list.uri,
@@ -6277,23 +6520,20 @@ class MainProcessor {
                     }
     
                     results.created.push(listData);
+                    results.stats.processed++;
     
                 } catch (err) {
-                    if (err.status === 404) {
-                        await this.dbManager.markListDeleted(list.uri, 'not_found');
-                        results.deleted.push(list.uri);
-                    } else {
-                        logger.error(`[${processingId}] Failed to process list ${list.uri}:`, err);
-                        results.failed.push({
-                            uri: list.uri,
-                            error: err.message,
-                            status: err.status
-                        });
-                    }
+                    results.stats.failed++;
+                    results.failed.push({
+                        uri: list.uri,
+                        error: err.message,
+                        status: err.status
+                    });
+                    logger.warn(`[${processingId}] Failed to process list ${list.uri}:`, err);
                 }
             }
     
-            // 3. Check for deleted lists
+            // Check for deleted lists
             if (!this.noMongoDB && !this.noDBWrites) {
                 const previousLists = await this.dbManager.db.collection('lists')
                     .find({ 
@@ -6307,6 +6547,7 @@ class MainProcessor {
                     if (!existingLists.has(list.uri)) {
                         await this.dbManager.markListDeleted(list.uri, 'no_longer_exists');
                         results.deleted.push(list.uri);
+                        results.stats.deleted++;
                     }
                 }
             }
@@ -7383,7 +7624,8 @@ async function handleQuickProcess(args, processor, startTime) {
                 debug: args.debug,
                 dbManager: processor.dbManager,
                 noMongoDB: processor.config.noMongoDB,
-                updateAll: processor.config.updateAll
+                updateAll: processor.config.updateAll,
+                emptyfirst: processor.config.emptyfirst,
             });
             
             // Only load existing data for lookups, but don't build task list
@@ -7553,7 +7795,7 @@ async function quickProcessList(identifier, options = {}) {
         };
 
         // 5. Process members if present
-        const members = await processor.apiHandler.getListMembers(listInfo.uri);
+        const members = await processor.getListMembers(listInfo.uri);
         
         // Track processing results
         const results = {
@@ -8225,6 +8467,31 @@ async function resolveAuthority(authority, { processor, processingId }) {
 }
 
 class TaskManager {
+
+    // Constants for priority calculation
+    static PRIORITY = {
+        MAX: 100,
+        BASE: {
+            CRITICAL: 90,   // Empty/broken packs
+            NEW: 70,        // Never processed
+            STALE: 50,      // Very old data
+            NORMAL: 30,     // Regular update needed
+            LOW: 10         // Recently processed
+        },
+        BOOST: {
+            EMPTY_PACK: 40,
+            ASSOCIATED: 20,
+            NEWLY_DISCOVERED: 15,
+            LARGE_PACK: 10,
+            URLS_FILE: 5
+        },
+        PENALTY: {
+            SMALL_PACK: -5,
+            PER_FAILURE: -10,
+            RECENT_SUCCESS: -20
+        }
+    };
+
     constructor(config) {
         // Handle both config object and legacy constructor params
         const fileHandler = config.fileHandler || config;
@@ -8261,9 +8528,10 @@ class TaskManager {
 
         // Configuration
         this.config = {
-            updateAll: updateAll,
-            DELETION_COOLDOWN: 7 * 24 * 60 * 60 * 1000, // 7 days
-            CHECKPOINT_INTERVAL: 20 * 60 * 1000         // 20 minutes
+            updateAll: config.updateAll ?? false,
+            emptyfirst: config.emptyfirst ?? false,
+            DELETION_COOLDOWN: 7 * 24 * 60 * 60 * 1000,
+            CHECKPOINT_INTERVAL: 20 * 60 * 1000
         };
 
         // Checkpointing
@@ -9063,22 +9331,21 @@ class TaskManager {
         }
     }
 
-    calculateTaskPriority(rkey, options = {}) {
+    async calculateTaskPriority(rkey, options = {}) {
         const {
             source = 'initial',
             isNewlyDiscovered = false,
             existingPack = null,
             lastUpdate = null,
             failure = null,
-            inMongoDB = null,  // Allow explicit passing
-            memberCount = null // New parameter for member count consideration
+            inMongoDB = null,
+            memberCount = null
         } = options;
     
-        // Get processing ID for logging
         const processingId = `priority-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        let priority = 0;
-        const factors = []; // Track factors affecting priority
-    
+        const factors = [];
+        let calculatedPriority = 0; // Renamed for clarity
+        
         try {
             // 1. Determine current states
             const states = {
@@ -9095,16 +9362,16 @@ class TaskManager {
                 const deletion = this.deletedPacks.get(rkey);
                 const age = Date.now() - new Date(deletion.timestamp).getTime();
                 if (age < this.DELETION_COOLDOWN) {
+                    logger.debug(`[${processingId}] Early exit: deleted pack in cooldown`);
                     return 0;
                 }
             }
     
             // 3. Base priority calculation
             if (!states.inMongoDB && !states.inFiles) {
-                priority = 15;  // Completely new
+                calculatedPriority = TaskManager.PRIORITY.BASE.NEW;
                 factors.push('new_pack');
             } else {
-                // Calculate days since last update
                 const lastUpdateDate = lastUpdate || 
                     existingPack?.updated_at || 
                     states.priorityFactors?.lastUpdate;
@@ -9113,25 +9380,24 @@ class TaskManager {
                     const daysSinceUpdate = (Date.now() - new Date(lastUpdateDate).getTime()) 
                         / (1000 * 60 * 60 * 24);
                     
-                    // Tiered priority based on age and state
                     if (daysSinceUpdate > 14) {
-                        priority = 10;
+                        calculatedPriority = TaskManager.PRIORITY.BASE.STALE;
                         factors.push('very_old');
                     } else if (!states.inMongoDB && states.inFiles) {
-                        priority = 8;
+                        calculatedPriority = TaskManager.PRIORITY.BASE.STALE;
                         factors.push('needs_mongodb_sync');
                     } else if (daysSinceUpdate > 7) {
-                        priority = 5;
+                        calculatedPriority = TaskManager.PRIORITY.BASE.NORMAL;
                         factors.push('old');
                     } else if (daysSinceUpdate > 3) {
-                        priority = 3;
+                        calculatedPriority = TaskManager.PRIORITY.BASE.NORMAL;
                         factors.push('moderate_age');
                     } else {
-                        priority = 1;
+                        calculatedPriority = TaskManager.PRIORITY.BASE.LOW;
                         factors.push('recent');
                     }
                 } else {
-                    priority = 10;
+                    calculatedPriority = TaskManager.PRIORITY.BASE.STALE;
                     factors.push('no_update_date');
                 }
             }
@@ -9139,77 +9405,86 @@ class TaskManager {
             // 4. Source adjustments
             switch(source) {
                 case 'associated':
-                    priority += 5;
+                    calculatedPriority += TaskManager.PRIORITY.BOOST.ASSOCIATED;
                     factors.push('associated_discovery');
                     break;
                 case 'mongodb':
-                    priority = Math.min(priority, 5); // Cap MongoDB source priority
+                    calculatedPriority = Math.min(calculatedPriority, TaskManager.PRIORITY.BASE.NORMAL);
                     factors.push('mongodb_source');
                     break;
                 case 'urls_file':
-                    priority += 2; // Slight boost for URLs file entries
+                    calculatedPriority += TaskManager.PRIORITY.BOOST.URLS_FILE;
                     factors.push('urls_file_source');
                     break;
             }
     
-            // 5. Discovery status adjustments
+            // 5. Empty pack priority boost
+            if (this.config?.emptyfirst) {
+                const pack = await this.fileHandler.getPack(rkey);
+                if (pack && (!pack.users || pack.users.length === 0)) {
+                    calculatedPriority += TaskManager.PRIORITY.BOOST.EMPTY_PACK;
+                    factors.push('empty_pack_priority');
+                }
+            }
+    
+            // 6. Discovery status
             if (isNewlyDiscovered) {
-                priority += 5;
+                calculatedPriority += TaskManager.PRIORITY.BOOST.NEWLY_DISCOVERED;
                 factors.push('newly_discovered');
             }
     
-            // 6. Member count considerations
+            // 7. Member count considerations
             if (memberCount !== null) {
-                if (memberCount > 1000) {
-                    priority += 2;
+                if (memberCount > 80) {
+                    calculatedPriority += TaskManager.PRIORITY.BOOST.LARGE_PACK;
                     factors.push('large_pack');
                 } else if (memberCount < 10) {
-                    priority -= 1;
+                    calculatedPriority += TaskManager.PRIORITY.PENALTY.SMALL_PACK;
                     factors.push('small_pack');
                 }
             }
     
-            // 7. Failure handling
+            // 8. Failure handling
             if (states.failureHistory) {
-                const penalty = states.failureHistory.attempts * 2;
-                priority = Math.max(1, priority - penalty);
+                const penalty = states.failureHistory.attempts * TaskManager.PRIORITY.PENALTY.PER_FAILURE;
+                calculatedPriority = Math.max(1, calculatedPriority + penalty);
                 factors.push(`failure_penalty_${penalty}`);
     
-                // Additional checks for recurring failures
                 if (states.failureHistory.attempts > 2) {
                     const lastAttempt = new Date(states.failureHistory.lastAttempt);
                     const hoursSinceLastAttempt = (Date.now() - lastAttempt.getTime()) / (1000 * 60 * 60);
                     
-                    // Exponential backoff
                     const requiredHours = Math.pow(2, states.failureHistory.attempts - 2);
                     if (hoursSinceLastAttempt < requiredHours) {
-                        priority = 0;
+                        calculatedPriority = 0;
                         factors.push('cooling_period');
                     }
                 }
             }
     
-            // 8. Recent completion check
+            // 9. Recent completion check
             if (states.wasCompleted && !this.config.updateAll) {
                 const processingHistory = this.stateData?.processingHistory?.get(rkey);
                 if (processingHistory?.lastSuccess) {
                     const hoursSinceSuccess = (Date.now() - new Date(processingHistory.lastSuccess).getTime()) 
                         / (1000 * 60 * 60);
                     if (hoursSinceSuccess < 24) {
-                        priority = Math.min(priority, 1);
+                        calculatedPriority += TaskManager.PRIORITY.PENALTY.RECENT_SUCCESS;
                         factors.push('recently_completed');
                     }
                 }
             }
     
-            // 9. Final bounds checking
-            priority = Math.max(0, Math.min(priority, 15));
+            // 10. Final bounds checking and return value preparation
+            const boundedPriority = Math.max(0, Math.min(calculatedPriority, TaskManager.PRIORITY.MAX));
+            // Ensure we have a valid number
+            const finalPriority = Number(boundedPriority) || 0;
     
-            // 10. Debug logging if needed
+            // Debug logging
             if (this.debug) {
                 logger.debug(`[${processingId}] Priority calculation:`, {
                     rkey,
-                    priority,
+                    priority: finalPriority,
                     factors,
                     states: {
                         inMongoDB: states.inMongoDB,
@@ -9217,14 +9492,193 @@ class TaskManager {
                         failures: states.failureHistory?.attempts || 0
                     }
                 });
+                logger.debug(`returning finalPriority: ${finalPriority}`);
             }
     
-            return priority;
+            return finalPriority;
     
         } catch (err) {
-            logger.error(`[${processingId}] Error calculating priority for ${rkey}:`, err);
+            logger.error(`[${processingId}] Priority calculation error:`, err);
             return 1; // Safe default
         }
+    }
+
+    async getPackState(rkey, options) {
+        return {
+            inMongoDB: options.inMongoDB,
+            inFiles: !!options.existingPack,
+            isDeleted: this.deletedPacks?.has(rkey),
+            wasCompleted: this.completedTasks?.has(rkey),
+            failureHistory: options.failure || this.failures.get(rkey),
+            priorityFactors: this.stateData?.priorityFactors?.get(rkey)
+        };
+    }
+
+    async shouldSkipPack(state) {
+        if (!state.isDeleted) return false;
+        const deletion = this.deletedPacks.get(rkey);
+        return (Date.now() - new Date(deletion.timestamp).getTime()) < this.DELETION_COOLDOWN;
+    }
+
+    async calculateBasePriority(state, { lastUpdate, factors }) {
+        if (!state.inMongoDB && !state.inFiles) {
+            factors.push('new_pack');
+            return TaskManager.PRIORITY.BASE.NEW;
+        }
+
+        if (lastUpdate) {
+            const daysSinceUpdate = (Date.now() - new Date(lastUpdate).getTime()) 
+                / (1000 * 60 * 60 * 24);
+
+            if (daysSinceUpdate > 14) {
+                factors.push('very_stale');
+                return TaskManager.PRIORITY.BASE.STALE;
+            }
+            
+            if (!state.inMongoDB && state.inFiles) {
+                factors.push('needs_mongodb_sync');
+                return TaskManager.PRIORITY.BASE.STALE;
+            }
+            
+            if (daysSinceUpdate > 7) {
+                factors.push('stale');
+                return TaskManager.PRIORITY.BASE.NORMAL;
+            }
+            
+            factors.push('recent');
+            return TaskManager.PRIORITY.BASE.LOW;
+        }
+
+        factors.push('no_update_date');
+        return TaskManager.PRIORITY.BASE.STALE;
+    }
+
+    async applyModeAdjustments(priority, { state, emptyfirst, updateAll, factors }) {
+        if (emptyfirst && this.isEmptyPack(state.existingPack)) {
+            priority += TaskManager.PRIORITY.BOOST.EMPTY_PACK;
+            factors.push('empty_pack_boost');
+        }
+
+        if (!updateAll && this.isRecentlyProcessed(state)) {
+            priority = Math.min(priority, TaskManager.PRIORITY.BASE.LOW);
+            factors.push('recent_processing_cap');
+        }
+
+        return priority;
+    }
+
+    async applySourceModifiers(priority, { source, isNewlyDiscovered, factors }) {
+        switch(source) {
+            case 'associated':
+                priority += TaskManager.PRIORITY.BOOST.ASSOCIATED;
+                factors.push('associated_boost');
+                break;
+            case 'urls_file':
+                priority += TaskManager.PRIORITY.BOOST.URLS_FILE;
+                factors.push('urls_file_boost');
+                break;
+        }
+
+        if (isNewlyDiscovered) {
+            priority += TaskManager.PRIORITY.BOOST.NEWLY_DISCOVERED;
+            factors.push('discovery_boost');
+        }
+
+        return priority;
+    }
+
+    async applyPackCharacteristics(priority, { memberCount, existingPack, factors }) {
+        if (memberCount !== null || existingPack?.users?.length) {
+            const count = memberCount ?? existingPack.users.length;
+            
+            if (count > 80) {
+                priority += TaskManager.PRIORITY.BOOST.LARGE_PACK;
+                factors.push('large_pack_boost');
+            } else if (count < 10) {
+                priority += TaskManager.PRIORITY.PENALTY.SMALL_PACK;
+                factors.push('small_pack_penalty');
+            }
+        }
+        return priority;
+    }
+
+    async applyFailurePenalties(priority, { failure, factors }) {
+        if (!failure) return priority;
+
+        const penalty = failure.attempts * TaskManager.PRIORITY.PENALTY.PER_FAILURE;
+        priority = Math.max(1, priority + penalty);
+        factors.push(`failure_penalty_${failure.attempts}`);
+
+        if (this.isInCoolingPeriod(failure)) {
+            priority = 0;
+            factors.push('cooling_period');
+        }
+
+        return priority;
+    }
+
+    async isInCoolingPeriod(failure) {
+        if (!failure || failure.attempts <= 2) return false;
+        
+        const hoursSinceLastAttempt = (Date.now() - new Date(failure.lastAttempt).getTime()) 
+            / (1000 * 60 * 60);
+            
+        return hoursSinceLastAttempt < Math.pow(2, failure.attempts - 2);
+    }
+
+    async applyProcessingHistory(priority, { state, factors }) {
+        if (state.wasCompleted && !this.config.updateAll) {
+            const history = this.stateData?.processingHistory?.get(state.rkey);
+            if (this.isRecentSuccess(history)) {
+                priority += TaskManager.PRIORITY.PENALTY.RECENT_SUCCESS;
+                factors.push('recent_success_penalty');
+            }
+        }
+        return priority;
+    }
+
+    // Helper methods
+    async isEmptyPack(pack) {
+        if (!pack) {
+            // Might need to fetch pack data
+            return false;
+        }
+        return !pack.users || pack.users.length === 0;
+    }
+
+    async isRecentlyProcessed(state) {
+        const history = this.stateData?.processingHistory?.get(state.rkey);
+        return history?.lastSuccess && 
+               (Date.now() - new Date(history.lastSuccess).getTime()) < 24 * 60 * 60 * 1000;
+    }
+
+    async isRecentlyProcessed(state) {
+        const history = await this.getProcessingHistory(state.rkey);
+        if (!history?.lastSuccess) return false;
+        
+        const hoursSinceProcess = (Date.now() - new Date(history.lastSuccess).getTime()) 
+            / (1000 * 60 * 60);
+            
+        return hoursSinceProcess < 24;
+    }
+
+    logPriorityCalculation(processingId, { rkey, priority, factors, state }) {
+        if (!this.debug) return;
+        
+        logger.debug(`[${processingId}] Priority calculation:`, {
+            rkey,
+            priority,
+            factors,
+            state: {
+                inMongoDB: state.inMongoDB,
+                inFiles: state.inFiles,
+                failures: state.failureHistory?.attempts || 0
+            }
+        });
+    }
+
+    async getProcessingHistory(rkey) {
+        return this.stateData?.processingHistory?.get(rkey);
     }
 
     async maybeWriteCheckpoint(force = false) {
@@ -9519,18 +9973,18 @@ class TaskManager {
         };
     }
 
-    async addTask({ 
-        handle, 
-        rkey, 
-        source = 'initial', 
-        parentDid = null, 
+    async addTask({
+        handle,
+        rkey,
+        source = 'initial',
+        parentDid = null,
         memberCount = 0,
-        discoveredAt = new Date().toISOString()  // Default value added
+        discoveredAt = new Date().toISOString()
     }) {
         try {
             // 1. Ensure rkey is resolved if it's a Promise
             rkey = await Promise.resolve(rkey);
-            
+    
             // 2. Validate rkey
             if (!rkey || rkey.toString() === '[object Promise]' || !rkey.match(/^[a-zA-Z0-9]+$/)) {
                 logger.warn(`Invalid rkey format rejected: ${rkey}`);
@@ -9552,22 +10006,24 @@ class TaskManager {
             // 4. Get existing data
             const existingPack = await this.fileHandler.getPack(rkey);
     
-            // 5. Calculate priority (fixed version)
+            // 5. Calculate priority
             const lastUpdate = existingPack?.updated_at ? new Date(existingPack.updated_at) : null;
-            const priority = this.calculateTaskPriority(rkey, {
+            const taskPriority = await this.calculateTaskPriority(rkey, {
                 source,
                 isNewlyDiscovered: !!discoveredAt,
                 memberCount,
                 existingPack,
                 failure,
-                lastUpdate  // Pass the parsed Date object
+                lastUpdate: existingPack?.updated_at
             });
+    
+            logger.debug(`Task priority calculated for ${rkey}:`, taskPriority);
     
             // 6. Create task data
             const taskData = {
                 handle,
                 rkey,
-                priority,
+                priority: taskPriority,
                 source,
                 parentDid,
                 memberCount,
@@ -9586,7 +10042,7 @@ class TaskManager {
     
             logger.debug(`Added task ${rkey}:`, {
                 source,
-                priority,
+                priority: taskPriority,  // Fixed: Use taskPriority instead of priority
                 pending: this.pendingTasks.size,
                 completed: this.completedTasks.size,
                 discovered: this.discoveredPacksMap?.size
@@ -9608,27 +10064,33 @@ class TaskManager {
 
     async getNextTask() {
         if (this.pendingTasks.size === 0) return null;
-
-        // Only recalculate priorities periodically or when needed
+    
+        // Only recalculate priorities when needed
         const now = Date.now();
         if (!this._lastPriorityUpdate || (now - this._lastPriorityUpdate) > 60000) {
             await this.updateTaskPriorities();
             this._lastPriorityUpdate = now;
         }
-
-        // Return highest priority task
+    
+        // Find highest priority task
         let highestPriority = -1;
         let selectedTask = null;
-
-        for (const task of this.pendingTasks.values()) {
-            if (task.priority > highestPriority) {
-                highestPriority = task.priority;
+    
+        for (const [rkey, task] of this.pendingTasks.entries()) {
+            const priority = Number(task.priority) || 0;
+            if (priority > highestPriority) {
+                highestPriority = priority;
                 selectedTask = task;
             }
         }
-
+    
+        if (!selectedTask) {
+            logger.warn('No valid task found in pending tasks');
+            return null;
+        }
+    
         return selectedTask;
-    }
+    }    
 
     async updateTaskPriorities() {
         // Batch fetch existing packs
@@ -9891,9 +10353,10 @@ class TaskManager {
         await this.markTaskCompleted(task.rkey);
     
         // Log success with metrics
-        const percentage = stats.total > 0 
-            ? ((stats.completed / stats.total) * 100).toFixed(1) 
-            : '0.0';
+        if (!stats.total || stats.total < stats.completed) {
+            stats.total = stats.completed;
+        }
+        const percentage = ((stats.completed / stats.total) * 100).toFixed(1);
         logger.info(`Task ${context.id}: ${stats.completed}/${stats.total} done, ${percentage}%`);
         this.markDirty();
     }
@@ -10682,6 +11145,7 @@ function parseArgs() {
         listsOnly: args.includes('--lists'),  // process only lists
         includeAssociatedLists: args.includes('--includeassociatedlists'),
         fixDeletions: args.includes('--fixdeletions'),
+        emptyfirst: args.includes('--emptyfirst'),
     };
 }
 
@@ -10733,7 +11197,8 @@ async function main() {
             fromApi: args.fromApi,
             debug: args.debug || process.env.DEBUG,
             mode,
-            updateAll: args.updateAll
+            updateAll: args.updateAll,
+            emptyfirst: args.emptyfirst // first process empty packs (they might have been wrongly parsed before)
         });
 
         // 4. Handle different processing modes
